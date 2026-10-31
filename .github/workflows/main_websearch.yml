@@ -12,6 +12,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
 
@@ -31,9 +32,24 @@ jobs:
             --target=".python_packages/lib/site-packages" \
             -r requirements.txt
 
-      - name: Verify dependencies
+      - name: Verify dependencies and crawler imports
         run: |
-          PYTHONPATH=".python_packages/lib/site-packages" python -c "import requests; import azure.functions; import bs4; import azure.storage.blob; print('All dependencies installed successfully')"
+          export PYTHONPATH=".python_packages/lib/site-packages:$PYTHONPATH"
+
+          python -c "import requests; import azure.functions; import bs4; print('Basic imports OK')"
+
+          python -c "from azure.data.tables import TableServiceClient, UpdateMode; from azure.core import MatchConditions; print('Azure Table imports OK')"
+
+          python -c "from azure.storage.queue import QueueServiceClient; print('Azure Queue imports OK')"
+
+          python -c "from azure.storage.blob import BlobServiceClient; print('Azure Blob imports OK')"
+
+          python -c "import services.crawl_state; print('Crawl state module OK')"
+
+      - name: Verify Python syntax
+        run: |
+          export PYTHONPATH=".python_packages/lib/site-packages:$PYTHONPATH"
+          python -m compileall -q .
 
       - name: Create deployment package
         run: |
@@ -46,6 +62,16 @@ jobs:
             -x "release.zip" \
             -x "__pycache__/*" \
             -x "*.pyc"
+
+      - name: Verify deployment package
+        run: |
+          unzip -t release.zip
+
+          unzip -l release.zip | grep "services/crawl_state.py"
+
+          unzip -l release.zip | grep ".python_packages/lib/site-packages/azure/data/tables"
+
+          echo "Deployment package verification completed."
 
       - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
