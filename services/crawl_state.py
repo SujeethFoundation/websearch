@@ -1,7 +1,8 @@
 """Persistent crawl job and page state backed by Azure Table Storage + Queue Storage."""
 import hashlib, json, uuid
 from datetime import datetime, timezone
-from azure.data.tables import TableServiceClient, UpdateMode, MatchConditions
+from azure.data.tables import TableServiceClient, UpdateMode
+from azure.core import MatchConditions
 from azure.storage.queue import QueueServiceClient
 from services.config import settings
 
