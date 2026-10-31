@@ -109,7 +109,9 @@ class PageWorker:
             self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'page_too_large'},pages_skipped=1); return
         title=final_url; text=''; discovered=[]; page_type='html'
         if 'text/html' in content_type or 'application/xhtml' in content_type:
-            soup=BeautifulSoup(raw,'html.parser')
+            if isinstance(raw, (bytes, bytearray)):
+                raw = bytes(raw).decode("utf-8", errors="replace")
+            soup = BeautifulSoup(raw, "html.parser")
             title=soup.title.get_text(' ',strip=True) if soup.title else final_url
             canonical=soup.find('link',rel=lambda x:x and 'canonical' in x)
             if canonical and canonical.get('href'):
