@@ -13,6 +13,9 @@ class Settings:
     embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "")
     embedding_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
     max_pages = int(os.getenv("MAX_PAGES_PER_DOMAIN", "1000"))
+    max_crawl_depth = int(os.getenv("MAX_CRAWL_DEPTH", "5"))
+    crawl_delay = float(os.getenv("CRAWL_DELAY_SECONDS", "0.5"))
+    max_sitemap_urls = int(os.getenv("MAX_SITEMAP_URLS", "5000"))
     timeout = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
     max_query_concepts = int(os.getenv("MAX_QUERY_CONCEPTS", "5"))
     embedding_configured = bool(

@@ -132,3 +132,46 @@ Without embeddings, the response explicitly reports `keyword_fallback`. With emb
 - Crawler documents currently have no assigned ontology concepts; add document-side concept enrichment before relying on concept-filtered retrieval.
 - Local file storage is not suitable for a scaled-out production deployment.
 - No automatic zone or regional failover is provided.
+
+
+## Version 0.3.0 — deeper website crawling
+
+This release upgrades the starter crawler with:
+
+- Breadth-first recursive same-host link discovery.
+- Sitemap discovery from `robots.txt`, `/sitemap.xml`, and `/sitemap_index.xml`,
+  including sitemap-index traversal.
+- Configurable maximum crawl depth (`MAX_CRAWL_DEPTH`, default 5).
+- Configurable per-domain page cap (`MAX_PAGES_PER_DOMAIN`, default 1000).
+- Configurable request spacing (`CRAWL_DELAY_SECONDS`, default 0.5 seconds).
+- URL normalization, fragment removal, and common tracking-parameter removal.
+- Robots exclusion checks using Python's `RobotFileParser`.
+- Crawl metrics: discovered, crawled, skipped, errors, sitemap count, depth reached,
+  page limit, and remaining queue.
+
+### Azure application settings
+
+Set these Function App application settings:
+
+- `MAX_PAGES_PER_DOMAIN=1000`
+- `MAX_CRAWL_DEPTH=5`
+- `CRAWL_DELAY_SECONDS=0.5`
+- `MAX_SITEMAP_URLS=5000`
+
+Keep `BLOB_STORAGE_CONNECTION_STRING` and `BLOB_CONTAINER=web-content` as already configured.
+
+### Important operating limits
+
+- Crawling remains synchronous inside the HTTP-triggered refresh function. Do not
+  start a 1,000-page crawl in one request; gateway/runtime timeouts remain possible.
+- Run one domain at a time for initial validation and keep the page cap low (e.g. 25–50).
+- The crawler only follows HTTPS URLs on the exact configured hostname. It does not
+  crawl subdomains automatically.
+- Sitemap discovery is best-effort; malformed, oversized, inaccessible, or off-host
+  sitemap entries are ignored.
+- Robots rules are checked for each requested URL. A robots.txt fetch failure blocks
+  the domain rather than assuming permission.
+- This release does not yet implement document-side ontology concept enrichment,
+  persistent crawl checkpoints, stale-page deletion, a background queue, or semantic
+  page prioritization. Crawled chunks currently carry an empty `concepts` list.
+- Respect site terms, robots directives, rate limits, and any privacy/access restrictions.
