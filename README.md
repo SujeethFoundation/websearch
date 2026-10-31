@@ -145,3 +145,14 @@ Do not launch all domains until the one-domain test confirms that Queue Trigger 
 - Job counter updates are best-effort under concurrency; for very high parallelism, use transactional entity-group operations or a dedicated durable orchestrator.
 - Stale-page cleanup requires a clean, complete crawl and intentionally does nothing when pages are skipped or failed. Review stale records and metrics before enabling aggressive deletion policies.
 - No scheduled refresh is created automatically; use a separate scheduler after crawl stability is verified.
+
+
+## v0.6.0 persistent crawl reliability
+
+This release adds ETag-guarded page claims and terminal transitions, idempotent page completion, per-page attempt counts and processing leases, aggregate job reconciliation, and stale-page recovery. New authenticated endpoints:
+
+- `GET /api/crawl/{job_id}/pages` — inspect persisted page records.
+- `POST /api/crawl/{job_id}/reconcile` — rebuild job counters from page records.
+- `POST /api/crawl/{job_id}/recover` — republish stale queued/publish-failed pages and expired processing leases. Optional JSON body: `{"stale_minutes":25}` (minimum 5, maximum 240).
+
+Recovery is safe to repeat: completed pages are not requeued, and workers must acquire a page claim before processing. Azure Table Storage and Queue Storage do not provide a cross-service transaction, so reconciliation remains necessary after partial failures. Test with one domain before starting a multi-domain crawl.

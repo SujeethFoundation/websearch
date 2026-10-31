@@ -67,61 +67,130 @@ class CrawlState:
             except Exception: continue
         raise RuntimeError('Could not update crawl job after concurrent updates')
 
+    def _publish(self, job_id, domain, url, depth):
+        payload = {"job_id": job_id, "domain": domain, "url": url, "depth": int(depth)}
+        self.queue.send_message(json.dumps(payload))
+
     def enqueue_page(self, job_id, domain, url, depth):
-        job=self.get_job(job_id)
-        if not job or job.get('status') in ('cancelled','failed','completed'):
+        job = self.get_job(job_id)
+        if not job or job.get("status") in ("cancelled", "failed", "completed", "completed_with_errors"):
             return False
-        if int(job.get('pages_discovered',0)) >= int(job.get('page_limit',settings.max_pages)):
-            return False
-        key=digest(url)
-        entity={'PartitionKey':job_id,'RowKey':key,'url':url,'depth':int(depth),'status':'queued','created_utc':utcnow()}
-        try: self.pages.create_entity(entity)
-        except Exception: return False
+        key = digest(url)
+        try:
+            self.pages.create_entity({"PartitionKey": job_id, "RowKey": key, "url": url,
+                "depth": int(depth), "status": "queued", "attempts": 0, "created_utc": utcnow(),
+                "updated_utc": utcnow()})
+        except Exception:
+            # Existing page is not necessarily queued; never duplicate its accounting.
+            existing = self.page(job_id, url)
+            if not existing or existing.get("status") in ("processing", "processed", "unchanged", "skipped", "failed"):
+                return False
+            if existing.get("status") != "queued":
+                return False
+            # A queued page can be republished during recovery; normal discovery avoids this path.
+            self._publish(job_id, domain, url, depth)
+            return True
         self._change(job_id, inc_pending=1, inc_pages_discovered=1)
-        self.queue.send_message(json.dumps({'job_id':job_id,'domain':domain,'url':url,'depth':int(depth)}))
+        try:
+            self._publish(job_id, domain, url, depth)
+        except Exception as exc:
+            self.mark_page(job_id, url, "publish_failed", error=str(exc)[:500])
+            self._change(job_id, inc_pending=-1, inc_pages_discovered=-1)
+            raise
         return True
 
     def enqueue_pages(self, job_id, domain, items):
-        """Register a whole seed set before publishing any queue messages."""
-        created=[]
-        job=self.get_job(job_id)
-        if not job: return 0
-        cap=int(job.get('page_limit',settings.max_pages))
-        remaining=max(0,cap-int(job.get('pages_discovered',0)))
-        for url,depth in items:
-            if len(created)>=remaining: break
-            key=digest(url)
-            entity={'PartitionKey':job_id,'RowKey':key,'url':url,'depth':int(depth),'status':'queued','created_utc':utcnow()}
-            try:
-                self.pages.create_entity(entity); created.append((url,int(depth)))
-            except Exception:
-                continue
-        if created:
-            self._change(job_id,inc_pending=len(created),inc_pages_discovered=len(created))
-            for url,depth in created:
-                self.queue.send_message(json.dumps({'job_id':job_id,'domain':domain,'url':url,'depth':depth}))
-        return len(created)
+        count = 0
+        for url, depth in items:
+            job = self.get_job(job_id)
+            if not job or int(job.get("pages_discovered", 0)) >= int(job.get("page_limit", settings.max_pages)):
+                break
+            if self.enqueue_page(job_id, domain, url, depth):
+                count += 1
+        return count
 
     def page(self, job_id, url):
-        try: return self.pages.get_entity(job_id,digest(url))
-        except Exception: return None
+        try:
+            entity = self.pages.get_entity(job_id, digest(url))
+            entity.pop("odata.etag", None)
+            return entity
+        except Exception:
+            return None
 
     def mark_page(self, job_id, url, status, **fields):
-        e=self.page(job_id,url)
-        if not e: return
-        e['status']=status; e['updated_utc']=utcnow()
-        for k,v in fields.items(): e[k]=v
-        try: self.pages.update_entity(e,mode=UpdateMode.REPLACE)
-        except Exception: pass
-
-    def finish_page(self, job_id, status='processed', **increments):
-        changes={'inc_pending':-1}
-        for k,v in increments.items(): changes['inc_'+k]=v
-        e=self._change(job_id, **changes)
-        if int(e.get('pending',0)) <= 0:
-            self._change(job_id, status='completed', completed_utc=utcnow())
-            return True
+        # ETag-guarded update; retries avoid overwriting concurrent page transitions.
+        for _ in range(5):
+            entity = self.pages.get_entity(job_id, digest(url))
+            entity["status"] = status
+            entity["updated_utc"] = utcnow()
+            entity.update(fields)
+            try:
+                etag = entity.metadata.get("etag", "*")
+                self.pages.update_entity(entity, mode=UpdateMode.REPLACE, etag=etag,
+                    match_condition=MatchConditions.IfNotModified)
+                return True
+            except Exception:
+                continue
         return False
+
+    def claim_page(self, job_id, url, lease_minutes=20):
+        for _ in range(6):
+            try:
+                entity = self.pages.get_entity(job_id, digest(url))
+            except Exception:
+                return False
+            status = entity.get("status")
+            if status in ("processed", "unchanged", "skipped", "failed"):
+                return False
+            now = datetime.now(timezone.utc)
+            lease_text = entity.get("lease_until_utc")
+            if status == "processing" and lease_text:
+                try:
+                    if datetime.fromisoformat(lease_text) > now:
+                        return False
+                except ValueError:
+                    pass
+            entity["status"] = "processing"
+            entity["attempts"] = int(entity.get("attempts", 0)) + 1
+            entity["lease_until_utc"] = (now + __import__('datetime').timedelta(minutes=lease_minutes)).isoformat()
+            entity["updated_utc"] = now.isoformat()
+            try:
+                self.pages.update_entity(entity, mode=UpdateMode.REPLACE,
+                    etag=entity.metadata.get("etag", "*"), match_condition=MatchConditions.IfNotModified)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def complete_page(self, job_id, url, status="processed", page_fields=None, **increments):
+        # Page transition is the idempotency gate. Only the winner changes job counters.
+        terminal = ("processed", "unchanged", "skipped", "failed")
+        for _ in range(6):
+            try:
+                entity = self.pages.get_entity(job_id, digest(url))
+            except Exception:
+                return False
+            if entity.get("status") in terminal:
+                return False
+            entity["status"] = status
+            entity["updated_utc"] = utcnow()
+            entity.pop("lease_until_utc", None)
+            if page_fields:
+                entity.update(page_fields)
+            try:
+                self.pages.update_entity(entity, mode=UpdateMode.REPLACE,
+                    etag=entity.metadata.get("etag", "*"), match_condition=MatchConditions.IfNotModified)
+            except Exception:
+                continue
+            changes = {"inc_pending": -1}
+            for key, value in increments.items():
+                changes["inc_" + key] = value
+            job = self._change(job_id, **changes)
+            if int(job.get("pending", 0)) <= 0:
+                final_status = "completed_with_errors" if int(job.get("pages_failed", 0)) else "completed"
+                self._change(job_id, status=final_status, completed_utc=utcnow())
+            return True
+        raise RuntimeError("Could not complete page due to concurrent updates")
 
     def manifest_get(self, domain, url):
         try: return self.manifest.get_entity(digest(domain),digest(url))
@@ -144,20 +213,60 @@ class CrawlState:
         return self._change(job_id,status='cancelled',cancelled_utc=utcnow())
 
     def fail_page(self, job_id, url, error):
-        self.mark_page(job_id,url,'failed',error=str(error)[:500])
-        self.finish_page(job_id,'failed',pages_failed=1)
-        job=self.get_job(job_id)
-        if job and job.get('status')=='completed':
-            self._change(job_id,status='completed_with_errors')
+        self.complete_page(job_id, url, "failed", pages_failed=1)
+        self.mark_page(job_id, url, "failed", error=str(error)[:500])
+
+    def reconcile_job(self, job_id):
+        job = self.get_job(job_id)
+        if not job:
+            return None
+        pages = self.page_records(job_id)
+        counts = {"queued": 0, "processing": 0, "processed": 0, "unchanged": 0, "skipped": 0, "failed": 0, "publish_failed": 0}
+        for page in pages:
+            status = page.get("status", "queued")
+            counts[status] = counts.get(status, 0) + 1
+        pending = counts.get("queued", 0) + counts.get("processing", 0) + counts.get("publish_failed", 0)
+        processed = counts.get("processed", 0) + counts.get("unchanged", 0)
+        # Repair aggregate counters from the authoritative page table.
+        self._change(job_id, pending=pending, pages_discovered=len(pages), pages_processed=processed,
+                     pages_skipped=counts.get("skipped", 0), pages_failed=counts.get("failed", 0))
+        return {"job_id": job_id, "page_count": len(pages), "page_states": counts,
+                "expected_pending": pending, "previous_pending": int(job.get("pending", 0))}
+
+    def recover_job(self, job_id, stale_minutes=25):
+        job = self.get_job(job_id)
+        if not job:
+            return None
+        now = datetime.now(timezone.utc)
+        from datetime import timedelta
+        stale_before = now - timedelta(minutes=int(stale_minutes))
+        requeued = []
+        for page in self.page_records(job_id):
+            status = page.get("status", "queued")
+            eligible = status in ("queued", "publish_failed")
+            if eligible:
+                try:
+                    eligible = datetime.fromisoformat(page.get("updated_utc") or page.get("created_utc")) < stale_before
+                except Exception:
+                    eligible = True
+            if status == "processing":
+                lease = page.get("lease_until_utc")
+                try:
+                    eligible = not lease or datetime.fromisoformat(lease) < now
+                except ValueError:
+                    eligible = True
+            if not eligible:
+                continue
+            url = page.get("url")
+            if not url:
+                continue
+            # Reset state before publishing; repeated recovery is safe because a live
+            # worker must acquire the page via claim_page's ETag-guarded transition.
+            if self.mark_page(job_id, url, "queued", lease_until_utc="", recovery_utc=utcnow()):
+                self._publish(job_id, job["domain"], url, int(page.get("depth", 0)))
+                requeued.append(url)
+        self.reconcile_job(job_id)
+        return {"job_id": job_id, "status": "recovery_submitted", "requeued": len(requeued), "urls": requeued}
 
     def resume_job(self, job_id):
-        job=self.get_job(job_id)
-        if not job: return None
-        failed=[p for p in self.page_records(job_id) if p.get('status')=='failed']
-        if not failed: return {'job_id':job_id,'status':job.get('status'),'requeued':0,'message':'No failed page tasks to resume.'}
-        self._change(job_id,status='running',inc_pending=len(failed),inc_pages_failed=-len(failed))
-        for page in failed:
-            page['status']='queued'; page['updated_utc']=utcnow()
-            self.pages.update_entity(page,mode=UpdateMode.REPLACE)
-            self.queue.send_message(json.dumps({'job_id':job_id,'domain':job['domain'],'url':page['url'],'depth':int(page.get('depth',0))}))
-        return {'job_id':job_id,'status':'running','requeued':len(failed)}
+        return self.recover_job(job_id)

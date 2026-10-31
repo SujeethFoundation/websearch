@@ -56,22 +56,24 @@ class PageWorker:
         existing=self.state.page(job_id,url)
         if existing and existing.get('status') in ('processed','unchanged','skipped','failed'):
             return
+        if not self.state.claim_page(job_id,url):
+            return
         if depth>int(job.get('max_depth',settings.max_crawl_depth)):
-            self.state.mark_page(job_id,url,'skipped',reason='depth_limit'); self.state.finish_page(job_id,'skipped',pages_skipped=1); return
+            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'depth_limit'},pages_skipped=1); return
         if not self.same_site(url,domain) or not self.safe_public_host(urlparse(url).hostname or ''):
-            self.state.mark_page(job_id,url,'skipped',reason='off_site_or_non_public'); self.state.finish_page(job_id,'skipped',pages_skipped=1); return
+            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'off_site_or_non_public'},pages_skipped=1); return
         # Require an explicit robots policy response for the actual host.
         robots_url=f"{urlparse(url).scheme}://{urlparse(url).netloc}/robots.txt"
         try:
             rr=self.safe_get(robots_url,domain)
             if rr.status_code in (401,403):
-                self.state.mark_page(job_id,url,'skipped',reason='robots_denied'); self.state.finish_page(job_id,'skipped',pages_skipped=1); return
+                self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'robots_denied'},pages_skipped=1); return
             if rr.status_code>=500: raise RuntimeError('robots.txt unavailable')
             if rr.status_code not in (200,404): raise RuntimeError(f'robots.txt returned HTTP {rr.status_code}')
             from urllib.robotparser import RobotFileParser
             rp=RobotFileParser(); rp.parse(rr.text.splitlines() if rr.status_code==200 else [])
             if not rp.can_fetch(settings.crawler_user_agent,url):
-                self.state.mark_page(job_id,url,'skipped',reason='robots_disallowed'); self.state.finish_page(job_id,'skipped',pages_skipped=1); return
+                self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'robots_disallowed'},pages_skipped=1); return
             if depth == 0:
                 # Discover sitemap URLs in the background worker, not the HTTP start request.
                 from services.crawler import Crawler
@@ -92,11 +94,11 @@ class PageWorker:
         response=self.safe_get(url,domain,headers=headers,stream=True)
         if response.status_code==304:
             self.state.manifest_put(domain,url,last_seen_job=job_id,last_status=304)
-            self.state.mark_page(job_id,url,'unchanged'); self.state.finish_page(job_id,'processed',pages_processed=1); self._finalize_if_safe(job_id,domain); return
+            self.state.complete_page(job_id,url,'unchanged',pages_processed=1); self._finalize_if_safe(job_id,domain); return
         response.raise_for_status()
         final_url=self.normalize(response.url)
         if not self.same_site(final_url,domain):
-            self.state.mark_page(job_id,url,'skipped',reason='redirected_off_site'); self.state.finish_page(job_id,'skipped',pages_skipped=1); return
+            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'redirected_off_site'},pages_skipped=1); return
         content_type=response.headers.get('content-type','').lower()
         raw=bytearray()
         for block in response.iter_content(chunk_size=65536):
@@ -104,7 +106,7 @@ class PageWorker:
                 raw.extend(block)
                 if len(raw)>settings.max_page_bytes: break
         if len(raw)>settings.max_page_bytes:
-            self.state.mark_page(job_id,url,'skipped',reason='page_too_large'); self.state.finish_page(job_id,'skipped',pages_skipped=1); return
+            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'page_too_large'},pages_skipped=1); return
         title=final_url; text=''; discovered=[]; page_type='html'
         if 'text/html' in content_type or 'application/xhtml' in content_type:
             soup=BeautifulSoup(raw,'html.parser')
@@ -132,15 +134,15 @@ class PageWorker:
             page_type='docx'; doc=Document(io.BytesIO(raw)); text=' '.join(p.text for p in doc.paragraphs)
             title=urlparse(final_url).path.rsplit('/',1)[-1]
         else:
-            self.state.mark_page(job_id,url,'skipped',reason='unsupported_content_type'); self.state.finish_page(job_id,'skipped',pages_skipped=1); return
+            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'unsupported_content_type'},pages_skipped=1); return
         text=re.sub(r'\s+',' ',text).strip()
         digest=hashlib.sha256(text.encode('utf-8')).hexdigest()
         if len(text)<settings.min_text_chars:
-            self.state.mark_page(job_id,url,'skipped',reason='insufficient_text'); self.state.finish_page(job_id,'skipped',pages_skipped=1); return
+            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'insufficient_text'},pages_skipped=1); return
         old_hash=previous.get('content_hash') if previous else None
         if old_hash==digest:
             self.state.manifest_put(domain,final_url,content_hash=digest,last_seen_job=job_id,etag=response.headers.get('ETag'),last_modified=response.headers.get('Last-Modified'),page_type=page_type)
-            self.state.mark_page(job_id,url,'unchanged'); self.state.finish_page(job_id,'processed',pages_processed=1); self._finalize_if_safe(job_id,domain); return
+            self.state.complete_page(job_id,url,'unchanged',pages_processed=1); self._finalize_if_safe(job_id,domain); return
         # Remove prior chunks for this URL before writing a changed version, preventing
         # orphaned tail chunks when the new page is shorter.
         self.search.delete_url(final_url)
@@ -159,8 +161,7 @@ class PageWorker:
         # Discover URLs before marking this page complete, so pending never transiently reaches zero.
         for link in dict.fromkeys(discovered):
             if self.state.enqueue_page(job_id,domain,link,depth+1): pass
-        self.state.mark_page(job_id,url,'processed',content_hash=digest,final_url=final_url)
-        self.state.finish_page(job_id,'processed',pages_processed=1,chunks_indexed=chunks,chunks_tagged=tagged,chunks_untagged=untagged)
+        self.state.complete_page(job_id,url,'processed',page_fields={'content_hash':digest,'final_url':final_url},pages_processed=1,chunks_indexed=chunks,chunks_tagged=tagged,chunks_untagged=untagged)
         self._finalize_if_safe(job_id,domain)
         if settings.crawl_delay>0: time.sleep(settings.crawl_delay)
 

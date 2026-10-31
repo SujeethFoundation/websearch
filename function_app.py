@@ -103,12 +103,12 @@ def health(req):
     return response({
         "status": "healthy",
         "service": "Sujeeth Foundation Web Search",
-        "version": "0.5.1",
+        "version": "0.6.0",
         "storage_mode": storage.mode,
         "embedding_configured": settings.embedding_configured,
         "ontology_configured": bool(settings.ontology_api_url),
         "concept_resolution_required": True,
-        "crawler_version": "0.5.1",
+        "crawler_version": "0.6.0",
         "persistent_crawl_jobs": bool(crawl_state),
         "crawl_queue": settings.crawl_queue,
         "max_pages_per_domain": settings.max_pages,
@@ -305,6 +305,45 @@ def crawl_dashboard(req):
         domain=str(item.get("domain") if isinstance(item,dict) else item)
         domain_rows.append({"domain":domain,"crawl_enabled":True,"latest_job":by_domain.get(domain)})
     return response({"domains":domain_rows,"recent_jobs":jobs,"index":storage.status(),"generated_utc":__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()})
+
+
+@app.route(route="crawl/{job_id}/pages", methods=["GET"])
+def crawl_pages(req):
+    if not crawl_state:
+        return response({"error": "Crawl state is not configured"}, 503)
+    job_id = req.route_params.get("job_id")
+    job = crawl_state.get_job(job_id)
+    if not job:
+        return response({"error": "Crawl job not found"}, 404)
+    pages = crawl_state.page_records(job_id)
+    pages.sort(key=lambda item: item.get("created_utc", ""))
+    return response({"job_id": job_id, "count": len(pages), "pages": pages})
+
+
+@app.route(route="crawl/{job_id}/reconcile", methods=["POST"])
+def crawl_reconcile(req):
+    if not crawl_state:
+        return response({"error": "Crawl state is not configured"}, 503)
+    try:
+        result = crawl_state.reconcile_job(req.route_params.get("job_id"))
+        return response(result or {"error": "Crawl job not found"}, 200 if result else 404)
+    except Exception as exc:
+        log.exception("Crawl reconciliation failed")
+        return response({"error": str(exc)}, 500)
+
+
+@app.route(route="crawl/{job_id}/recover", methods=["POST"])
+def crawl_recover(req):
+    if not crawl_state:
+        return response({"error": "Crawl state is not configured"}, 503)
+    try:
+        body = read_body(req)
+        stale_minutes = min(max(int(body.get("stale_minutes", 25)), 5), 240)
+        result = crawl_state.recover_job(req.route_params.get("job_id"), stale_minutes=stale_minutes)
+        return response(result or {"error": "Crawl job not found"}, 200 if result else 404)
+    except Exception as exc:
+        log.exception("Crawl recovery failed")
+        return response({"error": str(exc)}, 500)
 
 
 @app.queue_trigger(arg_name="msg", queue_name="%CRAWL_QUEUE_NAME%", connection="AzureWebJobsStorage")
