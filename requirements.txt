@@ -2,3 +2,7 @@ azure-functions>=1.20,<2
 requests>=2.31,<3
 beautifulsoup4>=4.12,<5
 azure-storage-blob>=12.19,<13
+azure-storage-queue>=12.10,<13
+azure-data-tables>=12.5,<13
+pypdf>=5,<7
+python-docx>=1.1,<2

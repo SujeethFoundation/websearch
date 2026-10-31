@@ -1,6 +1,8 @@
 import hashlib
 import re
 import time
+import socket
+import ipaddress
 import xml.etree.ElementTree as ET
 from collections import deque
 from urllib.parse import urlparse, urljoin, urldefrag, urlunparse
@@ -61,6 +63,14 @@ class Crawler:
         ))
 
     @staticmethod
+    def _public_host(host):
+        try:
+            addresses=socket.getaddrinfo(host,None)
+            return bool(addresses) and all(ipaddress.ip_address(item[4][0]).is_global for item in addresses)
+        except Exception:
+            return False
+
+    @staticmethod
     def _canonical_host(domain):
         host = (urlparse(domain).hostname or domain).lower().strip(".")
         return host[4:] if host.startswith("www.") else host
@@ -74,7 +84,7 @@ class Crawler:
             cap = max(1, min(int(configured_cap), settings.max_pages))
             depth = max(0, min(int(configured_depth), settings.max_crawl_depth))
             results.append(self.crawl_domain(domain, cap, depth))
-        return {"status": "completed", "crawler_version": "0.4.0", "domains": results}
+        return {"status": "completed", "crawler_version": "0.5.0", "domains": results}
 
     def _robots(self, domain):
         # Robots policy is evaluated separately for each permitted host variant.
@@ -85,7 +95,14 @@ class Crawler:
             robots_url = f"https://{host}/robots.txt"
             parser = RobotFileParser()
             try:
-                response = self.session.get(robots_url, timeout=settings.timeout)
+                if not self._public_host(host):
+                    raise requests.RequestException("host does not resolve exclusively to public IP addresses")
+                response = self.session.get(robots_url, timeout=settings.timeout, allow_redirects=False)
+                if response.status_code in (301,302,303,307,308):
+                    target=self._normalize_url(urljoin(robots_url,response.headers.get("Location","")))
+                    if not self._same_site(target,domain) or not self._public_host(urlparse(target).hostname or ""):
+                        raise requests.RequestException("robots.txt redirected outside approved public host")
+                    response=self.session.get(target,timeout=settings.timeout,allow_redirects=False)
                 if response.status_code == 404:
                     parser.parse([])
                 else:
@@ -119,15 +136,22 @@ class Crawler:
         found = []
         metadata = {}
         failures = []
-        while candidates and len(found) < settings.max_sitemap_urls:
+        while candidates and len(found) < settings.max_sitemap_urls and len(visited_sitemaps) < settings.max_sitemaps:
             sitemap_url = self._normalize_url(candidates.pop(0))
             if sitemap_url in visited_sitemaps:
                 continue
             visited_sitemaps.add(sitemap_url)
-            if not self._same_site(sitemap_url, domain):
+            if not self._same_site(sitemap_url, domain) or not self._public_host(urlparse(sitemap_url).hostname or ""):
                 continue
             try:
-                response = self.session.get(sitemap_url, timeout=settings.timeout, allow_redirects=True)
+                response = self.session.get(sitemap_url, timeout=settings.timeout, allow_redirects=False)
+                if response.status_code in (301,302,303,307,308):
+                    redirect_target = self._normalize_url(urljoin(sitemap_url, response.headers.get("Location", "")))
+                    if redirect_target and self._same_site(redirect_target, domain) and self._public_host(urlparse(redirect_target).hostname or ""):
+                        candidates.append(redirect_target)
+                    else:
+                        failures.append({"url": sitemap_url, "error": "off_site_sitemap_redirect"})
+                    continue
                 if response.status_code >= 400:
                     failures.append({"url": sitemap_url, "status_code": response.status_code})
                     continue

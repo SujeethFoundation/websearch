@@ -3,14 +3,16 @@
   "Values": {
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "python",
-    "ONTOLOGY_API_URL": "https://YOUR-ONTOLOGY-APP.azurewebsites.net",
-    "ONTOLOGY_FUNCTION_KEY": "PASTE_HOST_KEY_LOCALLY",
-    "LOCAL_DATA_DIR": "data",
+    "ONTOLOGY_API_URL": "https://ontology-ghgedphdh6eefych.eastus-01.azurewebsites.net",
+    "ONTOLOGY_FUNCTION_KEY": "",
+    "BLOB_STORAGE_CONNECTION_STRING": "",
+    "BLOB_CONTAINER": "web-content",
+    "CRAWL_QUEUE_NAME": "web-crawl-pages",
+    "CRAWL_POISON_QUEUE_NAME": "web-crawl-pages-poison",
     "MAX_PAGES_PER_DOMAIN": "1000",
-    "MAX_QUERY_CONCEPTS": "5",
-    "REQUEST_TIMEOUT_SECONDS": "20",
+    "MAX_SITEMAPS_PER_DOMAIN": "100",
     "MAX_CRAWL_DEPTH": "5",
-    "CRAWL_DELAY_SECONDS": "0.5",
-    "MAX_SITEMAP_URLS": "5000"
+    "MAX_PAGE_BYTES": "5000000",
+    "CRAWL_DELAY_SECONDS": "0.5"
   }
 }

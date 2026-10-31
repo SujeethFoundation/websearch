@@ -91,3 +91,11 @@ class SearchService:
                 self.storage.put(doc["_key"], doc)
                 updated += 1
         return updated
+
+    def delete_url(self, url):
+        removed = 0
+        for doc in list(self.storage.list("documents/")):
+            if doc.get("url") == url:
+                self.storage.delete(doc.get("_key") or ("documents/" + str(doc.get("id")) + ".json"))
+                removed += 1
+        return removed

@@ -68,3 +68,11 @@ class StorageService:
             "document_count": len(documents),
             "checked_utc": datetime.now(timezone.utc).isoformat(),
         }
+
+    def delete(self, name):
+        if self.container:
+            try: self.container.delete_blob(name)
+            except Exception: pass
+        else:
+            try: self._path(name).unlink()
+            except FileNotFoundError: pass
