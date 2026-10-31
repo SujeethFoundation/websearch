@@ -175,3 +175,17 @@ Keep `BLOB_STORAGE_CONNECTION_STRING` and `BLOB_CONTAINER=web-content` as alread
   persistent crawl checkpoints, stale-page deletion, a background queue, or semantic
   page prioritization. Crawled chunks currently carry an empty `concepts` list.
 - Respect site terms, robots directives, rate limits, and any privacy/access restrictions.
+
+
+## Version 0.3.1 — apex/www sitemap compatibility
+
+- Treats `sujeeth.org` and `www.sujeeth.org` as the same approved website.
+- Checks robots.txt independently for both permitted host variants and refuses to crawl a host whose robots policy could not be retrieved.
+- Discovers sitemap locations from both robots.txt files and conventional sitemap paths.
+- Parses sitemap URL sets and nested sitemap indexes.
+- Processes sitemap-discovered URLs before relying on homepage link discovery.
+- Follows redirects between apex and www, but rejects redirects to unrelated hosts.
+- Adds skip-reason counts, sitemap failures, robots errors, and sitemap-page crawl counts.
+- Retains same-site HTTPS restriction, page/depth limits, and request delay.
+
+The sitemap `<lastmod>` metadata is currently included only where parsed by the crawler; the supplied sitemap's `<lastmod>` fields can be added to per-URL metadata in a later refinement. The crawler remains synchronous and does not yet checkpoint unfinished queues or assign ontology concepts to document chunks.
