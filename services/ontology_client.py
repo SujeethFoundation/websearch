@@ -58,3 +58,16 @@ class OntologyClient:
             "domains": domains,
             "purpose": purpose,
         })
+
+
+    def domain_concepts(self, domain):
+        """Return the ontology-approved concept IDs associated with a crawl domain."""
+        from urllib.parse import quote
+        payload = self.get("/api/ontology/domains/" + quote(domain, safe="") + "/concepts")
+        if isinstance(payload, dict):
+            values = payload.get("associated_concepts") or payload.get("concepts") or payload.get("domain_concepts") or []
+            if isinstance(values, list):
+                return [str(x.get("id") if isinstance(x, dict) else x) for x in values if x]
+        if isinstance(payload, list):
+            return [str(x.get("id") if isinstance(x, dict) else x) for x in payload if x]
+        return []

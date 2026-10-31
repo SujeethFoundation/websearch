@@ -15,10 +15,11 @@ from services.config import settings
 class Crawler:
     """Bounded sitemap-first crawler; treats apex and www as one approved site."""
 
-    def __init__(self, ontology, storage, search):
+    def __init__(self, ontology, storage, search, concept_resolver=None):
         self.ontology = ontology
         self.storage = storage
         self.search = search
+        self.concept_resolver = concept_resolver
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "SujeethFoundationKnowledgeCrawler/0.3.1 (+contact site owner)"
@@ -73,7 +74,7 @@ class Crawler:
             cap = max(1, min(int(configured_cap), settings.max_pages))
             depth = max(0, min(int(configured_depth), settings.max_crawl_depth))
             results.append(self.crawl_domain(domain, cap, depth))
-        return {"status": "completed", "crawler_version": "0.3.1", "domains": results}
+        return {"status": "completed", "crawler_version": "0.4.0", "domains": results}
 
     def _robots(self, domain):
         # Robots policy is evaluated separately for each permitted host variant.
@@ -160,6 +161,7 @@ class Crawler:
     def crawl_domain(self, domain, cap, max_depth=None):
         domain = self._canonical_host(domain)
         max_depth = settings.max_crawl_depth if max_depth is None else max_depth
+        allowed_concepts = self.ontology.domain_concepts(domain) if self.ontology else []
         start_url = f"https://{domain}/"
 
         robots, sitemap_seeds, robots_errors = self._robots(domain)
@@ -186,6 +188,8 @@ class Crawler:
         skip_reasons = {}
         error_samples = []
         sitemap_pages_crawled = 0
+        chunks_tagged = 0
+        chunks_without_concepts = 0
 
         while queue and pages_crawled < cap:
             url, depth = queue.popleft()
@@ -245,13 +249,19 @@ class Crawler:
                     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
                     page_id = hashlib.sha256(final_url.encode("utf-8")).hexdigest()
                     for index, start in enumerate(range(0, len(text), 1800)):
+                        chunk_text = text[start:start + 1800]
+                        chunk_concepts = self.concept_resolver.tag_document(title, chunk_text, allowed_concepts) if self.concept_resolver else []
+                        if chunk_concepts:
+                            chunks_tagged += 1
+                        else:
+                            chunks_without_concepts += 1
                         self.search.upsert({
                             "id": f"{page_id}-{index}",
                             "title": title,
-                            "content": text[start:start + 1800],
+                            "content": chunk_text,
                             "url": final_url,
                             "domain": domain,
-                            "concepts": [],
+                            "concepts": chunk_concepts,
                             "content_hash": digest,
                             "crawl_depth": depth,
                             "sitemap_lastmod": sitemap_metadata.get(url, {}).get("lastmod"),
@@ -275,6 +285,9 @@ class Crawler:
             "pages_crawled": pages_crawled,
             "sitemap_urls_discovered": len(sitemap_urls),
             "sitemap_pages_crawled": sitemap_pages_crawled,
+            "chunks_tagged": chunks_tagged,
+            "chunks_without_concepts": chunks_without_concepts,
+            "domain_allowed_concepts": allowed_concepts,
             "sitemaps_found": sitemap_count,
             "sitemap_failures": sitemap_failures[:10],
             "robots_errors": robots_errors[:5],

@@ -17,7 +17,7 @@ storage = StorageService()
 ontology = OntologyClient()
 concept_resolver = ConceptResolver(ontology)
 searcher = SearchService(storage)
-crawler = Crawler(ontology, storage, searcher)
+crawler = Crawler(ontology, storage, searcher, concept_resolver)
 
 
 def response(data, status=200):
@@ -93,12 +93,12 @@ def health(req):
     return response({
         "status": "healthy",
         "service": "Sujeeth Foundation Web Search",
-        "version": "0.3.1",
+        "version": "0.4.0",
         "storage_mode": storage.mode,
         "embedding_configured": settings.embedding_configured,
         "ontology_configured": bool(settings.ontology_api_url),
         "concept_resolution_required": True,
-        "crawler_version": "0.3.1",
+        "crawler_version": "0.4.0",
         "max_pages_per_domain": settings.max_pages,
         "max_crawl_depth": settings.max_crawl_depth,
         "search_mode": "hybrid" if settings.embedding_configured else "keyword_fallback",
@@ -212,3 +212,15 @@ def reindex(req):
     except Exception as exc:
         log.exception("Reindex failed")
         return response({"error": str(exc)}, 500)
+
+
+@app.route(route="enrich", methods=["POST"])
+def enrich(req):
+    """Backfill ontology concept tags on content already stored by the crawler."""
+    try:
+        result = concept_resolver.enrich_existing_documents(storage, searcher)
+        result["ontology_version"] = ontology.summary().get("ontology_version")
+        return response(result)
+    except Exception as exc:
+        log.exception("Document concept enrichment failed")
+        return response({"error": str(exc), "stage": "document_enrichment"}, 502)

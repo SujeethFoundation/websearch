@@ -215,3 +215,88 @@ class ConceptResolver:
             "domain_resolution": domain_result,
             "domain_filtering": "concept_selected_domains_only",
         }
+
+
+    def tag_document(self, title, content, allowed_concepts):
+        """
+        Assign conservative ontology class IDs to a content chunk.
+        The domain's ontology-approved associated_concepts list is the hard boundary.
+        Matching uses class names and declared aliases/synonyms, not free-form guessing.
+        """
+        catalog = self._load_catalog()
+        allowed = {str(x).strip().lower() for x in (allowed_concepts or []) if str(x).strip()}
+        if not allowed:
+            return []
+
+        classes = {
+            self._class_id(item).lower(): item
+            for item in catalog["classes"]
+            if isinstance(item, dict) and self._class_id(item)
+        }
+        text = normalize(f"{title or ''} {content or ''}")
+        text_tokens = set(text.split())
+        matches = []
+
+        for concept_id in allowed:
+            item = classes.get(concept_id)
+            if not item:
+                continue
+            aliases = [
+                item.get("name", ""),
+                item.get("id", "").replace("_", " "),
+            ]
+            for field in ("aliases", "synonyms", "alternative_terms", "alternate_names"):
+                values = item.get(field, [])
+                if isinstance(values, str):
+                    aliases.append(values)
+                elif isinstance(values, list):
+                    aliases.extend(values)
+
+            best = 0.0
+            for alias in aliases:
+                alias_norm = normalize(alias)
+                if not alias_norm:
+                    continue
+                alias_tokens = set(alias_norm.split())
+                if len(alias_tokens) == 1:
+                    # Single-word labels must occur as a complete token and be reasonably distinctive.
+                    score = 1.0 if alias_norm in text_tokens else 0.0
+                elif f" {alias_norm} " in f" {text} ":
+                    score = 1.0
+                else:
+                    overlap = len(alias_tokens & text_tokens)
+                    score = overlap / len(alias_tokens)
+                    if overlap < 2:
+                        score = 0.0
+                best = max(best, score)
+
+            if best >= 0.75:
+                matches.append((best, concept_id))
+
+        # Stable order: strongest match first, then canonical ID.
+        return [concept_id for _, concept_id in sorted(matches, key=lambda x: (-x[0], x[1]))]
+
+    def enrich_existing_documents(self, storage, searcher):
+        """Backfill ontology tags for previously crawled chunks."""
+        updated = 0
+        unchanged = 0
+        missing_domain_concepts = []
+        for doc in storage.list("documents/"):
+            domain = str(doc.get("domain", "")).lower()
+            allowed = self.ontology.domain_concepts(domain)
+            if not allowed:
+                missing_domain_concepts.append(domain)
+                continue
+            concepts = self.tag_document(doc.get("title", ""), doc.get("content", ""), allowed)
+            if concepts != doc.get("concepts", []):
+                doc["concepts"] = concepts
+                storage.put(doc["_key"], doc)
+                updated += 1
+            else:
+                unchanged += 1
+        return {
+            "status": "completed",
+            "documents_updated": updated,
+            "documents_unchanged": unchanged,
+            "domains_without_concept_scope": sorted(set(missing_domain_concepts)),
+        }
