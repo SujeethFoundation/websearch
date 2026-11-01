@@ -6,6 +6,17 @@ import requests
 from bs4 import BeautifulSoup
 from services.config import settings
 
+# HTTP statuses that retrying will not fix. 408/429/5xx are not listed and stay retryable.
+PERMANENT_HTTP_STATUSES = {400, 401, 403, 404, 405, 406, 410, 451}
+
+
+class PermanentPageError(Exception):
+    """A condition a queue retry cannot fix. The page is skipped, not re-queued."""
+    def __init__(self, reason, message=None):
+        super().__init__(message or reason)
+        self.reason = reason
+
+
 class PageWorker:
     def __init__(self, ontology, storage, search, resolver, state):
         self.ontology,self.storage,self.search,self.resolver,self.state=ontology,storage,search,resolver,state
@@ -33,20 +44,20 @@ class PageWorker:
         current=url
         for _ in range(6):
             if not self.same_site(current,domain):
-                raise RuntimeError('Redirect target is outside the approved site')
+                raise PermanentPageError('redirect_off_site','Redirect target is outside the approved site')
             host=urlparse(current).hostname or ''
             if not self.safe_public_host(host):
-                raise RuntimeError('URL resolves to a non-public IP address')
+                raise PermanentPageError('non_public_ip','URL resolves to a non-public IP address')
             response=self.session.get(current,headers=headers or {},timeout=settings.timeout,
                                       allow_redirects=False,stream=stream)
             if response.status_code in (301,302,303,307,308):
                 location=response.headers.get('Location')
                 response.close()
-                if not location: raise RuntimeError('Redirect response omitted Location')
+                if not location: raise PermanentPageError('redirect_no_location','Redirect response omitted Location')
                 current=self.normalize(urljoin(current,location))
                 continue
             return response
-        raise RuntimeError('Redirect limit exceeded')
+        raise PermanentPageError('redirect_limit','Redirect limit exceeded')
 
     def process(self, task):
         job_id, domain, url, depth = task['job_id'], task['domain'], self.normalize(task['url']), int(task.get('depth', 0))
@@ -102,6 +113,8 @@ class PageWorker:
                 sitemap_urls, _, _, _ = sitemap_crawler._sitemap_urls(domain,sitemap_seeds)
                 for sitemap_url in sitemap_urls:
                     self.state.enqueue_page(job_id,domain,sitemap_url,1)
+        except PermanentPageError as exc:
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'robots_'+exc.reason},pages_skipped=1); return {'status': 'completed'}
         except Exception as exc:
             raise RuntimeError(f'robots policy could not be verified: {exc}')
 
@@ -110,10 +123,16 @@ class PageWorker:
         if previous:
             if previous.get('etag'): headers['If-None-Match']=previous['etag']
             if previous.get('last_modified'): headers['If-Modified-Since']=previous['last_modified']
-        response=self.safe_get(url,domain,headers=headers,stream=True)
+        try:
+            response=self.safe_get(url,domain,headers=headers,stream=True)
+        except PermanentPageError as exc:
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':exc.reason},pages_skipped=1); return {'status': 'completed'}
         if response.status_code==304:
             self.state.manifest_put(domain,url,last_seen_job=job_id,last_status=304)
             self._complete(job_id,url,claim_token,'unchanged',pages_processed=1); self._finalize_if_safe(job_id,domain); return {'status': 'completed'}
+        if response.status_code in PERMANENT_HTTP_STATUSES:
+            response.close()
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':f'http_{response.status_code}'},pages_skipped=1); return {'status': 'completed'}
         response.raise_for_status()
         final_url=self.normalize(response.url)
         if not self.same_site(final_url,domain):
