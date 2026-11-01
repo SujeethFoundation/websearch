@@ -386,6 +386,95 @@ def crawl_dashboard(req):
         domain_rows.append({"domain":domain,"crawl_enabled":True,"latest_job":by_domain.get(domain)})
     return response({"domains":domain_rows,"recent_jobs":jobs,"index":storage.status(),"generated_utc":__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()})
 
+@app.route(route="crawl/domain-stats", methods=["GET"])
+def crawl_domain_stats(req):
+    if not crawl_state:
+        return response({"error": "Crawl state is not configured"}, 503)
+
+    try:
+        # Retrieve crawl history across domains.
+        jobs = crawl_state.list_jobs(10000)
+
+        stats = {}
+
+        for job in jobs:
+            domain = str(job.get("domain", "unknown")).lower()
+
+            if domain not in stats:
+                stats[domain] = {
+                    "domain": domain,
+                    "jobs": 0,
+                    "job_statuses": {},
+                    "pages_discovered": 0,
+                    "processed": 0,
+                    "unchanged": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "queued": 0,
+                    "processing": 0,
+                    "publish_failed": 0,
+                    "chunks_indexed": 0,
+                    "chunks_tagged": 0,
+                    "chunks_untagged": 0,
+                    "pending": 0,
+                    "latest_job": None,
+                    "latest_created_utc": None,
+                    "latest_updated_utc": None
+                }
+
+            row = stats[domain]
+            row["jobs"] += 1
+
+            status = job.get("status", "unknown")
+            row["job_statuses"][status] = (
+                row["job_statuses"].get(status, 0) + 1
+            )
+
+            # Aggregate counters stored on each crawl job.
+            for field in (
+                "pages_discovered",
+                "chunks_indexed",
+                "chunks_tagged",
+                "chunks_untagged",
+                "pending"
+            ):
+                row[field] += int(job.get(field, 0) or 0)
+
+            # The job list is newest first.
+            if row["latest_job"] is None:
+                row["latest_job"] = job.get("RowKey")
+                row["latest_status"] = status
+                row["latest_created_utc"] = job.get("created_utc")
+                row["latest_updated_utc"] = job.get("updated_utc")
+
+            # Count actual page states from the page table.
+            for page in crawl_state.page_records(job["RowKey"]):
+                page_status = page.get("status", "queued")
+
+                if page_status in (
+                    "processed",
+                    "unchanged",
+                    "skipped",
+                    "failed",
+                    "queued",
+                    "processing",
+                    "publish_failed"
+                ):
+                    row[page_status] += 1
+
+        return response({
+            "domain_count": len(stats),
+            "job_count": len(jobs),
+            "aggregation": "all retained crawl jobs; page counts are per-job records",
+            "domains": sorted(
+                stats.values(),
+                key=lambda x: x["domain"]
+            )
+        })
+
+    except Exception as exc:
+        log.exception("Domain crawl statistics failed")
+        return response({"error": str(exc)}, 500)
 
 @app.route(route="crawl/{job_id}", methods=["GET"])
 def crawl_get(req):
