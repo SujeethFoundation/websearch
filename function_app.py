@@ -2,6 +2,7 @@
 import json
 import logging
 import azure.functions as func
+from azure.storage.queue import QueueClient, TextBase64EncodePolicy
 
 from services.config import settings
 from services.ontology_client import OntologyClient
@@ -103,17 +104,19 @@ def health(req):
     return response({
         "status": "healthy",
         "service": "Sujeeth Foundation Web Search",
-        "version": "0.6.1",
+        "version": "0.7.0",
         "storage_mode": storage.mode,
         "embedding_configured": settings.embedding_configured,
+        "ai_search_configured": settings.search_configured,
+        "ai_search_index": settings.search_index_name,
         "ontology_configured": bool(settings.ontology_api_url),
         "concept_resolution_required": True,
-        "crawler_version": "0.6.1",
+        "crawler_version": "0.7.0",
         "persistent_crawl_jobs": bool(crawl_state),
         "crawl_queue": settings.crawl_queue,
         "max_pages_per_domain": settings.max_pages,
         "max_crawl_depth": settings.max_crawl_depth,
-        "search_mode": "hybrid" if settings.embedding_configured else "keyword_fallback",
+        "search_mode": "azure_ai_search_hybrid" if settings.search_configured and settings.embedding_configured else "not_configured",
     })
 
 
@@ -185,7 +188,11 @@ def sources(req):
 
 @app.route(route="index-status", methods=["GET"])
 def index_status(req):
-    return response(storage.status())
+    try:
+        return response({"blob_storage": storage.status(), "ai_search": searcher.status()})
+    except Exception as exc:
+        log.exception("Index status failed")
+        return response({"error": str(exc)}, 502)
 
 
 @app.route(route="refresh", methods=["POST"])
@@ -219,10 +226,38 @@ def refresh(req):
 
 @app.route(route="reindex", methods=["POST"])
 def reindex(req):
+    return response({
+        "error": "Use POST /api/index/backfill to queue a resumable Azure AI Search backfill.",
+        "backfill_endpoint": "/api/index/backfill"
+    }, 409)
+
+
+@app.route(route="index/backfill", methods=["POST"])
+def index_backfill(req):
+    """Start a queue-driven, resumable backfill of existing Blob documents."""
+    if not settings.azure_storage_connection or not storage.container or not queue_processor:
+        return response({"error": "Azure Blob Storage and AzureWebJobsStorage must be configured."}, 503)
+    if not settings.search_configured or not settings.embedding_configured:
+        return response({"error": "Configure Azure AI Search and Foundry embeddings before backfill."}, 503)
     try:
-        return response({"status": "completed", "documents": searcher.rebuild_vectors()})
+        queue = QueueClient.from_connection_string(
+            settings.azure_storage_connection,
+            settings.crawl_queue,
+            message_encode_policy=TextBase64EncodePolicy(),
+        )
+        queue.send_message(json.dumps({
+            "task_type": "index_backfill_page",
+            "continuation_token": None,
+        }))
+        return response({
+            "status": "queued",
+            "task_type": "index_backfill_page",
+            "source_prefix": "documents/",
+            "batch_size": settings.index_backfill_batch_size,
+            "message": "The queue worker will page through Blob Storage, generate embeddings in batches, and upload documents to sf-knowledge."
+        }, 202)
     except Exception as exc:
-        log.exception("Reindex failed")
+        log.exception("AI Search backfill enqueue failed")
         return response({"error": str(exc)}, 500)
 
 
@@ -567,7 +602,12 @@ def crawl_page_poison(msg: func.QueueMessage):
     if not crawl_state: raise RuntimeError("Crawl state is unavailable")
     try:
         task=json.loads(msg.get_body().decode("utf-8"))
-        crawl_state.fail_page(task.get("job_id"),task.get("url"),"Queue retry limit exceeded; inspect poison queue message and function logs.")
+        if task.get("task_type", "crawl_page") == "crawl_page":
+            crawl_state.fail_page(task.get("job_id"), task.get("url"),
+                "Queue retry limit exceeded; inspect poison queue message and function logs.")
+        else:
+            log.error("AI Search queue task moved to poison queue: task_type=%s payload=%s",
+                      task.get("task_type"), task)
     except Exception:
         log.exception("Could not record poison crawl message")
         raise

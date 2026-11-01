@@ -1,6 +1,7 @@
-.venv/
-__pycache__/
-*.py[cod]
 local.settings.json
+.venv/
+venv/
+__pycache__/
+*.pyc
 data/
-.pytest_cache/
+.python_packages/

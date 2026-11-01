@@ -4,6 +4,7 @@
                     "students.linkedin.com"
                 ],
     "purpose":  "search",
+    "limit":  5,
     "concepts":  [
                      "student",
                      "resume_resource"

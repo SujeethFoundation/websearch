@@ -1,7 +1,8 @@
-.venv/
-.git/
-.gitignore
-__pycache__/
-tests/
+.git*
+.vscode
+.venv
+venv
+__pycache__
+*.pyc
 local.settings.json
-data/
+tests

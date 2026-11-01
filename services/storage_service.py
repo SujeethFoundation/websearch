@@ -1,4 +1,3 @@
-
 import json
 import hashlib
 from pathlib import Path
@@ -37,10 +36,8 @@ class StorageService:
 
     def get(self, name):
         try:
-            raw = (
-                self.container.download_blob(name).readall()
-                if self.container else self._path(name).read_bytes()
-            )
+            raw = (self.container.download_blob(name).readall()
+                   if self.container else self._path(name).read_bytes())
             return json.loads(raw)
         except Exception:
             return None
@@ -61,18 +58,52 @@ class StorageService:
                 except Exception:
                     continue
 
+    def list_blob_name_page(self, prefix, continuation_token=None, page_size=250):
+        """Return blob names only, without downloading blob contents."""
+        if not self.container:
+            names = []
+            for path in self.directory.glob("*.json"):
+                try:
+                    item = json.loads(path.read_text(encoding="utf-8"))
+                    name = item.get("_key", "")
+                    if name.startswith(prefix):
+                        names.append(name)
+                except Exception:
+                    continue
+            names.sort()
+            start = int(continuation_token or 0)
+            page = names[start:start + page_size]
+            next_token = str(start + len(page)) if start + len(page) < len(names) else None
+            return page, next_token
+        pager = self.container.list_blobs(name_starts_with=prefix).by_page(
+            continuation_token=continuation_token, results_per_page=page_size
+        )
+        try:
+            page = next(pager)
+        except StopIteration:
+            return [], None
+        names = [blob.name for blob in page]
+        return names, pager.continuation_token
+
     def status(self):
-        documents = list(self.list("documents/"))
+        if self.container:
+            count = sum(1 for _ in self.container.list_blobs(name_starts_with="documents/"))
+        else:
+            count = sum(1 for _ in self.list("documents/"))
         return {
             "storage_mode": self.mode,
-            "document_count": len(documents),
+            "document_count": count,
             "checked_utc": datetime.now(timezone.utc).isoformat(),
         }
 
     def delete(self, name):
         if self.container:
-            try: self.container.delete_blob(name)
-            except Exception: pass
+            try:
+                self.container.delete_blob(name)
+            except Exception:
+                pass
         else:
-            try: self._path(name).unlink()
-            except FileNotFoundError: pass
+            try:
+                self._path(name).unlink()
+            except FileNotFoundError:
+                pass

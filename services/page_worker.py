@@ -169,14 +169,17 @@ class PageWorker:
         self.search.delete_url(final_url)
         page_id=hashlib.sha256(final_url.encode()).hexdigest(); chunks=tagged=untagged=0
         allowed=json.loads(job.get('allowed_concepts_json','[]'))
+        page_documents=[]
         for index,start in enumerate(range(0,len(text),settings.chunk_chars)):
             chunk=text[start:start+settings.chunk_chars]
             concepts=self.resolver.tag_document(title,chunk,allowed)
-            self.search.upsert({'id':f'{page_id}-{index}','title':title,'content':chunk,'url':final_url,'domain':domain,
+            page_documents.append({'id':f'{page_id}-{index}','title':title,'content':chunk,'url':final_url,'domain':domain,
                 'concepts':concepts,'content_hash':digest,'page_hash':digest,'crawl_depth':depth,'page_type':page_type,
                 'etag':response.headers.get('ETag'),'last_modified':response.headers.get('Last-Modified'),
                 'crawled_utc':datetime.now(timezone.utc).isoformat()})
             chunks+=1; tagged+=bool(concepts); untagged+=not bool(concepts)
+        if page_documents:
+            self.search.upsert_many(page_documents, persist_blobs=True)
         self.state.manifest_put(domain,final_url,content_hash=digest,last_seen_job=job_id,etag=response.headers.get('ETag'),
             last_modified=response.headers.get('Last-Modified'),page_type=page_type,chunk_count=chunks)
         # Discover URLs before marking this page complete, so pending never transiently reaches zero.

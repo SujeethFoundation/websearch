@@ -1,6 +1,9 @@
 {
   "version": "2.0",
-  "functionTimeout": "00:10:00",
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.*, 5.0.0)"
+  },
   "extensions": {
     "queues": {
       "messageEncoding": "base64",
@@ -9,17 +12,5 @@
       "maxDequeueCount": 5,
       "visibilityTimeout": "00:15:00"
     }
-  },
-  "logging": {
-    "applicationInsights": {
-      "samplingSettings": {
-        "isEnabled": true,
-        "excludedTypes": "Request"
-      }
-    }
-  },
-  "extensionBundle": {
-    "id": "Microsoft.Azure.Functions.ExtensionBundle",
-    "version": "[4.*, 5.0.0)"
   }
 }
