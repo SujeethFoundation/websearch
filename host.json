@@ -3,6 +3,7 @@
   "functionTimeout": "00:10:00",
   "extensions": {
     "queues": {
+      "messageEncoding": "base64",
       "batchSize": 1,
       "newBatchThreshold": 1,
       "maxDequeueCount": 5,

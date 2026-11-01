@@ -3,7 +3,10 @@ import hashlib, json, uuid
 from datetime import datetime, timezone
 from azure.data.tables import TableServiceClient, UpdateMode
 from azure.core import MatchConditions
-from azure.storage.queue import QueueServiceClient
+from azure.storage.queue import (
+    QueueServiceClient,
+    TextBase64EncodePolicy
+)
 from services.config import settings
 from azure.core.exceptions import ResourceExistsError
 
@@ -25,7 +28,10 @@ class CrawlState:
             except ResourceExistsError:
                 pass
         self.queues = QueueServiceClient.from_connection_string(settings.azure_storage_connection)
-        self.queue = self.queues.get_queue_client(settings.crawl_queue)
+        self.queue = self.queues.get_queue_client(
+            settings.crawl_queue,
+            message_encode_policy=TextBase64EncodePolicy()
+        )
         try: self.queue.create_queue()
         except Exception: pass
 
