@@ -1,5 +1,5 @@
 """One-URL-at-a-time crawler worker. Queue retries make page work resumable."""
-import hashlib, re, ipaddress, socket, time
+import hashlib, re, ipaddress, socket, time, json
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
 import requests
