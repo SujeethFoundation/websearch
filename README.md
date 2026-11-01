@@ -1,169 +1,157 @@
-# Sujeeth Foundation Web Search Function — v0.5.0
+# Sujeeth Foundation Web Search — v0.7.x
 
-This release upgrades the v0.4.0 crawler with persistent, page-level background crawl jobs while preserving the existing ontology-gated search and concept-tagging implementation.
+Azure Functions app (Python v2) that crawls ontology-approved websites, stores the text in Blob Storage, indexes it in Azure AI Search, and serves ontology-gated search to the MCP server and other clients.
 
-## Main changes
+For the AI Search index contract and first-time setup, see [README-AI-SEARCH.md](README-AI-SEARCH.md).
 
-- Persistent job, page-state, and URL-manifest tables using Azure Table Storage.
-- Azure Storage Queue page workers: each URL is a separate retryable task, rather than one long HTTP crawl request.
-- Crawl jobs can be inspected and cancelled; queue poison messages are recorded as failed pages.
-- Sitemap URLs are discovered and seeded by the background homepage worker, then same-site links are discovered breadth-first.
-- Incremental fetches use ETag and Last-Modified conditional requests; content hashes prevent unnecessary re-indexing.
-- HTML, PDF, and DOCX text extraction, canonical URL handling, page-size limits, navigation/boilerplate removal, and chunk metadata.
-- Domain allowlist and ontology concept restrictions remain mandatory.
-- Robots.txt is checked before fetching each URL; 401/403 blocks crawling; inability to verify robots policy causes queue retry rather than assuming permission.
-- Public-IP DNS check, HTTPS-only same-site restriction, redirect checks, bounded page size, configurable request timeouts, depth and page caps.
-- Conservative stale-page cleanup: old URLs are deleted only after a fully clean crawl that completed below the page cap with no skipped or failed pages. Incomplete/limited/errored crawls never trigger deletion.
-- Dashboard endpoint reports all ontology crawl-enabled domains, latest jobs, and index size.
+## How it fits together
 
-## Important architecture notes
+| Piece | Role |
+|---|---|
+| Ontology app | Decides which domains may be crawled or searched and which concepts a query maps to. Crawl size limits are **not** in the ontology. |
+| Blob Storage (`documents/`) | Durable copy of every chunk (JSON). The index can be rebuilt from it. |
+| Table Storage | Crawl jobs, page state, and the cross-crawl URL manifest. |
+| Queue Storage | One message per page to crawl, plus backfill and re-tag tasks. Failed tasks go to the poison queue. |
+| Azure AI Search (`sf-knowledge`) | Hybrid keyword + vector retrieval. The **index's vectorizer** turns query text into a vector, using the same Azure OpenAI embedding deployment that indexing uses. |
+| Azure OpenAI / Foundry (`sf-embeddings`) | Embeds chunks at indexing time. |
 
-- Blob Storage remains the content/chunk store.
-- Azure Table Storage holds job state, per-job URL deduplication, and the cross-crawl URL manifest.
-- Azure Queue Storage holds page tasks. Azure Functions Queue Trigger provides retries; exhausted tasks go to the poison queue and are recorded as failures.
-- The legacy `POST /api/refresh` endpoint is retained for compatibility but is synchronous. Use `POST /api/crawl` for production crawl runs.
-- The new worker uses a single URL per queue invocation, which keeps individual executions bounded. Azure Queue delivery is at-least-once; writes are idempotent by deterministic page/chunk IDs and per-job URL records.
-- Stale deletion is deliberately conservative. A crawl with any skipped URL, queue failure, or page-cap hit will not delete old content.
-- AI-assisted concept classification is not enabled in this release. The existing deterministic ontology-approved concept resolver remains in use; untagged pages are visible in job metrics.
-- This release has not been deployed or integration-tested against your Azure resources. Run the smoke tests below on a small domain before starting all domains.
+Every search must resolve to ontology concepts and approved domains first. If no concept matches, nothing is searched.
 
-## Required Azure Function App settings
+## Endpoints
 
-Keep your existing settings and add/verify:
+All routes require a Function key and are under `/api`.
 
-| Setting | Example | Purpose |
+**Search and content**
+
+| Route | Purpose |
+|---|---|
+| `GET /health` | Version, configuration flags, search mode |
+| `GET /search?q=` and `POST /search` | Ontology-gated hybrid search. Body: `query`, optional `concepts`, `domains`, `limit` (max 5) |
+| `POST /domain-resolution` | Show how a query resolves to concepts and domains |
+| `POST /document` | Read an indexed page. Body: `url` or `chunk_id`, optional `neighbors` (0–3, default 1), `max_chars` (500–20000, default 6000) |
+| `GET /sources` | Approved search sources |
+| `GET /index-status` | Blob document count and AI Search document count (lists all blobs; do not poll it every minute) |
+
+`POST /document` returns the full page for domains in `FULL_TEXT_DOMAINS`. All other domains return an excerpt only (`EXCERPT_MAX_CHARS`) with `excerpt_only: true`. The domain must be approved by the ontology for search (403 otherwise). A page that is not in the index returns 404.
+
+**Crawling**
+
+| Route | Purpose |
+|---|---|
+| `POST /crawl` | Start jobs. Optional body `{"domains": ["sujeeth.org"]}` |
+| `POST /crawl/all` | Start a job for every crawl-enabled domain without an active job |
+| `GET /crawl-status` | Recent jobs |
+| `GET /crawl-dashboard` | Every crawl-enabled domain with its latest job |
+| `GET /crawl/domain-stats` | Per-domain statistics |
+| `GET /crawl/{job_id}` | One job |
+| `GET /crawl/{job_id}/pages` | Page records for a job |
+| `POST /crawl/{job_id}/cancel` | Stop a job. Queued messages for it finish immediately |
+| `POST /crawl/{job_id}/resume` | Resume failed tasks |
+| `POST /crawl/{job_id}/reconcile` | Rebuild job counters from page records |
+| `POST /crawl/{job_id}/recover` | Requeue stale pages and expired leases. Optional body `{"stale_minutes": 25}` (5–240) |
+
+Note: the status and dashboard routes use a hyphen (`crawl-status`, `crawl-dashboard`) so they do not collide with `crawl/{job_id}`.
+
+**Index maintenance**
+
+| Route | Purpose |
+|---|---|
+| `POST /index/backfill` | Queue a resumable backfill of all Blob documents into the index (re-embeds everything; start it once) |
+| `POST /index/retag-preview` | Read-only sample of how many stored documents a re-tag would change. Body: optional `domains`, `scan_limit` (max 1000) |
+| `POST /index/retag` | Queue a re-tag of stored documents with the current ontology. Updates Blob Storage and merges tags into the index. Uses no embedding quota. Body: optional `domains` |
+| `POST /refresh`, `POST /enrich`, `POST /reindex` | Legacy. `reindex` returns 409 and points to backfill |
+
+## Scheduled jobs (UTC)
+
+| Function | Schedule | What it does |
 |---|---|---|
-| `AzureWebJobsStorage` | existing storage connection string | Queue + Table storage binding and state |
-| `CRAWL_QUEUE_NAME` | `web-crawl-pages` | Page task queue |
-| `CRAWL_POISON_QUEUE_NAME` | `web-crawl-pages-poison` | Exhausted-task queue |
-| `MAX_PAGES_PER_DOMAIN` | `1000` | Per-domain safety cap |
-| `MAX_CRAWL_DEPTH` | `5` | Link depth cap |
-| `MAX_PAGE_BYTES` | `5000000` | Maximum response size |
-| `MAX_SITEMAPS_PER_DOMAIN` | `100` | Maximum sitemap files inspected per domain |
-| `MIN_TEXT_CHARS` | `80` | Ignore near-empty extraction |
-| `CHUNK_CHARS` | `1800` | Text chunk size |
-| `CRAWL_DELAY_SECONDS` | `0.5` | Per-worker politeness delay |
-| `REQUEST_TIMEOUT_SECONDS` | `20` | HTTP timeout |
-| `CRAWLER_USER_AGENT` | `SujeethFoundationKnowledgeCrawler/0.5 (+https://www.sujeeth.org)` | Robots identity |
+| `scheduled_crawl_recovery` | Daily 10:00 | Reconciles and recovers unfinished jobs (up to 30 days old). Jobs that finished with errors are retried for 3 days only |
+| `scheduled_weekly_crawl` | Sundays 08:00 | Starts an incremental crawl for each domain in `WEEKLY_CRAWL_DOMAINS` (default `*`, every crawl-enabled domain). Skips domains that already have an open job |
 
-The app identity/connection must be able to create queues and tables in the storage account referenced by `AzureWebJobsStorage`. The current implementation uses a connection string, consistent with the existing Function App. Managed identity/RBAC can be a later security improvement.
+Incremental crawls use ETag and Last-Modified conditional requests and content hashes. Unchanged pages are not re-embedded or re-written, but every crawl still creates new job rows and queue messages for every page it visits.
 
-The content Blob Storage settings remain:
+## Settings
 
-- `BLOB_STORAGE_CONNECTION_STRING`
-- `BLOB_CONTAINER=web-content`
+Set these under **Function App → Settings → Environment variables**. Keep secrets out of source control.
 
-The ontology settings remain:
+| Setting | Default | Purpose |
+|---|---|---|
+| `AzureWebJobsStorage` | none | Queue and Table storage |
+| `BLOB_STORAGE_CONNECTION_STRING`, `BLOB_CONTAINER` | none, `web-content` | Chunk storage |
+| `CRAWL_QUEUE_NAME`, `CRAWL_POISON_QUEUE_NAME` | `web-crawl-pages`, `web-crawl-pages-poison` | Queues |
+| `ONTOLOGY_API_URL`, `ONTOLOGY_FUNCTION_KEY` | none | Ontology app |
+| `AZURE_SEARCH_ENDPOINT`, `AZURE_SEARCH_API_KEY`, `AZURE_SEARCH_INDEX_NAME`, `AZURE_SEARCH_API_VERSION` | see README-AI-SEARCH | AI Search (admin key) |
+| `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`, `AZURE_OPENAI_EMBEDDING_DIMENSIONS` | `sf-embeddings`, `v1`, `1536` | Embeddings |
+| `MAX_PAGES_PER_DOMAIN` | `1000` in code (deployed: `10000`) | Page cap per domain, for every domain |
+| `MAX_CRAWL_DEPTH` | `5` | Link depth |
+| `CHUNK_CHARS`, `MIN_TEXT_CHARS`, `MAX_PAGE_BYTES`, `REQUEST_TIMEOUT_SECONDS`, `CRAWL_DELAY_SECONDS` | `1800`, `80`, `5000000`, `20`, `0.5` | Extraction and politeness |
+| `INDEX_BACKFILL_BATCH_SIZE`, `AZURE_SEARCH_BATCH_SIZE` | `10`, `100` | Backfill and upload batch sizes |
+| `EMBED_MIN_INTERVAL_SECONDS` | `0` (off) | Minimum seconds between embedding calls on each instance. Protects search from being throttled by indexing |
+| `WEEKLY_CRAWL_DOMAINS` | `*` | Comma-separated domains for the weekly crawl, or `*` for all. If this setting exists with a list, that list wins |
+| `FULL_TEXT_DOMAINS` | `sujeeth.org,topics.sujeeth.org` | Domains `/document` may return in full |
+| `EXCERPT_MAX_CHARS` | `3000` | Cap for every other domain |
 
-- `ONTOLOGY_API_URL`
-- `ONTOLOGY_FUNCTION_KEY`
+## Operating notes
 
-## New endpoints
+- **Search 502 with a 429 inside:** the index vectorizer calls the same embedding deployment as indexing. Heavy indexing can throttle query vectorization and break search. Mitigations: set `EMBED_MIN_INTERVAL_SECONDS`, cap the instance count (Flex Consumption: Settings → Scale and concurrency), or give queries their own embedding deployment.
+- **Page limits live here, not in the ontology.** Every domain gets `MAX_PAGES_PER_DOMAIN` and `MAX_CRAWL_DEPTH`. The ontology only decides which domains are crawl-enabled.
+- **Permanent failures are skipped, not retried:** off-site redirects, redirect loops, non-public IPs, and HTTP 400/401/403/404/405/406/410/451. Timeouts, 429, and 5xx still retry (up to 5 deliveries).
+- **Stale-page cleanup** only runs after a clean crawl: no skipped or failed pages and below the page cap. Because skipped pages block it, domains with dead links will not purge removed pages.
+- **Re-tagging:** tags are assigned at crawl time, and unchanged pages are not re-tagged on later crawls. After an ontology alias or domain-concept change, run `index/retag-preview`, then `index/retag`. The resolver caches the ontology in memory, so restart the app after an ontology deploy.
+- **Backfill** re-embeds every blob. Run it once, after the crawl queue has drained, and watch `index-status` and the poison queue. A second pass fixes gaps (writes are idempotent).
+- **Queue messages are at-least-once.** Writes use deterministic IDs.
 
-All endpoints require the Function key, as before.
-
-### Start background crawl
-
-`POST /api/crawl`
-
-Optional JSON body:
-
-```json
-{"domains": ["sujeeth.org"]}
-```
-
-Omit `domains` to enqueue every crawl-enabled domain returned by the ontology. The API validates requested domains against the ontology crawl manifest before creating jobs.
-
-### Inspect one job
-
-`GET /api/crawl/{job_id}`
-
-### List recent jobs
-
-`GET /api/crawl/status`
-
-### Cancel a job
-
-`POST /api/crawl/{job_id}/cancel`
-
-Cancellation prevents queued tasks from doing more work; already-running HTTP requests may finish.
-
-### Resume failed tasks
-
-`POST /api/crawl/{job_id}/resume`
-
-### Dashboard
-
-`GET /api/crawl/dashboard`
-
-Returns all ontology crawl-enabled domains, their latest job, recent jobs, and index status.
-
-### Existing endpoints preserved
-
-- `GET /api/health`
-- `GET /api/search?q=...`
-- `POST /api/search`
-- `POST /api/domain-resolution`
-- `GET /api/sources`
-- `GET /api/index-status`
-- `POST /api/refresh` (legacy synchronous)
-- `POST /api/reindex`
-- `POST /api/enrich`
-
-## Deployment
-
-1. Add the required Function App settings in Azure Configuration. `AzureWebJobsStorage` should already exist; add both queue-name settings exactly as shown.
-2. Ensure the Function App storage account has Queue and Table service enabled and the connection string has permission to create queues/tables and read/write entities/messages.
-3. Deploy this project using the existing GitHub Actions workflow. Ensure the workflow installs `requirements.txt` into `.python_packages/lib/site-packages` before zipping, as in the corrected v0.4 deployment workflow.
-4. Restart the Function App.
-5. Check `GET /api/health`. Confirm `persistent_crawl_jobs` is `true`.
-6. Start with one small domain and inspect the returned `job_id`.
-7. Poll `GET /api/crawl/{job_id}` until `completed` or `completed_with_errors`.
-8. Inspect `GET /api/crawl/dashboard` and run the ontology search regression queries.
-
-## PowerShell smoke test
+## Setup for scripts
 
 ```powershell
-$body = @{ domains = @("sujeeth.org") } | ConvertTo-Json
-$job = Invoke-RestMethod -Method Post -Uri "$azureUrl/api/crawl" -Headers $headers -ContentType "application/json" -Body $body
-$job | ConvertTo-Json -Depth 10
+$azureUrl = "https://<your-websearch-app>.azurewebsites.net"
+$key      = Read-Host "Function key" -AsSecureString
+$headers  = @{ "x-functions-key" = [System.Net.NetworkCredential]::new("", $key).Password }
 
-$jobId = $job.jobs[0].job_id
-Invoke-RestMethod "$azureUrl/api/crawl/$jobId" -Headers $headers | ConvertTo-Json -Depth 10
-Invoke-RestMethod "$azureUrl/api/crawl/dashboard" -Headers $headers | ConvertTo-Json -Depth 20
+function Call($method, $path, $body = $null) {
+    $p = @{ Method = $method; Uri = "$azureUrl$path"; Headers = $headers; ContentType = "application/json" }
+    if ($body) { $p.Body = ($body | ConvertTo-Json -Depth 5) }
+    try { Invoke-RestMethod @p }
+    catch { Write-Warning "$method $path -> $($_.Exception.Message)"; $_.ErrorDetails.Message }
+}
 ```
 
-Do not launch all domains until the one-domain test confirms that Queue Trigger invocations are running, jobs progress, and the index is being updated.
+Common calls:
 
-## Known limitations / next hardening
+```powershell
+Call GET  "/api/health"
+Call GET  "/api/crawl-dashboard"
+Call POST "/api/crawl" @{ domains = @("sujeeth.org") }
+Call POST "/api/search" @{ query = "how can I donate"; concepts = @("donation"); domains = @("sujeeth.org"); limit = 3 }
+Call POST "/api/document" @{ url = "https://www.sujeeth.org/"; max_chars = 3000 }
+Call POST "/api/index/retag-preview" @{ domains = @("sujeeth.org") }
+```
 
-- No JavaScript browser rendering; client-rendered content may not be extracted.
-- PDF and DOCX extraction is text-only; scanned PDFs need OCR, which is not included.
-- No AI classifier; deterministic ontology tagging favors precision over recall.
-- The public-IP check is a defense-in-depth check, not a substitute for network egress restrictions. For higher assurance, use an outbound firewall/private network policy.
-- Queue tasks are at-least-once. Deterministic IDs and page-state deduplication reduce duplicate writes, but a worker crash between a state update and queue acknowledgement can still cause a repeated fetch.
-- Job counter updates are best-effort under concurrency; for very high parallelism, use transactional entity-group operations or a dedicated durable orchestrator.
-- Stale-page cleanup requires a clean, complete crawl and intentionally does nothing when pages are skipped or failed. Review stale records and metrics before enabling aggressive deletion policies.
-- No scheduled refresh is created automatically; use a separate scheduler after crawl stability is verified.
+## Deploy
 
+1. Push to `main`. The GitHub Actions workflow builds and deploys.
+2. Wait for the run to finish, then check `GET /api/health`: `ai_search_configured` and `embedding_configured` should be `true`.
+3. If the ontology changed, deploy it first, then restart this app.
+4. Confirm both timers appear under **Functions**.
 
-## v0.6.0 persistent crawl reliability
+## Tests
 
-This release adds ETag-guarded page claims and terminal transitions, idempotent page completion, per-page attempt counts and processing leases, aggregate job reconciliation, and stale-page recovery. New authenticated endpoints:
+```powershell
+pip install -r requirements.txt
+python -m pytest -q tests
+```
 
-- `GET /api/crawl/{job_id}/pages` — inspect persisted page records.
-- `POST /api/crawl/{job_id}/reconcile` — rebuild job counters from page records.
-- `POST /api/crawl/{job_id}/recover` — republish stale queued/publish-failed pages and expired processing leases. Optional JSON body: `{"stale_minutes":25}` (minimum 5, maximum 240).
+## Known limitations
 
-Recovery is safe to repeat: completed pages are not requeued, and workers must acquire a page claim before processing. Azure Table Storage and Queue Storage do not provide a cross-service transaction, so reconciliation remains necessary after partial failures. Test with one domain before starting a multi-domain crawl.
+- No JavaScript rendering. PDF and DOCX extraction is text-only (no OCR).
+- Tagging is deterministic (names and aliases), so untagged chunks are not searchable by concept.
+- Job counters are best-effort under heavy concurrency; use `reconcile` after partial failures.
+- The public-IP check is defense in depth, not a replacement for network egress controls.
+- `GET /api/index-status` and re-tag runs read every blob; avoid calling them in a loop.
 
-## Version 0.6.1 — persistent queue recovery corrections
+## Version history (short)
 
-- Page claims now carry a unique lease token. Only the worker holding that token can complete or release the page claim.
-- If page processing raises an exception, that worker releases its own claim back to `queued` before re-raising so Azure Queue retry can retry without waiting for the full lease duration.
-- Expired-page recovery now re-reads each page and uses an ETag-guarded transition before publishing, reducing races with workers that complete concurrently.
-- Queue processor logs the actual page disposition instead of always claiming that a page was processed.
-- HTML response bytes are decoded once as UTF-8 with replacement before BeautifulSoup parsing.
-- Reconciliation can finalize a job whose authoritative page records show no remaining pending pages.
-
-Deploy this version before calling the existing `POST /api/crawl/{job_id}/recover` endpoint. Recovery is explicit; deployment does not automatically restart an existing job.
+- 0.5.0: persistent page-level crawl jobs on queues and tables.
+- 0.6.x: page claims, leases, reconcile, and recover.
+- 0.7.0: Azure AI Search hybrid retrieval, backfill.
+- After 0.7.0: embedding retry and throttle; permanent failures skipped; explicit-domain validation fix; scheduled recovery and weekly crawl; re-tag and document routes; app-wide page limits.
