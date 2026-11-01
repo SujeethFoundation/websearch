@@ -52,6 +52,34 @@ class SearchService:
             outcomes.extend(result)
         return outcomes
 
+    def update_concepts(self, updates):
+        """Merge new concept tags into documents already in the index. No re-embedding.
+
+        updates is a list of (document_id, concepts). Uses the 'merge' action so a
+        document that is not indexed yet is skipped, never created as an empty stub.
+        Returns (updated, not_indexed).
+        """
+        if not self.configured:
+            raise RuntimeError("Azure AI Search is not configured.")
+        updated = 0
+        not_indexed = 0
+        for start in range(0, len(updates), settings.search_batch_size):
+            batch = updates[start:start + settings.search_batch_size]
+            payload = {"value": [
+                {"@search.action": "merge", "id": str(doc_id), "concepts": [str(c) for c in concepts]}
+                for doc_id, concepts in batch
+            ]}
+            response = self.session.post(self._url("index"), json=payload, timeout=90)
+            response.raise_for_status()
+            for item in response.json().get("value", []):
+                if item.get("status"):
+                    updated += 1
+                elif item.get("statusCode") == 404:
+                    not_indexed += 1
+                else:
+                    raise RuntimeError(f"Azure AI Search rejected a concept update: {item}")
+        return updated, not_indexed
+
     def upsert_many(self, documents, persist_blobs=True):
         documents = [dict(x) for x in documents if x and x.get("id")]
         if not documents:

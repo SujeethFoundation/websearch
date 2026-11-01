@@ -263,6 +263,65 @@ def index_backfill(req):
 
 
 
+@app.route(route="index/retag", methods=["POST"])
+def index_retag(req):
+    """Queue a resumable re-tag of stored documents using the current ontology.
+
+    Updates tags in Blob Storage and merges them into the search index. No embeddings are
+    generated, so this does not use Azure OpenAI quota. Optional body: {"domains": ["sujeeth.org"]}.
+    """
+    if not settings.azure_storage_connection or not storage.container or not queue_processor:
+        return response({"error": "Azure Blob Storage and AzureWebJobsStorage must be configured."}, 503)
+    if not settings.search_configured:
+        return response({"error": "Configure Azure AI Search before re-tagging."}, 503)
+    body = read_body(req)
+    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    try:
+        queue = QueueClient.from_connection_string(
+            settings.azure_storage_connection,
+            settings.crawl_queue,
+            message_encode_policy=TextBase64EncodePolicy(),
+        )
+        queue.send_message(json.dumps({
+            "task_type": "index_retag_page",
+            "continuation_token": None,
+            "domains": domains,
+        }))
+        return response({
+            "status": "queued",
+            "task_type": "index_retag_page",
+            "domains": domains or "all",
+            "message": "The queue worker will page through Blob Storage, re-tag documents with the current ontology, and merge changed tags into the index.",
+        }, 202)
+    except Exception as exc:
+        log.exception("Retag enqueue failed")
+        return response({"error": str(exc)}, 500)
+
+
+@app.route(route="index/retag-preview", methods=["POST"])
+def index_retag_preview(req):
+    """Read-only sample of how many stored documents a re-tag would change."""
+    if not storage.container or not queue_processor:
+        return response({"error": "Azure Blob Storage must be configured."}, 503)
+    body = read_body(req)
+    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    try:
+        return response(queue_processor.retag_preview(domains, scan_limit=int(body.get("scan_limit", 1000))))
+    except Exception as exc:
+        log.exception("Retag preview failed")
+        return response({"error": str(exc)}, 502)
+
+
+def _crawl_limits(item=None):
+    """Page cap and depth for a crawl job.
+
+    Crawl size is an operational setting of this app, not ontology content. The limits come
+    from MAX_PAGES_PER_DOMAIN and MAX_CRAWL_DEPTH in the app settings, and the ontology
+    only decides which domains may be crawled.
+    """
+    return max(1, settings.max_pages), max(0, settings.max_crawl_depth)
+
+
 @app.route(route="crawl", methods=["POST"])
 def crawl_start(req):
     """Create persistent page-level crawl jobs. Work is executed by the Storage Queue trigger."""
@@ -279,8 +338,7 @@ def crawl_start(req):
         created=[]
         for item in targets:
             domain=str(item.get("domain") if isinstance(item,dict) else item).lower()
-            cap=max(1,min(int(item.get("max_pages",settings.max_pages)) if isinstance(item,dict) else settings.max_pages,settings.max_pages))
-            depth=max(0,min(int(item.get("max_depth",settings.max_crawl_depth)) if isinstance(item,dict) else settings.max_crawl_depth,settings.max_crawl_depth))
+            cap,depth=_crawl_limits(item)
             concepts=ontology.domain_concepts(domain)
             job_id=crawl_state.create_job(domain,cap,depth,concepts)
             # Enqueue only the homepage here. The queue worker discovers and registers
@@ -341,17 +399,7 @@ def crawl_all(req):
                 })
                 continue
 
-            cap = max(1, min(
-                int(item.get("max_pages", settings.max_pages))
-                if isinstance(item, dict) else settings.max_pages,
-                settings.max_pages
-            ))
-
-            depth = max(0, min(
-                int(item.get("max_depth", settings.max_crawl_depth))
-                if isinstance(item, dict) else settings.max_crawl_depth,
-                settings.max_crawl_depth
-            ))
+            cap, depth = _crawl_limits(item)
 
             concepts = ontology.domain_concepts(domain)
 
@@ -661,18 +709,16 @@ def scheduled_crawl_recovery(timer: func.TimerRequest) -> None:
 def scheduled_weekly_crawl(timer: func.TimerRequest) -> None:
     """Sundays 08:00 UTC: start an incremental crawl for each allowed domain.
 
-    ETag/Last-Modified checks and content hashes skip unchanged pages. Domains come
-    from the WEEKLY_CRAWL_DOMAINS setting (comma-separated) and must also be
-    crawl-enabled in the ontology.
+    ETag/Last-Modified checks and content hashes skip unchanged pages. By default every
+    crawl-enabled ontology domain is crawled. Set WEEKLY_CRAWL_DOMAINS to a comma-separated
+    list to restrict it. Each domain is limited to MAX_PAGES_PER_DOMAIN pages.
     """
     if not crawl_state:
         log.error("Weekly crawl skipped: crawl state is not configured")
         return
-    allowlist = {
-        x.strip().lower()
-        for x in os.getenv("WEEKLY_CRAWL_DOMAINS", "sujeeth.org,topics.sujeeth.org").split(",")
-        if x.strip()
-    }
+    configured = os.getenv("WEEKLY_CRAWL_DOMAINS", "*")
+    allowlist = {x.strip().lower() for x in configured.split(",") if x.strip()}
+    crawl_everything = bool(allowlist & {"*", "all"})
     open_domains = {
         str(j.get("domain", "")).lower()
         for j in crawl_state.list_jobs(1000)
@@ -685,18 +731,13 @@ def scheduled_weekly_crawl(timer: func.TimerRequest) -> None:
         return
     for item in entries:
         domain = str(item.get("domain") if isinstance(item, dict) else item).lower().strip()
-        if domain not in allowlist:
+        if not crawl_everything and domain not in allowlist:
             continue
         if domain in open_domains:
             log.warning("Weekly crawl: skipping %s, a job is still open", domain)
             continue
         try:
-            cap = max(1, min(
-                int(item.get("max_pages", settings.max_pages)) if isinstance(item, dict) else settings.max_pages,
-                settings.max_pages))
-            depth = max(0, min(
-                int(item.get("max_depth", settings.max_crawl_depth)) if isinstance(item, dict) else settings.max_crawl_depth,
-                settings.max_crawl_depth))
+            cap, depth = _crawl_limits(item)
             job_id = crawl_state.create_job(domain, cap, depth, ontology.domain_concepts(domain))
             if crawl_state.enqueue_pages(job_id, domain, [(f"https://{domain}/", 0)]):
                 log.info("Weekly crawl started domain=%s job=%s", domain, job_id)

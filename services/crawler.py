@@ -79,10 +79,8 @@ class Crawler:
         results = []
         for item in domains:
             domain = item.get("domain") if isinstance(item, dict) else str(item)
-            configured_cap = item.get("max_pages", settings.max_pages) if isinstance(item, dict) else settings.max_pages
-            configured_depth = item.get("max_depth", settings.max_crawl_depth) if isinstance(item, dict) else settings.max_crawl_depth
-            cap = max(1, min(int(configured_cap), settings.max_pages))
-            depth = max(0, min(int(configured_depth), settings.max_crawl_depth))
+            cap = max(1, settings.max_pages)
+            depth = max(0, settings.max_crawl_depth)
             results.append(self.crawl_domain(domain, cap, depth))
         return {"status": "completed", "crawler_version": "0.5.0", "domains": results}
 
