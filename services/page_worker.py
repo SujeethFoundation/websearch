@@ -111,6 +111,8 @@ class PageWorker:
         if 'text/html' in content_type or 'application/xhtml' in content_type:
             if isinstance(raw, (bytes, bytearray)):
                 raw = bytes(raw).decode("utf-8", errors="replace")
+            if isinstance(raw, (bytes, bytearray)):
+                raw = bytes(raw).decode("utf-8", errors="replace")
             soup = BeautifulSoup(raw, "html.parser")
             title=soup.title.get_text(' ',strip=True) if soup.title else final_url
             canonical=soup.find('link',rel=lambda x:x and 'canonical' in x)
