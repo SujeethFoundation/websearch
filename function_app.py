@@ -364,14 +364,14 @@ def crawl_all(req):
         log.exception("Bulk crawl failed")
         return response({"error": str(exc)}, 502)
 
-@app.route(route="crawl/status", methods=["GET"])
+@app.route(route="crawl-status", methods=["GET"])
 def crawl_status(req):
     if not crawl_state: return response({"error":"Crawl state is not configured"},503)
     jobs=crawl_state.list_jobs(100)
     return response({"count":len(jobs),"jobs":jobs})
 
 
-@app.route(route="crawl/dashboard", methods=["GET"])
+@app.route(route="crawl-dashboard", methods=["GET"])
 def crawl_dashboard(req):
     if not crawl_state: return response({"error":"Crawl state is not configured"},503)
     jobs=crawl_state.list_jobs(100)
