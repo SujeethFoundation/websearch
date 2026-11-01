@@ -54,10 +54,34 @@ class OntologyClient:
         })
 
     def validate_domains(self, domains, purpose="search"):
-        return self.post("/api/ontology/validate-domains", {
-            "domains": domains,
-            "purpose": purpose,
-        })
+        response = self.post(
+            "/api/ontology/validate-domains",
+            {
+                "domains": domains,
+                "purpose": purpose
+            }
+        )
+
+        approved = response.get("approved", [])
+        rejected = response.get("rejected", [])
+
+        approved_domains = {
+            item.get("domain")
+            for item in approved
+            if isinstance(item, dict)
+        }
+
+        requested_domains = set(domains)
+
+        valid = (
+            not rejected
+            and requested_domains.issubset(approved_domains)
+        )
+
+        return {
+            **response,
+            "valid": valid
+        }
 
 
     def domain_concepts(self, domain):

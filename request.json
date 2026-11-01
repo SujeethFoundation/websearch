@@ -1,0 +1,11 @@
+{
+    "query":  "What resources are available to help students build their resumes?",
+    "domains":  [
+                    "students.linkedin.com"
+                ],
+    "purpose":  "search",
+    "concepts":  [
+                     "student",
+                     "resume_resource"
+                 ]
+}
