@@ -363,31 +363,6 @@ def crawl_all(req):
     except Exception as exc:
         log.exception("Bulk crawl failed")
         return response({"error": str(exc)}, 502)
-        
-@app.route(route="crawl/{job_id}", methods=["GET"])
-def crawl_get(req):
-    if not crawl_state: return response({"error":"Crawl state is not configured"},503)
-    job=crawl_state.get_job(req.route_params.get("job_id"))
-    return response(job or {"error":"Crawl job not found"},200 if job else 404)
-
-
-@app.route(route="crawl/{job_id}/cancel", methods=["POST"])
-def crawl_cancel(req):
-    if not crawl_state: return response({"error":"Crawl state is not configured"},503)
-    job=crawl_state.cancel_job(req.route_params.get("job_id"))
-    return response(job or {"error":"Crawl job not found"},200 if job else 404)
-
-
-
-@app.route(route="crawl/{job_id}/resume", methods=["POST"])
-def crawl_resume(req):
-    if not crawl_state: return response({"error":"Crawl state is not configured"},503)
-    try:
-        result=crawl_state.resume_job(req.route_params.get("job_id"))
-        return response(result or {"error":"Crawl job not found"},200 if result else 404)
-    except Exception as exc:
-        log.exception("Could not resume crawl job"); return response({"error":str(exc)},500)
-
 
 @app.route(route="crawl/status", methods=["GET"])
 def crawl_status(req):
@@ -411,6 +386,27 @@ def crawl_dashboard(req):
         domain_rows.append({"domain":domain,"crawl_enabled":True,"latest_job":by_domain.get(domain)})
     return response({"domains":domain_rows,"recent_jobs":jobs,"index":storage.status(),"generated_utc":__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()})
 
+
+@app.route(route="crawl/{job_id}", methods=["GET"])
+def crawl_get(req):
+    if not crawl_state: return response({"error":"Crawl state is not configured"},503)
+    job=crawl_state.get_job(req.route_params.get("job_id"))
+    return response(job or {"error":"Crawl job not found"},200 if job else 404)
+
+@app.route(route="crawl/{job_id}/cancel", methods=["POST"])
+def crawl_cancel(req):
+    if not crawl_state: return response({"error":"Crawl state is not configured"},503)
+    job=crawl_state.cancel_job(req.route_params.get("job_id"))
+    return response(job or {"error":"Crawl job not found"},200 if job else 404)
+
+@app.route(route="crawl/{job_id}/resume", methods=["POST"])
+def crawl_resume(req):
+    if not crawl_state: return response({"error":"Crawl state is not configured"},503)
+    try:
+        result=crawl_state.resume_job(req.route_params.get("job_id"))
+        return response(result or {"error":"Crawl job not found"},200 if result else 404)
+    except Exception as exc:
+        log.exception("Could not resume crawl job"); return response({"error":str(exc)},500)
 
 @app.route(route="crawl/{job_id}/pages", methods=["GET"])
 def crawl_pages(req):
