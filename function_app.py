@@ -188,6 +188,77 @@ def index_status(req):
     return response(storage.status())
 
 
+@app.route(route="topic-stats", methods=["GET"])
+def topic_stats(req):
+    """Report indexed pages and chunks grouped by ontology concept."""
+    try:
+        documents = list(storage.list("documents/"))
+
+        page_concepts = {}
+        chunk_counts = {}
+
+        for doc in documents:
+            url = doc.get("url")
+            if not url:
+                continue
+
+            page_concepts.setdefault(url, set())
+
+            for concept in doc.get("concepts", []) or []:
+                concept = str(concept).lower()
+                page_concepts[url].add(concept)
+                chunk_counts[concept] = chunk_counts.get(concept, 0) + 1
+
+        page_counts = {}
+        for concepts in page_concepts.values():
+            for concept in concepts:
+                page_counts[concept] = page_counts.get(concept, 0) + 1
+
+        payload = ontology.classes()
+        if isinstance(payload, list):
+            classes = payload
+        else:
+            classes = (
+                payload.get("classes")
+                or payload.get("ontology_classes")
+                or []
+            )
+
+        names = {
+            str(item.get("id") or item.get("name")).lower(): item.get("name")
+            for item in classes
+            if isinstance(item, dict)
+        }
+
+        topics = [
+            {
+                "concept_id": concept,
+                "concept_name": names.get(concept, concept),
+                "pages": page_counts.get(concept, 0),
+                "chunks": chunk_counts.get(concept, 0)
+            }
+            for concept in sorted(
+                set(page_counts) | set(chunk_counts),
+                key=lambda x: page_counts.get(x, 0),
+                reverse=True
+            )
+        ]
+
+        tagged_pages = sum(bool(x) for x in page_concepts.values())
+
+        return response({
+            "total_chunks": len(documents),
+            "total_pages": len(page_concepts),
+            "tagged_pages": tagged_pages,
+            "untagged_pages": len(page_concepts) - tagged_pages,
+            "topics": topics
+        })
+
+    except Exception as exc:
+        log.exception("Topic statistics failed")
+        return response({"error": str(exc)}, 500)
+
+
 @app.route(route="refresh", methods=["POST"])
 def refresh(req):
     body = read_body(req)
