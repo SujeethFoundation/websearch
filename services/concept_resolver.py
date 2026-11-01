@@ -1,4 +1,3 @@
-
 import re
 from services.config import settings
 
@@ -186,7 +185,13 @@ class ConceptResolver:
         explicit_domain_list = [str(x).lower() for x in (explicit_domains or [])]
         if explicit_domain_list:
             validation = self.ontology.validate_domains(explicit_domain_list, purpose)
-            if not validation.get("valid", False):
+            # The ontology service answers with "approved" and "rejected" lists and no
+            # "valid" flag. Honor a "valid" flag if a future version adds one.
+            if "valid" in validation:
+                domains_ok = bool(validation["valid"])
+            else:
+                domains_ok = bool(validation.get("approved")) and not validation.get("rejected")
+            if not domains_ok:
                 raise PermissionError("One or more requested domains are not approved by ontology.")
             domains = [d for d in domains if d in explicit_domain_list]
             # A user-supplied domain can narrow, never broaden, the concept-selected set.
