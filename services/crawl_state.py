@@ -5,6 +5,7 @@ from azure.data.tables import TableServiceClient, UpdateMode
 from azure.core import MatchConditions
 from azure.storage.queue import QueueServiceClient
 from services.config import settings
+from azure.core.exceptions import ResourceExistsError
 
 
 def utcnow(): return datetime.now(timezone.utc).isoformat()
@@ -19,8 +20,10 @@ class CrawlState:
         self.pages = self.tables.get_table_client(settings.crawl_pages_table)
         self.manifest = self.tables.get_table_client(settings.crawl_manifest_table)
         for table in (self.jobs, self.pages, self.manifest):
-            try: table.create_table()
-            except Exception: pass
+            try:
+                table.create_table()
+            except ResourceExistsError:
+                pass
         self.queues = QueueServiceClient.from_connection_string(settings.azure_storage_connection)
         self.queue = self.queues.get_queue_client(settings.crawl_queue)
         try: self.queue.create_queue()
