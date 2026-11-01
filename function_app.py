@@ -258,7 +258,112 @@ def crawl_start(req):
     except Exception as exc:
         log.exception("Could not create crawl jobs"); return response({"error":str(exc)},502)
 
+@app.route(route="crawl/all", methods=["POST"])
+def crawl_all(req):
+    """Start persistent crawl jobs for all ontology-approved domains."""
+    if not crawl_state:
+        return response({
+            "error": "Persistent crawl infrastructure is not configured."
+        }, 503)
 
+    try:
+        manifest = ontology.crawl_manifest()
+        entries = manifest.get("crawl_domains", [])
+
+        if not entries:
+            return response({
+                "status": "nothing_to_crawl",
+                "job_count": 0,
+                "message": "No crawl-enabled domains found."
+            })
+
+        existing_jobs = crawl_state.list_jobs(1000)
+
+        # Do not start a second job for a domain with an active crawl.
+        active_statuses = {"queued", "running", "processing"}
+        active_domains = {
+            str(job.get("domain", "")).lower()
+            for job in existing_jobs
+            if job.get("status") in active_statuses
+        }
+
+        created = []
+        skipped = []
+
+        for item in entries:
+            domain = str(
+                item.get("domain") if isinstance(item, dict) else item
+            ).lower().strip()
+
+            if not domain:
+                continue
+
+            if domain in active_domains:
+                skipped.append({
+                    "domain": domain,
+                    "reason": "An active crawl already exists."
+                })
+                continue
+
+            cap = max(1, min(
+                int(item.get("max_pages", settings.max_pages))
+                if isinstance(item, dict) else settings.max_pages,
+                settings.max_pages
+            ))
+
+            depth = max(0, min(
+                int(item.get("max_depth", settings.max_crawl_depth))
+                if isinstance(item, dict) else settings.max_crawl_depth,
+                settings.max_crawl_depth
+            ))
+
+            concepts = ontology.domain_concepts(domain)
+
+            job_id = crawl_state.create_job(
+                domain, cap, depth, concepts
+            )
+
+            queued = crawl_state.enqueue_pages(
+                job_id,
+                domain,
+                [(f"https://{domain}/", 0)]
+            )
+
+            if not queued:
+                crawl_state._change(
+                    job_id,
+                    status="failed",
+                    error="Could not enqueue homepage."
+                )
+                skipped.append({
+                    "domain": domain,
+                    "job_id": job_id,
+                    "reason": "Homepage could not be queued."
+                })
+                continue
+
+            created.append({
+                "job_id": job_id,
+                "domain": domain,
+                "status": "queued",
+                "page_limit": cap,
+                "max_depth": depth,
+                "allowed_concepts": concepts
+            })
+
+        return response({
+            "status": "queued",
+            "job_count": len(created),
+            "skipped_count": len(skipped),
+            "jobs": created,
+            "skipped": skipped,
+            "message": "Bulk crawl jobs submitted to Azure Storage Queue."
+        }, 202)
+
+    except Exception as exc:
+        log.exception("Bulk crawl failed")
+        return response({"error": str(exc)}, 502)
+        
 @app.route(route="crawl/{job_id}", methods=["GET"])
 def crawl_get(req):
     if not crawl_state: return response({"error":"Crawl state is not configured"},503)
