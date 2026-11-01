@@ -9,7 +9,7 @@ from services.config import settings
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
-from services.search_service import SearchService
+from services.search_service import SearchService, assemble_document, chunk_index
 from services.crawler import Crawler
 from services.crawl_state import CrawlState
 from services.queue_worker import QueueProcessor
@@ -309,6 +309,65 @@ def index_retag_preview(req):
         return response(queue_processor.retag_preview(domains, scan_limit=int(body.get("scan_limit", 1000))))
     except Exception as exc:
         log.exception("Retag preview failed")
+        return response({"error": str(exc)}, 502)
+
+
+@app.route(route="document", methods=["POST"])
+def document(req):
+    """Return one indexed page, or a passage with its neighbors, within size limits.
+
+    Domains listed in FULL_TEXT_DOMAINS return up to max_chars. Every other domain returns
+    an excerpt only (EXCERPT_MAX_CHARS) with a note to link to the source.
+    """
+    body = read_body(req)
+    url = str(body.get("url") or "").strip()
+    chunk_id = str(body.get("chunk_id") or "").strip()
+    if not url and not chunk_id:
+        return response({"error": "JSON body requires url or chunk_id"}, 400)
+    if not settings.search_configured:
+        return response({"error": "Azure AI Search is not configured."}, 503)
+    try:
+        neighbors = int(body.get("neighbors", 1))
+        max_chars = max(500, min(int(body.get("max_chars", 6000)), 20000))
+        rows, focus, total = searcher.fetch_chunks(
+            None if chunk_id else url, chunk_id or None, neighbors)
+        if not rows:
+            return response({"error": "Document not found in the index."}, 404)
+        domains = sorted({str(r.get("domain") or "").lower() for r in rows})
+        validation = ontology.validate_domains(domains, "search")
+        if not validation.get("approved") or validation.get("rejected"):
+            return response({"error": "This domain is not approved for search."}, 403)
+        full_text_domains = {
+            x.strip().lower()
+            for x in os.getenv("FULL_TEXT_DOMAINS", "sujeeth.org,topics.sujeeth.org").split(",")
+            if x.strip()
+        }
+        excerpt_only = any(d not in full_text_domains for d in domains)
+        limit = min(max_chars, int(os.getenv("EXCERPT_MAX_CHARS", "3000"))) if excerpt_only else max_chars
+        chosen, truncated = assemble_document(rows, focus, limit)
+        return response({
+            "status": "ok",
+            "title": chosen[0].get("title"),
+            "url": chosen[0].get("url"),
+            "domain": domains[0],
+            "source": "website",
+            "excerpt_only": excerpt_only,
+            "total_chunks": total,
+            "chunks_returned": len(chosen),
+            "complete_page": bool(total is not None and len(chosen) == total and not truncated),
+            "truncated": truncated,
+            "chunks": [
+                {"chunk_id": r.get("id"), "index": chunk_index(r.get("id")), "text": r.get("content")}
+                for r in chosen
+            ],
+            "text": "\n\n".join(str(r.get("content") or "") for r in chosen),
+            "note": ("Excerpt of third-party content. Link to the source URL instead of reproducing it."
+                     if excerpt_only else None),
+        })
+    except ValueError as exc:
+        return response({"error": str(exc)}, 400)
+    except Exception as exc:
+        log.exception("Document lookup failed")
         return response({"error": str(exc)}, 502)
 
 

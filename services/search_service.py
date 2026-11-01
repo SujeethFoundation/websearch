@@ -80,6 +80,46 @@ class SearchService:
                     raise RuntimeError(f"Azure AI Search rejected a concept update: {item}")
         return updated, not_indexed
 
+    def fetch_chunks(self, url=None, chunk_id=None, neighbors=1):
+        """Read stored chunks of one page from the index.
+
+        With chunk_id, returns that chunk and up to `neighbors` chunks on each side. With
+        url, returns every chunk of the page. Returns (rows, focus_index, total_chunks).
+        """
+        if not self.configured:
+            raise RuntimeError("Azure AI Search is not configured.")
+        focus = None
+        if chunk_id:
+            page_id, _, suffix = str(chunk_id).rpartition("-")
+            if not page_id or not suffix.isdigit():
+                raise ValueError("chunk_id must look like <page>-<number>.")
+            focus = int(suffix)
+            reach = max(0, min(int(neighbors), 3))
+            ids = [f"{page_id}-{i}" for i in range(max(0, focus - reach), focus + reach + 1)]
+            filter_expr = f"search.in(id, '{self._odata_values(ids)}', ',')"
+        elif url:
+            base = str(url).strip().split("#", 1)[0]
+            variants = sorted({base, base.rstrip("/"), base.rstrip("/") + "/"} - {"", "/"})
+            joined = "|".join(v.replace("'", "''") for v in variants)
+            filter_expr = f"search.in(url, '{joined}', '|')"
+        else:
+            raise ValueError("Provide url or chunk_id.")
+        response = self.session.post(self._url("search"), json={
+            "search": "*", "filter": filter_expr, "top": 1000,
+            "select": "id,title,url,domain,concepts,content",
+        }, timeout=45)
+        response.raise_for_status()
+        rows = response.json().get("value", [])
+        total = None
+        if rows:
+            page_url = str(rows[0].get("url") or "").replace("'", "''")
+            counted = self.session.post(self._url("search"), json={
+                "search": "*", "filter": f"url eq '{page_url}'", "top": 0, "count": True,
+            }, timeout=45)
+            counted.raise_for_status()
+            total = counted.json().get("@odata.count")
+        return rows, focus, total
+
     def upsert_many(self, documents, persist_blobs=True):
         documents = [dict(x) for x in documents if x and x.get("id")]
         if not documents:
@@ -207,3 +247,44 @@ class SearchService:
             "document_count": payload.get("@odata.count"),
             "embedding_configured": settings.embedding_configured,
         }
+
+
+def chunk_index(chunk_id):
+    """Position of a chunk within its page: the number after the last dash in its id."""
+    try:
+        return int(str(chunk_id).rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def assemble_document(rows, focus=None, limit=6000):
+    """Choose which chunks to return within a character limit.
+
+    With a focus chunk, the matched passage comes first and neighbors are added by closeness
+    while they fit. Without one, chunks are taken in page order and the last one is cut at
+    the limit. Returns (chunks in page order, truncated).
+    """
+    rows = sorted(rows, key=lambda r: chunk_index(r.get("id")))
+    order = rows
+    if focus is not None:
+        order = sorted(rows, key=lambda r: abs(chunk_index(r.get("id")) - focus))
+    chosen, used, truncated = [], 0, False
+    for row in order:
+        text = str(row.get("content") or "")
+        room = limit - used
+        if room <= 0:
+            truncated = True
+            break
+        if len(text) <= room:
+            chosen.append({**row, "content": text})
+            used += len(text)
+        elif not chosen or focus is None:
+            chosen.append({**row, "content": text[:room]})
+            used += room
+            truncated = True
+            if focus is None:
+                break
+        else:
+            truncated = True
+    chosen.sort(key=lambda r: chunk_index(r.get("id")))
+    return chosen, truncated
