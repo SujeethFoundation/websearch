@@ -142,6 +142,12 @@ class ConceptResolver:
             if score >= 0.28:
                 scores.append((score, cid, matched_term))
 
+        # When the query names a concept outright (a score of 1.0 or more), partial word overlaps
+        # such as "Week 2" for the question "week 1" are noise. They would add unrelated concepts
+        # and domains to the search, so keep only the strong matches and substantial partial ones.
+        if any(score >= 1.0 for score, _, _ in scores):
+            scores = [item for item in scores if item[0] >= 0.5]
+
         explicit = [str(x).strip() for x in (explicit_concepts or []) if str(x).strip()]
         unknown = [x for x in explicit if x.lower() not in by_id]
         if unknown:
