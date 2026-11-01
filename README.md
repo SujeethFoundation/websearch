@@ -156,3 +156,14 @@ This release adds ETag-guarded page claims and terminal transitions, idempotent 
 - `POST /api/crawl/{job_id}/recover` — republish stale queued/publish-failed pages and expired processing leases. Optional JSON body: `{"stale_minutes":25}` (minimum 5, maximum 240).
 
 Recovery is safe to repeat: completed pages are not requeued, and workers must acquire a page claim before processing. Azure Table Storage and Queue Storage do not provide a cross-service transaction, so reconciliation remains necessary after partial failures. Test with one domain before starting a multi-domain crawl.
+
+## Version 0.6.1 — persistent queue recovery corrections
+
+- Page claims now carry a unique lease token. Only the worker holding that token can complete or release the page claim.
+- If page processing raises an exception, that worker releases its own claim back to `queued` before re-raising so Azure Queue retry can retry without waiting for the full lease duration.
+- Expired-page recovery now re-reads each page and uses an ETag-guarded transition before publishing, reducing races with workers that complete concurrently.
+- Queue processor logs the actual page disposition instead of always claiming that a page was processed.
+- HTML response bytes are decoded once as UTF-8 with replacement before BeautifulSoup parsing.
+- Reconciliation can finalize a job whose authoritative page records show no remaining pending pages.
+
+Deploy this version before calling the existing `POST /api/crawl/{job_id}/recover` endpoint. Recovery is explicit; deployment does not automatically restart an existing job.

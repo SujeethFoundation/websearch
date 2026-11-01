@@ -49,31 +49,50 @@ class PageWorker:
         raise RuntimeError('Redirect limit exceeded')
 
     def process(self, task):
-        job_id,domain,url,depth=task['job_id'],task['domain'],self.normalize(task['url']),int(task.get('depth',0))
-        job=self.state.get_job(job_id)
-        if not job or job.get('status') in ('cancelled','failed','completed','completed_with_errors'):
-            return
-        existing=self.state.page(job_id,url)
-        if existing and existing.get('status') in ('processed','unchanged','skipped','failed'):
-            return
-        if not self.state.claim_page(job_id,url):
-            return
+        job_id, domain, url, depth = task['job_id'], task['domain'], self.normalize(task['url']), int(task.get('depth', 0))
+        job = self.state.get_job(job_id)
+        if not job or job.get('status') in ('cancelled', 'failed', 'completed', 'completed_with_errors'):
+            return {'status': 'job_not_active'}
+        existing = self.state.page(job_id, url)
+        if existing and existing.get('status') in ('processed', 'unchanged', 'skipped', 'failed'):
+            return {'status': 'already_terminal', 'page_status': existing.get('status')}
+        claim_token = self.state.claim_page(job_id, url)
+        if not claim_token:
+            return {'status': 'already_claimed'}
+        try:
+            return self._process_claimed(task, job_id, domain, url, depth, job, claim_token)
+        except Exception as exc:
+            # Release only this execution's lease. Azure Queue can then retry immediately
+            # without waiting for the lease to expire or consuming a duplicate message.
+            self.state.release_page_claim(job_id, url, claim_token, error=str(exc))
+            raise
+
+    def _complete(self, job_id, url, claim_token, status='processed', page_fields=None, **increments):
+        completed = self.state.complete_page(
+            job_id, url, status=status, page_fields=page_fields,
+            claim_token=claim_token, **increments
+        )
+        if not completed:
+            raise RuntimeError(f"Page claim was lost before completion: {url}")
+        return True
+
+    def _process_claimed(self, task, job_id, domain, url, depth, job, claim_token):
         if depth>int(job.get('max_depth',settings.max_crawl_depth)):
-            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'depth_limit'},pages_skipped=1); return
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'depth_limit'},pages_skipped=1); return {'status': 'completed'}
         if not self.same_site(url,domain) or not self.safe_public_host(urlparse(url).hostname or ''):
-            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'off_site_or_non_public'},pages_skipped=1); return
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'off_site_or_non_public'},pages_skipped=1); return {'status': 'completed'}
         # Require an explicit robots policy response for the actual host.
         robots_url=f"{urlparse(url).scheme}://{urlparse(url).netloc}/robots.txt"
         try:
             rr=self.safe_get(robots_url,domain)
             if rr.status_code in (401,403):
-                self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'robots_denied'},pages_skipped=1); return
+                self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'robots_denied'},pages_skipped=1); return {'status': 'completed'}
             if rr.status_code>=500: raise RuntimeError('robots.txt unavailable')
             if rr.status_code not in (200,404): raise RuntimeError(f'robots.txt returned HTTP {rr.status_code}')
             from urllib.robotparser import RobotFileParser
             rp=RobotFileParser(); rp.parse(rr.text.splitlines() if rr.status_code==200 else [])
             if not rp.can_fetch(settings.crawler_user_agent,url):
-                self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'robots_disallowed'},pages_skipped=1); return
+                self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'robots_disallowed'},pages_skipped=1); return {'status': 'completed'}
             if depth == 0:
                 # Discover sitemap URLs in the background worker, not the HTTP start request.
                 from services.crawler import Crawler
@@ -94,11 +113,11 @@ class PageWorker:
         response=self.safe_get(url,domain,headers=headers,stream=True)
         if response.status_code==304:
             self.state.manifest_put(domain,url,last_seen_job=job_id,last_status=304)
-            self.state.complete_page(job_id,url,'unchanged',pages_processed=1); self._finalize_if_safe(job_id,domain); return
+            self._complete(job_id,url,claim_token,'unchanged',pages_processed=1); self._finalize_if_safe(job_id,domain); return {'status': 'completed'}
         response.raise_for_status()
         final_url=self.normalize(response.url)
         if not self.same_site(final_url,domain):
-            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'redirected_off_site'},pages_skipped=1); return
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'redirected_off_site'},pages_skipped=1); return {'status': 'completed'}
         content_type=response.headers.get('content-type','').lower()
         raw=bytearray()
         for block in response.iter_content(chunk_size=65536):
@@ -106,14 +125,12 @@ class PageWorker:
                 raw.extend(block)
                 if len(raw)>settings.max_page_bytes: break
         if len(raw)>settings.max_page_bytes:
-            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'page_too_large'},pages_skipped=1); return
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'page_too_large'},pages_skipped=1); return {'status': 'completed'}
         title=final_url; text=''; discovered=[]; page_type='html'
         if 'text/html' in content_type or 'application/xhtml' in content_type:
-            if isinstance(raw, (bytes, bytearray)):
-                raw = bytes(raw).decode("utf-8", errors="replace")
-            if isinstance(raw, (bytes, bytearray)):
-                raw = bytes(raw).decode("utf-8", errors="replace")
-            soup = BeautifulSoup(raw, "html.parser")
+            raw_bytes = bytes(raw) if isinstance(raw, (bytes, bytearray)) else raw
+            raw_text = raw_bytes.decode('utf-8', errors='replace') if isinstance(raw_bytes, bytes) else str(raw_bytes)
+            soup = BeautifulSoup(raw_text, 'html.parser')
             title=soup.title.get_text(' ',strip=True) if soup.title else final_url
             canonical=soup.find('link',rel=lambda x:x and 'canonical' in x)
             if canonical and canonical.get('href'):
@@ -138,15 +155,15 @@ class PageWorker:
             page_type='docx'; doc=Document(io.BytesIO(raw)); text=' '.join(p.text for p in doc.paragraphs)
             title=urlparse(final_url).path.rsplit('/',1)[-1]
         else:
-            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'unsupported_content_type'},pages_skipped=1); return
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'unsupported_content_type'},pages_skipped=1); return {'status': 'completed'}
         text=re.sub(r'\s+',' ',text).strip()
         digest=hashlib.sha256(text.encode('utf-8')).hexdigest()
         if len(text)<settings.min_text_chars:
-            self.state.complete_page(job_id,url,'skipped',page_fields={'reason':'insufficient_text'},pages_skipped=1); return
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'insufficient_text'},pages_skipped=1); return {'status': 'completed'}
         old_hash=previous.get('content_hash') if previous else None
         if old_hash==digest:
             self.state.manifest_put(domain,final_url,content_hash=digest,last_seen_job=job_id,etag=response.headers.get('ETag'),last_modified=response.headers.get('Last-Modified'),page_type=page_type)
-            self.state.complete_page(job_id,url,'unchanged',pages_processed=1); self._finalize_if_safe(job_id,domain); return
+            self._complete(job_id,url,claim_token,'unchanged',pages_processed=1); self._finalize_if_safe(job_id,domain); return {'status': 'completed'}
         # Remove prior chunks for this URL before writing a changed version, preventing
         # orphaned tail chunks when the new page is shorter.
         self.search.delete_url(final_url)
@@ -165,9 +182,11 @@ class PageWorker:
         # Discover URLs before marking this page complete, so pending never transiently reaches zero.
         for link in dict.fromkeys(discovered):
             if self.state.enqueue_page(job_id,domain,link,depth+1): pass
-        self.state.complete_page(job_id,url,'processed',page_fields={'content_hash':digest,'final_url':final_url},pages_processed=1,chunks_indexed=chunks,chunks_tagged=tagged,chunks_untagged=untagged)
+        self._complete(job_id,url,claim_token,'processed',page_fields={'content_hash':digest,'final_url':final_url},pages_processed=1,chunks_indexed=chunks,chunks_tagged=tagged,chunks_untagged=untagged)
         self._finalize_if_safe(job_id,domain)
-        if settings.crawl_delay>0: time.sleep(settings.crawl_delay)
+        if settings.crawl_delay > 0: time.sleep(settings.crawl_delay)
+        return {'status': 'completed'}
+
 
     def _finalize_if_safe(self, job_id, domain):
         job=self.state.get_job(job_id)

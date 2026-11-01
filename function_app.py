@@ -103,12 +103,12 @@ def health(req):
     return response({
         "status": "healthy",
         "service": "Sujeeth Foundation Web Search",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "storage_mode": storage.mode,
         "embedding_configured": settings.embedding_configured,
         "ontology_configured": bool(settings.ontology_api_url),
         "concept_resolution_required": True,
-        "crawler_version": "0.6.0",
+        "crawler_version": "0.6.1",
         "persistent_crawl_jobs": bool(crawl_state),
         "crawl_queue": settings.crawl_queue,
         "max_pages_per_domain": settings.max_pages,
@@ -186,77 +186,6 @@ def sources(req):
 @app.route(route="index-status", methods=["GET"])
 def index_status(req):
     return response(storage.status())
-
-
-@app.route(route="topic-stats", methods=["GET"])
-def topic_stats(req):
-    """Report indexed pages and chunks grouped by ontology concept."""
-    try:
-        documents = list(storage.list("documents/"))
-
-        page_concepts = {}
-        chunk_counts = {}
-
-        for doc in documents:
-            url = doc.get("url")
-            if not url:
-                continue
-
-            page_concepts.setdefault(url, set())
-
-            for concept in doc.get("concepts", []) or []:
-                concept = str(concept).lower()
-                page_concepts[url].add(concept)
-                chunk_counts[concept] = chunk_counts.get(concept, 0) + 1
-
-        page_counts = {}
-        for concepts in page_concepts.values():
-            for concept in concepts:
-                page_counts[concept] = page_counts.get(concept, 0) + 1
-
-        payload = ontology.classes()
-        if isinstance(payload, list):
-            classes = payload
-        else:
-            classes = (
-                payload.get("classes")
-                or payload.get("ontology_classes")
-                or []
-            )
-
-        names = {
-            str(item.get("id") or item.get("name")).lower(): item.get("name")
-            for item in classes
-            if isinstance(item, dict)
-        }
-
-        topics = [
-            {
-                "concept_id": concept,
-                "concept_name": names.get(concept, concept),
-                "pages": page_counts.get(concept, 0),
-                "chunks": chunk_counts.get(concept, 0)
-            }
-            for concept in sorted(
-                set(page_counts) | set(chunk_counts),
-                key=lambda x: page_counts.get(x, 0),
-                reverse=True
-            )
-        ]
-
-        tagged_pages = sum(bool(x) for x in page_concepts.values())
-
-        return response({
-            "total_chunks": len(documents),
-            "total_pages": len(page_concepts),
-            "tagged_pages": tagged_pages,
-            "untagged_pages": len(page_concepts) - tagged_pages,
-            "topics": topics
-        })
-
-    except Exception as exc:
-        log.exception("Topic statistics failed")
-        return response({"error": str(exc)}, 500)
 
 
 @app.route(route="refresh", methods=["POST"])
@@ -424,7 +353,7 @@ def crawl_page_worker(msg: func.QueueMessage):
     body=msg.get_body().decode("utf-8")
     try:
         result=queue_processor.process(body)
-        log.info("Crawl page processed: %s",result)
+        log.info("Crawl queue disposition: %s",result)
     except Exception:
         log.exception("Crawl page task failed; Azure Queue retry will handle it")
         raise

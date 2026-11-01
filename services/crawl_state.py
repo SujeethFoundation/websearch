@@ -150,10 +150,35 @@ class CrawlState:
                         return False
                 except ValueError:
                     pass
+            token = uuid.uuid4().hex
             entity["status"] = "processing"
             entity["attempts"] = int(entity.get("attempts", 0)) + 1
+            entity["lease_token"] = token
             entity["lease_until_utc"] = (now + __import__('datetime').timedelta(minutes=lease_minutes)).isoformat()
             entity["updated_utc"] = now.isoformat()
+            try:
+                self.pages.update_entity(entity, mode=UpdateMode.REPLACE,
+                    etag=entity.metadata.get("etag", "*"), match_condition=MatchConditions.IfNotModified)
+                return token
+            except Exception:
+                continue
+        return None
+
+    def release_page_claim(self, job_id, url, claim_token, error=None):
+        """Release only the lease owned by this failed queue execution."""
+        for _ in range(6):
+            try:
+                entity = self.pages.get_entity(job_id, digest(url))
+            except Exception:
+                return False
+            if entity.get("status") != "processing" or entity.get("lease_token") != claim_token:
+                return False
+            entity["status"] = "queued"
+            entity["updated_utc"] = utcnow()
+            entity.pop("lease_until_utc", None)
+            entity.pop("lease_token", None)
+            if error:
+                entity["last_error"] = str(error)[:500]
             try:
                 self.pages.update_entity(entity, mode=UpdateMode.REPLACE,
                     etag=entity.metadata.get("etag", "*"), match_condition=MatchConditions.IfNotModified)
@@ -162,7 +187,7 @@ class CrawlState:
                 continue
         return False
 
-    def complete_page(self, job_id, url, status="processed", page_fields=None, **increments):
+    def complete_page(self, job_id, url, status="processed", page_fields=None, claim_token=None, **increments):
         # Page transition is the idempotency gate. Only the winner changes job counters.
         terminal = ("processed", "unchanged", "skipped", "failed")
         for _ in range(6):
@@ -172,9 +197,12 @@ class CrawlState:
                 return False
             if entity.get("status") in terminal:
                 return False
+            if claim_token and entity.get("lease_token") != claim_token:
+                return False
             entity["status"] = status
             entity["updated_utc"] = utcnow()
             entity.pop("lease_until_utc", None)
+            entity.pop("lease_token", None)
             if page_fields:
                 entity.update(page_fields)
             try:
@@ -230,43 +258,79 @@ class CrawlState:
         # Repair aggregate counters from the authoritative page table.
         self._change(job_id, pending=pending, pages_discovered=len(pages), pages_processed=processed,
                      pages_skipped=counts.get("skipped", 0), pages_failed=counts.get("failed", 0))
+        if pending == 0 and job.get("status") not in ("cancelled", "failed"):
+            final_status = "completed_with_errors" if counts.get("failed", 0) else "completed"
+            self._change(job_id, status=final_status, completed_utc=utcnow())
         return {"job_id": job_id, "page_count": len(pages), "page_states": counts,
                 "expected_pending": pending, "previous_pending": int(job.get("pending", 0))}
+
+    def _requeue_if_stale(self, job_id, page, now, stale_before):
+        """Atomically change only a still-stale page to queued."""
+        url = page.get("url")
+        if not url:
+            return False
+        for _ in range(6):
+            try:
+                entity = self.pages.get_entity(job_id, digest(url))
+            except Exception:
+                return False
+            status = entity.get("status", "queued")
+            # Explicit recovery may retry terminal failures as well as stale queue work.
+            eligible = status == "failed"
+            if status in ("queued", "publish_failed"):
+                eligible = True
+                try:
+                    stamp = entity.get("updated_utc") or entity.get("created_utc")
+                    eligible = datetime.fromisoformat(stamp) < stale_before
+                except Exception:
+                    eligible = True
+            elif status == "processing":
+                lease = entity.get("lease_until_utc")
+                try:
+                    eligible = not lease or datetime.fromisoformat(lease) < now
+                except Exception:
+                    eligible = True
+            else:
+                eligible = False
+            if not eligible:
+                return False
+            entity["status"] = "queued"
+            entity["updated_utc"] = utcnow()
+            entity.pop("lease_until_utc", None)
+            entity.pop("lease_token", None)
+            entity["recovery_utc"] = utcnow()
+            try:
+                self.pages.update_entity(entity, mode=UpdateMode.REPLACE,
+                    etag=entity.metadata.get("etag", "*"), match_condition=MatchConditions.IfNotModified)
+                return True
+            except Exception:
+                continue
+        return False
 
     def recover_job(self, job_id, stale_minutes=25):
         job = self.get_job(job_id)
         if not job:
             return None
+        if job.get("status") in ("cancelled", "failed"):
+            return {"job_id": job_id, "status": job.get("status"), "requeued": 0, "message": "Job is not recoverable."}
         now = datetime.now(timezone.utc)
         from datetime import timedelta
-        stale_before = now - timedelta(minutes=int(stale_minutes))
+        stale_before = now - timedelta(minutes=max(1, int(stale_minutes)))
         requeued = []
+        publish_errors = []
         for page in self.page_records(job_id):
-            status = page.get("status", "queued")
-            eligible = status in ("queued", "publish_failed")
-            if eligible:
-                try:
-                    eligible = datetime.fromisoformat(page.get("updated_utc") or page.get("created_utc")) < stale_before
-                except Exception:
-                    eligible = True
-            if status == "processing":
-                lease = page.get("lease_until_utc")
-                try:
-                    eligible = not lease or datetime.fromisoformat(lease) < now
-                except ValueError:
-                    eligible = True
-            if not eligible:
-                continue
             url = page.get("url")
-            if not url:
+            if not url or not self._requeue_if_stale(job_id, page, now, stale_before):
                 continue
-            # Reset state before publishing; repeated recovery is safe because a live
-            # worker must acquire the page via claim_page's ETag-guarded transition.
-            if self.mark_page(job_id, url, "queued", lease_until_utc="", recovery_utc=utcnow()):
+            try:
                 self._publish(job_id, job["domain"], url, int(page.get("depth", 0)))
                 requeued.append(url)
-        self.reconcile_job(job_id)
-        return {"job_id": job_id, "status": "recovery_submitted", "requeued": len(requeued), "urls": requeued}
+            except Exception as exc:
+                self.mark_page(job_id, url, "publish_failed", error=str(exc)[:500])
+                publish_errors.append({"url": url, "error": str(exc)[:300]})
+        reconciliation = self.reconcile_job(job_id)
+        return {"job_id": job_id, "status": "recovery_submitted", "requeued": len(requeued),
+                "urls": requeued, "publish_errors": publish_errors, "reconciliation": reconciliation}
 
     def resume_job(self, job_id):
         return self.recover_job(job_id)
