@@ -1,6 +1,7 @@
-
 import json
 import logging
+import os
+from datetime import datetime, timedelta, timezone
 import azure.functions as func
 from azure.storage.queue import QueueClient, TextBase64EncodePolicy
 
@@ -611,3 +612,96 @@ def crawl_page_poison(msg: func.QueueMessage):
     except Exception:
         log.exception("Could not record poison crawl message")
         raise
+
+
+# ---------------------------------------------------------------------------
+# Scheduled maintenance (all schedules are UTC). Manual HTTP endpoints remain.
+# ---------------------------------------------------------------------------
+_TERMINAL_JOB_STATUSES = ("completed", "completed_with_errors", "failed", "cancelled")
+
+
+def _job_age_days(job):
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(job["created_utc"])).days
+    except Exception:
+        return 0  # unknown age: treat as recent
+
+
+@app.timer_trigger(schedule="0 0 10 * * *", arg_name="timer", run_on_startup=False)
+def scheduled_crawl_recovery(timer: func.TimerRequest) -> None:
+    """Daily 10:00 UTC: reconcile and recover unfinished crawl jobs. No-op when healthy."""
+    if not crawl_state:
+        log.error("Scheduled recovery skipped: crawl state is not configured")
+        return
+    examined = 0
+    for job in crawl_state.list_jobs(100):
+        status = job.get("status")
+        age = _job_age_days(job)
+        # Unfinished jobs are recovered for up to 30 days. Jobs that finished with
+        # errors get failed pages retried for 3 days only, so permanently failing
+        # URLs (404s, robots blocks) are not refetched forever.
+        if status in ("cancelled", "failed", "completed"):
+            continue
+        if status == "completed_with_errors" and age > 3:
+            continue
+        if age > 30:
+            continue
+        try:
+            crawl_state.reconcile_job(job["job_id"])
+            result = crawl_state.recover_job(job["job_id"], stale_minutes=25)
+            examined += 1
+            log.info("Daily recovery job=%s domain=%s requeued=%s",
+                     job["job_id"], job.get("domain"), (result or {}).get("requeued"))
+        except Exception:
+            log.exception("Daily recovery failed for job=%s", job.get("job_id"))
+    log.info("Daily crawl recovery finished; jobs examined: %d", examined)
+
+
+@app.timer_trigger(schedule="0 0 8 * * 0", arg_name="timer", run_on_startup=False)
+def scheduled_weekly_crawl(timer: func.TimerRequest) -> None:
+    """Sundays 08:00 UTC: start an incremental crawl for each allowed domain.
+
+    ETag/Last-Modified checks and content hashes skip unchanged pages. Domains come
+    from the WEEKLY_CRAWL_DOMAINS setting (comma-separated) and must also be
+    crawl-enabled in the ontology.
+    """
+    if not crawl_state:
+        log.error("Weekly crawl skipped: crawl state is not configured")
+        return
+    allowlist = {
+        x.strip().lower()
+        for x in os.getenv("WEEKLY_CRAWL_DOMAINS", "sujeeth.org,topics.sujeeth.org").split(",")
+        if x.strip()
+    }
+    open_domains = {
+        str(j.get("domain", "")).lower()
+        for j in crawl_state.list_jobs(1000)
+        if j.get("status") not in _TERMINAL_JOB_STATUSES
+    }
+    try:
+        entries = ontology.crawl_manifest().get("crawl_domains", [])
+    except Exception:
+        log.exception("Weekly crawl: could not read ontology crawl manifest")
+        return
+    for item in entries:
+        domain = str(item.get("domain") if isinstance(item, dict) else item).lower().strip()
+        if domain not in allowlist:
+            continue
+        if domain in open_domains:
+            log.warning("Weekly crawl: skipping %s, a job is still open", domain)
+            continue
+        try:
+            cap = max(1, min(
+                int(item.get("max_pages", settings.max_pages)) if isinstance(item, dict) else settings.max_pages,
+                settings.max_pages))
+            depth = max(0, min(
+                int(item.get("max_depth", settings.max_crawl_depth)) if isinstance(item, dict) else settings.max_crawl_depth,
+                settings.max_crawl_depth))
+            job_id = crawl_state.create_job(domain, cap, depth, ontology.domain_concepts(domain))
+            if crawl_state.enqueue_pages(job_id, domain, [(f"https://{domain}/", 0)]):
+                log.info("Weekly crawl started domain=%s job=%s", domain, job_id)
+            else:
+                crawl_state._change(job_id, status="failed", error="Could not enqueue homepage.")
+                log.error("Weekly crawl could not enqueue homepage for %s", domain)
+        except Exception:
+            log.exception("Weekly crawl failed to start for %s", domain)
