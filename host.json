@@ -1,5 +1,19 @@
 {
   "version": "2.0",
+  "logging": {
+    "logLevel": {
+      "default": "Warning",
+      "Function": "Warning",
+      "sujeeth-web-search": "Information"
+    },
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "maxTelemetryItemsPerSecond": 5,
+        "excludedTypes": "Exception"
+      }
+    }
+  },
   "extensionBundle": {
     "id": "Microsoft.Azure.Functions.ExtensionBundle",
     "version": "[4.*, 5.0.0)"
@@ -8,7 +22,7 @@
     "queues": {
       "messageEncoding": "base64",
       "batchSize": 1,
-      "newBatchThreshold": 1,
+      "newBatchThreshold": 0,
       "maxDequeueCount": 5,
       "visibilityTimeout": "00:15:00"
     }

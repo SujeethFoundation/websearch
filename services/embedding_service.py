@@ -1,5 +1,7 @@
 """Embedding client for the Azure OpenAI-compatible Microsoft Foundry endpoint."""
 import logging
+import os
+import threading
 import time
 
 import requests
@@ -12,6 +14,25 @@ RETRYABLE_STATUS = (429, 500, 502, 503, 504)
 MAX_ATTEMPTS = 6
 MAX_WAIT_SECONDS = 60
 
+# Indexing throttle. Spaces embedding calls at least this many seconds apart on each
+# running instance, so indexing leaves quota for search (the index vectorizer shares
+# this deployment). 0 disables it. Set EMBED_MIN_INTERVAL_SECONDS in app settings.
+MIN_INTERVAL_SECONDS = float(os.getenv("EMBED_MIN_INTERVAL_SECONDS", "0") or 0)
+_throttle_lock = threading.Lock()
+_next_slot = 0.0
+
+
+def _throttle():
+    global _next_slot
+    if MIN_INTERVAL_SECONDS <= 0:
+        return
+    with _throttle_lock:
+        now = time.monotonic()
+        wait = _next_slot - now
+        _next_slot = max(now, _next_slot) + MIN_INTERVAL_SECONDS
+    if wait > 0:
+        time.sleep(wait)
+
 
 class EmbeddingService:
     def __init__(self):
@@ -22,6 +43,7 @@ class EmbeddingService:
         """POST with exponential backoff on throttling and transient server errors."""
         response = None
         for attempt in range(MAX_ATTEMPTS):
+            _throttle()
             try:
                 response = self.session.post(
                     url,
