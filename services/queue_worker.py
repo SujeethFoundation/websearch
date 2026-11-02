@@ -1,5 +1,6 @@
 """Azure Queue adapter for crawl and Azure AI Search indexing tasks."""
 import json
+import os
 from urllib.parse import urlparse
 import logging
 from azure.storage.queue import QueueClient, TextBase64EncodePolicy
@@ -7,8 +8,15 @@ from services.config import settings
 from services.crawl_state import CrawlState
 from services.page_worker import PageWorker
 from services.path_rules import is_excluded_url
+from services.search_service import IndexBusyError
 
 log = logging.getLogger("sujeeth-web-search.crawl-worker")
+
+# When the search index is busy, indexing is retried later: after 2, 5, 10, 20, 30 minutes, then hourly,
+# up to INDEX_MAX_DEFERRALS times. After that the task fails normally and POST /api/index/backfill
+# can pick the chunks up again from Blob Storage (their vectors are stored, so nothing is re-embedded).
+DEFERRAL_DELAYS = (120, 300, 600, 1200, 1800, 3600)
+MAX_INDEX_DEFERRALS = int(os.getenv("INDEX_MAX_DEFERRALS", "12") or 12)
 
 
 class QueueProcessor:
@@ -24,6 +32,7 @@ class QueueProcessor:
             message_encode_policy=TextBase64EncodePolicy(),
         )
         self.worker = PageWorker(ontology, storage, search, resolver, self.state)
+        self.worker.defer_indexing = self._defer_index_batch
 
     def _retag_changes(self, names, domains=None, collect_examples=0):
         """Compare stored tags with what the current ontology would assign.
@@ -85,6 +94,18 @@ class QueueProcessor:
         return {"status": "preview", "blob_names_scanned": len(names), **stats,
                 "would_change": len(changes), "examples": sample}
 
+    def _defer_index_batch(self, names, attempt=0):
+        """Queue a delayed indexing task for chunks that are stored but not yet in the index."""
+        delay = DEFERRAL_DELAYS[min(int(attempt), len(DEFERRAL_DELAYS) - 1)]
+        names = list(names)
+        # Queue messages are limited in size, so a page with very many chunks is sent in groups.
+        for start in range(0, len(names), 100):
+            self.queue.send_message(
+                json.dumps({"task_type": "index_blob_batch", "blob_names": names[start:start + 100], "attempt": int(attempt)}),
+                visibility_timeout=delay,
+            )
+        return delay
+
     def _purge_matches(self, names, domains=None):
         """Find stored chunks whose page is under an excluded path for its domain."""
         only = {str(x).lower() for x in (domains or []) if str(x).strip()}
@@ -112,6 +133,7 @@ class QueueProcessor:
         index_deleted = self.search.delete_ids(ids) if ids else 0
         for name, doc in matches:
             self.storage.delete(name)
+            self.storage.delete(self.search.vector_key(doc["id"]))
             self.state.manifest_delete(str(doc.get("domain") or "").lower(), doc.get("url"))
         log.info("Purge batch read=%s removed=%s index_deleted=%s", stats["read"], len(matches), index_deleted)
         return {"status": "purged", **stats, "removed": len(matches), "index_deleted": index_deleted}
@@ -221,8 +243,15 @@ class QueueProcessor:
             result = self.purge_blobs(task.get("blob_names") or [], task.get("domains") or [])
         elif task_type == "index_blob_batch":
             names = task.get("blob_names") or []
-            indexed = self.search.index_existing_blobs(names)
-            result = {"status": "indexed", "blobs_read": len(names), "documents_indexed": indexed}
+            attempt = int(task.get("attempt", 0))
+            try:
+                indexed = self.search.index_existing_blobs(names)
+                result = {"status": "indexed", "blobs_read": len(names), "documents_indexed": indexed}
+            except IndexBusyError:
+                if attempt >= MAX_INDEX_DEFERRALS:
+                    raise
+                delay = self._defer_index_batch(names, attempt + 1)
+                result = {"status": "index_busy_deferred", "blobs": len(names), "attempt": attempt + 1, "retry_in_seconds": delay}
         else:
             result = self.worker.process(task)
 

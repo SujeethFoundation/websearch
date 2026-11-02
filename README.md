@@ -89,6 +89,11 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `CHUNK_CHARS`, `MIN_TEXT_CHARS`, `MAX_PAGE_BYTES`, `REQUEST_TIMEOUT_SECONDS`, `CRAWL_DELAY_SECONDS` | `1800`, `80`, `5000000`, `20`, `0.5` | Extraction and politeness |
 | `INDEX_BACKFILL_BATCH_SIZE`, `AZURE_SEARCH_BATCH_SIZE` | `10`, `100` | Backfill and upload batch sizes |
 | `EMBED_MIN_INTERVAL_SECONDS` | `0` (off) | Minimum seconds between embedding calls on each instance. Protects search from being throttled by indexing |
+| `EMBED_BATCH_SIZE` | `16` | Texts per embedding request |
+| `SEARCH_MIN_INTERVAL_SECONDS` | `0` (off) | Minimum seconds between index writes on each instance |
+| `SEARCH_WRITE_ATTEMPTS` | `8` | Tries per index write when the search service answers 429 or 503. Waits grow from 2 to 60 seconds, about 3 minutes in all |
+| `SEARCH_BREAKER_SECONDS` | `120` | After the index stays busy through every retry, other writes on that instance skip the retries for this long and defer at once |
+| `INDEX_MAX_DEFERRALS` | `12` | How many times a deferred indexing task is re-queued before it fails normally |
 | `WEEKLY_CRAWL_DOMAINS` | `*` | Comma-separated domains for the weekly crawl, or `*` for all. If this setting exists with a list, that list wins |
 | `FULL_TEXT_DOMAINS` | `sujeeth.org,topics.sujeeth.org` | Domains `/document` may return in full |
 | `EXCERPT_MAX_CHARS` | `3000` | Cap for every other domain |
@@ -101,7 +106,8 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 - **Stale-page cleanup** only runs after a clean crawl: no skipped or failed pages and below the page cap. Because skipped pages block it, domains with dead links will not purge removed pages.
 - **Re-tagging:** tags are assigned at crawl time, and unchanged pages are not re-tagged on later crawls. After an ontology alias or domain-concept change, run `index/retag-preview`, then `index/retag`. The resolver caches the ontology in memory, so restart the app after an ontology deploy.
 - **Excluded paths.** A domain's `crawl_policy.exclude_paths` in the ontology (for example TealHQ's `/job` and `/jobs`) stops the crawler from queuing or fetching those URLs. This covers sitemap URLs, discovered links, and pages already waiting in the queue. Excluded pages are not counted as skipped, so they do not block stale-page cleanup. The rules are cached for 10 minutes, so after changing them, restart the app, then run `index/purge-preview` and `index/purge` to remove what is already stored. Run the purge before a backfill, or the backfill will re-index the excluded pages from Blob Storage.
-- **Backfill** re-embeds every blob. Run it once, after the crawl queue has drained, and watch `index-status` and the poison queue. A second pass fixes gaps (writes are idempotent).
+- **Vectors are stored and a busy index never fails a crawl.** Each chunk is embedded once, and its vector is saved as `vectors/<id>.json` next to the chunk. If the search service stays busy (429 or 503) through every retry, the page is still marked processed (`index_deferred`), and a delayed `index_blob_batch` task indexes the stored chunks later: after 2, 5, 10, 20, and 30 minutes, then hourly, up to `INDEX_MAX_DEFERRALS` times. Nothing is fetched or embedded again. A page whose indexing is deferred is missing from search until that task succeeds, and `POST /api/index/backfill` indexes anything still stored but missing.
+- **Backfill** indexes every blob. Chunks that already have a stored vector are not embedded again, so only old chunks without one pay for embeddings the first time. Run it once, after the crawl queue has drained, and watch `index-status` and the poison queue. A second pass fixes gaps (writes are idempotent).
 - **Queue messages are at-least-once.** Writes use deterministic IDs.
 
 ## Setup for scripts

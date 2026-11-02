@@ -1,6 +1,9 @@
 """Azure AI Search indexing and hybrid retrieval; Blob Storage remains canonical."""
+import base64
+import hashlib
 import logging
 import os
+import struct
 import threading
 import time
 import requests
@@ -17,6 +20,32 @@ SEARCH_MIN_INTERVAL = float(os.getenv("SEARCH_MIN_INTERVAL_SECONDS", "0") or 0)
 SEARCH_WRITE_ATTEMPTS = max(1, int(os.getenv("SEARCH_WRITE_ATTEMPTS", "8") or 8))
 _pace_lock = threading.Lock()
 _next_write_slot = 0.0
+
+# Chunks are embedded once. The vector is stored next to the chunk (vectors/<id>.json) so a busy or
+# failed index never causes a second embedding call. EMBED_BATCH_SIZE caps texts per embedding request.
+EMBED_BATCH_SIZE = max(1, int(os.getenv("EMBED_BATCH_SIZE", "16") or 16))
+# After the index stays busy through every retry, other writes on this instance skip straight to
+# deferral for this many seconds, so workers keep crawling instead of each waiting out the retries.
+SEARCH_BREAKER_SECONDS = float(os.getenv("SEARCH_BREAKER_SECONDS", "120") or 120)
+_breaker_until = 0.0
+
+
+class IndexBusyError(RuntimeError):
+    """The search service stayed busy (429 or 503) through every retry."""
+
+
+def _breaker_open():
+    return time.monotonic() < _breaker_until
+
+
+def _breaker_trip():
+    global _breaker_until
+    _breaker_until = time.monotonic() + SEARCH_BREAKER_SECONDS
+
+
+def _breaker_clear():
+    global _breaker_until
+    _breaker_until = 0.0
 
 
 def _pace_writes():
@@ -78,6 +107,8 @@ class SearchService:
         for round_number in range(rounds):
             _pace_writes()
             response = self._post("index", {"value": pending}, 90, attempts=SEARCH_WRITE_ATTEMPTS)
+            if response.status_code in (429, 502, 503, 504):
+                raise IndexBusyError(f"Azure AI Search stayed busy (HTTP {response.status_code}) through every retry.")
             response.raise_for_status()
             retry_ids = set()
             for item in response.json().get("value", []):
@@ -88,6 +119,9 @@ class SearchService:
                 break
             pending = [a for a in pending if str(a.get("id")) in retry_ids]
             time.sleep(min(5 * (round_number + 1), 30))
+        busy = [x for x in final.values() if not x.get("status") and x.get("statusCode") in (429, 503)]
+        if busy:
+            raise IndexBusyError(f"Azure AI Search was still busy for {len(busy)} document(s) after every retry.")
         return list(final.values())
 
     @staticmethod
@@ -195,13 +229,63 @@ class SearchService:
             raise RuntimeError(f"Azure AI Search could not delete {len(failed)} document(s): {failed[:3]}")
         return len(ids)
 
-    def upsert_many(self, documents, persist_blobs=True):
+    @staticmethod
+    def vector_key(doc_id):
+        return "vectors/" + str(doc_id) + ".json"
+
+    @staticmethod
+    def _pack_vector(vector):
+        return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
+
+    @staticmethod
+    def _unpack_vector(text):
+        raw = base64.b64decode(text)
+        return list(struct.unpack(f"<{len(raw) // 4}f", raw))
+
+    @staticmethod
+    def _content_sha(content):
+        return hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
+
+    def _vectors_for(self, documents):
+        """One vector per document. A stored vector is reused when it matches the chunk's current
+        text and the embedding model. Only the rest are embedded, then stored immediately."""
+        shas = [self._content_sha(d.get("content", "")) for d in documents]
+        vectors = [None] * len(documents)
+        for i, doc in enumerate(documents):
+            stored = self.storage.get(self.vector_key(doc["id"]))
+            if (stored and stored.get("sha") == shas[i]
+                    and stored.get("model") == settings.embedding_deployment
+                    and int(stored.get("dims", 0)) == settings.embedding_dimensions):
+                try:
+                    vectors[i] = self._unpack_vector(stored["v"])
+                except Exception:
+                    vectors[i] = None
+        missing = [i for i, vector in enumerate(vectors) if vector is None]
+        for start in range(0, len(missing), EMBED_BATCH_SIZE):
+            group = missing[start:start + EMBED_BATCH_SIZE]
+            fresh = self.embedder.embed([documents[i].get("content", "") for i in group])
+            for i, vector in zip(group, fresh):
+                vectors[i] = vector
+                self.storage.put(self.vector_key(documents[i]["id"]), {
+                    "id": str(documents[i]["id"]), "sha": shas[i],
+                    "model": settings.embedding_deployment, "dims": len(vector),
+                    "v": self._pack_vector(vector),
+                })
+        return vectors
+
+    def upsert_or_defer(self, documents, persist_blobs=True):
+        """Embed (once), store the chunks and vectors, then try to index them.
+
+        Returns (indexed_count, deferred_blob_names). If the search index stays busy, nothing is
+        raised: the chunks and vectors are already safe in Blob Storage, and the caller queues a
+        delayed indexing task for the returned blob names.
+        """
         documents = [dict(x) for x in documents if x and x.get("id")]
         if not documents:
-            return 0
+            return 0, []
         if not settings.embedding_configured:
             raise RuntimeError("Embedding configuration is missing; refusing to index documents without vectors.")
-        vectors = self.embedder.embed([x.get("content", "") for x in documents])
+        vectors = self._vectors_for(documents)
         search_docs = [self._search_doc(doc, vector) for doc, vector in zip(documents, vectors)]
         # Save source documents first. They remain the durable, rebuildable source of truth.
         if persist_blobs:
@@ -211,8 +295,23 @@ class SearchService:
                 stored["_key"] = key
                 stored.pop("embedding", None)
                 self.storage.put(key, stored)
-        self._upload(search_docs)
-        return len(search_docs)
+        names = ["documents/" + str(doc["id"]) + ".json" for doc in documents]
+        if _breaker_open():
+            return 0, names
+        try:
+            self._upload(search_docs)
+        except IndexBusyError as exc:
+            _breaker_trip()
+            log.warning("Search index busy; %d chunk(s) stored and queued for later indexing: %s", len(names), exc)
+            return 0, names
+        _breaker_clear()
+        return len(search_docs), []
+
+    def upsert_many(self, documents, persist_blobs=True):
+        count, deferred = self.upsert_or_defer(documents, persist_blobs)
+        if deferred:
+            raise IndexBusyError(f"Azure AI Search is busy; {len(deferred)} chunk(s) are stored but not indexed.")
+        return count
 
     def upsert(self, doc):
         return self.upsert_many([doc], persist_blobs=True)
@@ -301,6 +400,7 @@ class SearchService:
         self._write_batch([{"@search.action": "delete", "id": doc_id} for doc_id in ids])
         for doc_id in ids:
             self.storage.delete("documents/" + str(doc_id) + ".json")
+            self.storage.delete(self.vector_key(doc_id))
         return len(ids)
 
     def rebuild_vectors(self):

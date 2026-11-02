@@ -6,6 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 from services.config import settings
 from services.path_rules import PathPolicy
+from services.search_service import IndexBusyError
 
 # HTTP statuses that retrying will not fix. 408/429/5xx are not listed and stay retryable.
 PERMANENT_HTTP_STATUSES = {400, 401, 403, 404, 405, 406, 410, 451}
@@ -22,6 +23,7 @@ class PageWorker:
     def __init__(self, ontology, storage, search, resolver, state):
         self.ontology,self.storage,self.search,self.resolver,self.state=ontology,storage,search,resolver,state
         self.path_policy=PathPolicy(ontology)
+        self.defer_indexing=None  # set by the queue processor: queues a delayed indexing task
         self.session=requests.Session(); self.session.headers.update({'User-Agent':settings.crawler_user_agent})
 
     @staticmethod
@@ -204,14 +206,21 @@ class PageWorker:
                 'etag':response.headers.get('ETag'),'last_modified':response.headers.get('Last-Modified'),
                 'crawled_utc':datetime.now(timezone.utc).isoformat()})
             chunks+=1; tagged+=bool(concepts); untagged+=not bool(concepts)
+        index_deferred=False
         if page_documents:
-            self.search.upsert_many(page_documents, persist_blobs=True)
+            _, deferred=self.search.upsert_or_defer(page_documents, persist_blobs=True)
+            if deferred:
+                # The chunks and their vectors are safely stored. Index them later instead of
+                # failing the page, which would re-fetch and re-embed it on every retry.
+                if not self.defer_indexing:
+                    raise IndexBusyError(f'Search index busy; {len(deferred)} chunk(s) stored but not indexed.')
+                self.defer_indexing(deferred); index_deferred=True
         self.state.manifest_put(domain,final_url,content_hash=digest,last_seen_job=job_id,etag=response.headers.get('ETag'),
             last_modified=response.headers.get('Last-Modified'),page_type=page_type,chunk_count=chunks)
         # Discover URLs before marking this page complete, so pending never transiently reaches zero.
         for link in dict.fromkeys(discovered):
             if self.state.enqueue_page(job_id,domain,link,depth+1): pass
-        self._complete(job_id,url,claim_token,'processed',page_fields={'content_hash':digest,'final_url':final_url},pages_processed=1,chunks_indexed=chunks,chunks_tagged=tagged,chunks_untagged=untagged)
+        self._complete(job_id,url,claim_token,'processed',page_fields={'content_hash':digest,'final_url':final_url,**({'index_deferred':True} if index_deferred else {})},pages_processed=1,chunks_indexed=chunks,chunks_tagged=tagged,chunks_untagged=untagged)
         self._finalize_if_safe(job_id,domain)
         if settings.crawl_delay > 0: time.sleep(settings.crawl_delay)
         return {'status': 'completed'}
