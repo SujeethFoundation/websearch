@@ -56,7 +56,7 @@ Note: the status and dashboard routes use a hyphen (`crawl-status`, `crawl-dashb
 
 | Route | Purpose |
 |---|---|
-| `POST /index/backfill` | Queue a resumable backfill of all Blob documents into the index (re-embeds everything; start it once) |
+| `POST /index/backfill` | Queue a resumable pass over every stored chunk. Body: optional `mode` and `domains`. `domains` (for example `["sujeeth.org"]`) limits the pass to chunks from those domains, so your own sites can be indexed without waiting for everything else. `missing` (the default) indexes only chunks that are not in the index yet, which makes it cheap to repeat. `all` re-sends every chunk, for example after changing the index schema or vectorizer. Stored vectors are reused, so nothing is embedded twice |
 | `POST /index/retag-preview` | Read-only sample of how many stored documents a re-tag would change. Body: optional `domains`, `scan_limit` (max 1000) |
 | `POST /index/retag` | Queue a re-tag of stored documents with the current ontology. Updates Blob Storage and merges tags into the index. Uses no embedding quota. Body: optional `domains` |
 | `POST /index/purge-preview` | Read-only sample of how many stored chunks fall under the ontology's `exclude_paths`. Body: optional `domains`, `scan_limit` (max 1000) |
@@ -69,6 +69,7 @@ Note: the status and dashboard routes use a hyphen (`crawl-status`, `crawl-dashb
 |---|---|---|
 | `scheduled_crawl_recovery` | Daily 10:00 | Reconciles and recovers unfinished jobs (up to 30 days old). Jobs that finished with errors are retried for 3 days only |
 | `scheduled_weekly_crawl` | Sundays 08:00 | Starts an incremental crawl for each domain in `WEEKLY_CRAWL_DOMAINS` (default `*`, every crawl-enabled domain). Skips domains that already have an open job |
+| `scheduled_index_reconcile` | Daily 11:00 | Queues a `missing`-mode backfill so any chunk that is stored but absent from the index gets indexed. Skipped when the queue already holds more than `INDEX_RECONCILE_MAX_QUEUE` messages or `INDEX_RECONCILE_ENABLED` is false |
 
 Incremental crawls use ETag and Last-Modified conditional requests and content hashes. Unchanged pages are not re-embedded or re-written, but every crawl still creates new job rows and queue messages for every page it visits.
 
@@ -94,6 +95,8 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `SEARCH_WRITE_ATTEMPTS` | `8` | Tries per index write when the search service answers 429 or 503. Waits grow from 2 to 60 seconds, about 3 minutes in all |
 | `SEARCH_BREAKER_SECONDS` | `120` | After the index stays busy through every retry, other writes on that instance skip the retries for this long and defer at once |
 | `INDEX_MAX_DEFERRALS` | `12` | How many times a deferred indexing task is re-queued before it fails normally |
+| `INDEX_RECONCILE_ENABLED` | `true` | Set to `false` to turn the nightly reconcile off without redeploying |
+| `INDEX_RECONCILE_MAX_QUEUE` | `500` | The nightly reconcile is skipped when the queue holds more messages than this |
 | `WEEKLY_CRAWL_DOMAINS` | `*` | Comma-separated domains for the weekly crawl, or `*` for all. If this setting exists with a list, that list wins |
 | `FULL_TEXT_DOMAINS` | `sujeeth.org,topics.sujeeth.org` | Domains `/document` may return in full |
 | `EXCERPT_MAX_CHARS` | `3000` | Cap for every other domain |
@@ -107,7 +110,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 - **Re-tagging:** tags are assigned at crawl time, and unchanged pages are not re-tagged on later crawls. After an ontology alias or domain-concept change, run `index/retag-preview`, then `index/retag`. The resolver caches the ontology in memory, so restart the app after an ontology deploy.
 - **Excluded paths.** A domain's `crawl_policy.exclude_paths` in the ontology (for example TealHQ's `/job` and `/jobs`) stops the crawler from queuing or fetching those URLs. This covers sitemap URLs, discovered links, and pages already waiting in the queue. Excluded pages are not counted as skipped, so they do not block stale-page cleanup. The rules are cached for 10 minutes, so after changing them, restart the app, then run `index/purge-preview` and `index/purge` to remove what is already stored. Run the purge before a backfill, or the backfill will re-index the excluded pages from Blob Storage.
 - **Vectors are stored and a busy index never fails a crawl.** Each chunk is embedded once, and its vector is saved as `vectors/<id>.json` next to the chunk. If the search service stays busy (429 or 503) through every retry, the page is still marked processed (`index_deferred`), and a delayed `index_blob_batch` task indexes the stored chunks later: after 2, 5, 10, 20, and 30 minutes, then hourly, up to `INDEX_MAX_DEFERRALS` times. Nothing is fetched or embedded again. A page whose indexing is deferred is missing from search until that task succeeds, and `POST /api/index/backfill` indexes anything still stored but missing.
-- **Backfill** indexes every blob. Chunks that already have a stored vector are not embedded again, so only old chunks without one pay for embeddings the first time. Run it once, after the crawl queue has drained, and watch `index-status` and the poison queue. A second pass fixes gaps (writes are idempotent).
+- **Backfill** compares Blob Storage with the index and, in the default `missing` mode, indexes only the chunks that are absent. It is safe to run again whenever you suspect a gap, such as after a long index outage. Use `mode: all` only to rebuild the whole index. Chunks that already have a stored vector are not embedded again, so only old chunks without one pay for embeddings the first time. Watch `index-status`, the `Index batch mode=… already_indexed=… indexed=…` log lines, and the poison queue.
 - **Queue messages are at-least-once.** Writes use deterministic IDs.
 
 ## Setup for scripts

@@ -235,7 +235,17 @@ def reindex(req):
 
 @app.route(route="index/backfill", methods=["POST"])
 def index_backfill(req):
-    """Start a queue-driven, resumable backfill of existing Blob documents."""
+    """Start a queue-driven, resumable backfill of existing Blob documents.
+
+    Body (optional): {"mode": "missing"} indexes only chunks that are not in the index yet (the default);
+    {"mode": "all"} re-sends every chunk. Stored vectors are reused either way.
+    {"domains": ["sujeeth.org"]} limits the pass to chunks from those domains.
+    """
+    body = read_body(req)
+    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    mode = str(body.get("mode") or "missing").strip().lower()
+    if mode not in ("missing", "all"):
+        return response({"error": "mode must be 'missing' or 'all'"}, 400)
     if not settings.azure_storage_connection or not storage.container or not queue_processor:
         return response({"error": "Azure Blob Storage and AzureWebJobsStorage must be configured."}, 503)
     if not settings.search_configured or not settings.embedding_configured:
@@ -249,13 +259,19 @@ def index_backfill(req):
         queue.send_message(json.dumps({
             "task_type": "index_backfill_page",
             "continuation_token": None,
+            "mode": mode,
+            "domains": domains,
         }))
         return response({
             "status": "queued",
             "task_type": "index_backfill_page",
+            "mode": mode,
+            "domains": domains or "all",
             "source_prefix": "documents/",
             "batch_size": settings.index_backfill_batch_size,
-            "message": "The queue worker will page through Blob Storage, generate embeddings in batches, and upload documents to sf-knowledge."
+            "message": ("The queue worker will page through Blob Storage and index only the chunks that are not in sf-knowledge yet."
+                        if mode == "missing" else
+                        "The queue worker will page through Blob Storage and re-send every chunk to sf-knowledge."),
         }, 202)
     except Exception as exc:
         log.exception("AI Search backfill enqueue failed")
@@ -852,3 +868,42 @@ def scheduled_weekly_crawl(timer: func.TimerRequest) -> None:
                 log.error("Weekly crawl could not enqueue homepage for %s", domain)
         except Exception:
             log.exception("Weekly crawl failed to start for %s", domain)
+
+
+@app.timer_trigger(schedule="0 0 11 * * *", arg_name="timer", run_on_startup=False)
+def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
+    """Daily 11:00 UTC: index any stored chunk that is missing from the search index.
+
+    Queues the same resumable backfill as POST /api/index/backfill, in "missing" mode, so a clean
+    index costs one cheap existence check per 10 chunks and no writes. The run is skipped when:
+      - INDEX_RECONCILE_ENABLED is set to false,
+      - storage, search, or embeddings are not configured, or
+      - the queue already holds more than INDEX_RECONCILE_MAX_QUEUE messages (default 500). That keeps
+        one nightly run from starting on top of an unfinished one, and from piling onto a busy index.
+    """
+    if os.getenv("INDEX_RECONCILE_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+        log.info("Nightly index reconcile is turned off (INDEX_RECONCILE_ENABLED)")
+        return
+    if (not settings.azure_storage_connection or not storage.container or not queue_processor
+            or not settings.search_configured or not settings.embedding_configured):
+        log.warning("Nightly index reconcile skipped: storage, search, or embeddings are not configured")
+        return
+    try:
+        queue = QueueClient.from_connection_string(
+            settings.azure_storage_connection,
+            settings.crawl_queue,
+            message_encode_policy=TextBase64EncodePolicy(),
+        )
+        limit = int(os.getenv("INDEX_RECONCILE_MAX_QUEUE", "500") or 500)
+        waiting = int(queue.get_queue_properties().approximate_message_count or 0)
+        if waiting > limit:
+            log.warning("Nightly index reconcile skipped: the queue holds %d messages (limit %d)", waiting, limit)
+            return
+        queue.send_message(json.dumps({
+            "task_type": "index_backfill_page",
+            "continuation_token": None,
+            "mode": "missing",
+        }))
+        log.info("Nightly index reconcile queued (the queue held %d messages)", waiting)
+    except Exception:
+        log.exception("Nightly index reconcile could not be queued")

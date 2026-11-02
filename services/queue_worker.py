@@ -94,14 +94,15 @@ class QueueProcessor:
         return {"status": "preview", "blob_names_scanned": len(names), **stats,
                 "would_change": len(changes), "examples": sample}
 
-    def _defer_index_batch(self, names, attempt=0):
+    def _defer_index_batch(self, names, attempt=0, mode=None, domains=None):
         """Queue a delayed indexing task for chunks that are stored but not yet in the index."""
         delay = DEFERRAL_DELAYS[min(int(attempt), len(DEFERRAL_DELAYS) - 1)]
         names = list(names)
         # Queue messages are limited in size, so a page with very many chunks is sent in groups.
         for start in range(0, len(names), 100):
             self.queue.send_message(
-                json.dumps({"task_type": "index_blob_batch", "blob_names": names[start:start + 100], "attempt": int(attempt)}),
+                json.dumps({"task_type": "index_blob_batch", "blob_names": names[start:start + 100], "attempt": int(attempt),
+                            **({"mode": mode} if mode else {}), **({"domains": domains} if domains else {})}),
                 visibility_timeout=delay,
             )
         return delay
@@ -165,19 +166,28 @@ class QueueProcessor:
                 page_size=500,
             )
             batch_size = settings.index_backfill_batch_size
+            # "missing" indexes only chunks that are not in the index yet. "all" re-sends everything.
+            mode = task.get("mode", "all")
+            domains = task.get("domains") or []
             queued = 0
             for start in range(0, len(names), batch_size):
                 self.queue.send_message(json.dumps({
                     "task_type": "index_blob_batch",
                     "blob_names": names[start:start + batch_size],
+                    "mode": mode,
+                    "domains": domains,
                 }))
                 queued += 1
             if next_token:
                 self.queue.send_message(json.dumps({
                     "task_type": "index_backfill_page",
                     "continuation_token": next_token,
+                    "mode": mode,
+                    "domains": domains,
                 }))
             result = {
+                "mode": mode,
+                "domains": domains or "all",
                 "status": "backfill_page_queued",
                 "blob_names_found": len(names),
                 "index_batches_queued": queued,
@@ -258,13 +268,18 @@ class QueueProcessor:
         elif task_type == "index_blob_batch":
             names = task.get("blob_names") or []
             attempt = int(task.get("attempt", 0))
+            mode = task.get("mode")
+            domains = task.get("domains") or []
             try:
-                indexed = self.search.index_existing_blobs(names)
-                result = {"status": "indexed", "blobs_read": len(names), "documents_indexed": indexed}
+                outcome = self.search.index_blobs(names, only_missing=(mode == "missing"), domains=domains)
+                result = {"status": "indexed", "blobs_read": len(names), "documents_indexed": outcome["indexed"],
+                          "already_indexed": outcome["already_indexed"]}
+                log.info("Index batch mode=%s read=%s already_indexed=%s indexed=%s",
+                         mode or "all", len(names), outcome["already_indexed"], outcome["indexed"])
             except IndexBusyError:
                 if attempt >= MAX_INDEX_DEFERRALS:
                     raise
-                delay = self._defer_index_batch(names, attempt + 1)
+                delay = self._defer_index_batch(names, attempt + 1, mode, domains)
                 result = {"status": "index_busy_deferred", "blobs": len(names), "attempt": attempt + 1, "retry_in_seconds": delay}
         else:
             result = self.worker.process(task)

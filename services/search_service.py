@@ -316,13 +316,64 @@ class SearchService:
     def upsert(self, doc):
         return self.upsert_many([doc], persist_blobs=True)
 
-    def index_existing_blobs(self, blob_names):
+    def _existing_ids(self, ids):
+        """Which of these chunk ids are already in the index."""
+        ids = [str(x) for x in ids]
+        found = set()
+        for start in range(0, len(ids), 100):
+            group = ids[start:start + 100]
+            response = self._post("search", {
+                "search": "*",
+                "filter": f"search.in(id, '{self._odata_values(group)}', ',')",
+                "select": "id",
+                "top": len(group),
+            }, 45, attempts=3, max_wait=5)
+            if response.status_code in (429, 502, 503, 504):
+                raise IndexBusyError(f"Azure AI Search was busy (HTTP {response.status_code}) while checking existing chunks.")
+            if response.status_code == 400:
+                # The id field is not filterable in this index, so look each chunk up directly.
+                found.update(self._existing_ids_by_lookup(group))
+                continue
+            response.raise_for_status()
+            found.update(str(x.get("id")) for x in response.json().get("value", []))
+        return found
+
+    def _existing_ids_by_lookup(self, ids):
+        found = set()
+        for doc_id in ids:
+            url = (f"{settings.search_endpoint}/indexes/{settings.search_index_name}/docs('{doc_id}')"
+                   f"?api-version={settings.search_api_version}&$select=id")
+            response = self.session.get(url, timeout=30)
+            if response.status_code == 200:
+                found.add(str(doc_id))
+            elif response.status_code in (429, 502, 503, 504):
+                raise IndexBusyError(f"Azure AI Search was busy (HTTP {response.status_code}) while checking existing chunks.")
+            elif response.status_code != 404:
+                response.raise_for_status()
+        return found
+
+    def index_blobs(self, blob_names, only_missing=False, domains=None):
+        """Index stored chunks. With only_missing, chunks already in the index are left alone.
+        With domains, only chunks from those domains are considered.
+        Stored vectors are reused, so a chunk is never embedded twice."""
+        only = {str(x).lower() for x in (domains or []) if str(x).strip()}
         docs = []
         for name in blob_names:
             doc = self.storage.get(name)
             if doc and doc.get("id") and doc.get("content"):
+                if only and str(doc.get("domain") or "").lower() not in only:
+                    continue
                 docs.append(doc)
-        return self.upsert_many(docs, persist_blobs=False)
+        already = 0
+        if only_missing and docs:
+            present = self._existing_ids([d["id"] for d in docs])
+            already = len(present)
+            docs = [d for d in docs if str(d["id"]) not in present]
+        indexed = self.upsert_many(docs, persist_blobs=False) if docs else 0
+        return {"read": len(docs) + already, "already_indexed": already, "indexed": indexed}
+
+    def index_existing_blobs(self, blob_names):
+        return self.index_blobs(blob_names)["indexed"]
 
     @staticmethod
     def _odata_values(values):
