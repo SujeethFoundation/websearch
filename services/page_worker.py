@@ -5,6 +5,7 @@ from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
 from services.config import settings
+from services.path_rules import PathPolicy
 
 # HTTP statuses that retrying will not fix. 408/429/5xx are not listed and stay retryable.
 PERMANENT_HTTP_STATUSES = {400, 401, 403, 404, 405, 406, 410, 451}
@@ -20,6 +21,7 @@ class PermanentPageError(Exception):
 class PageWorker:
     def __init__(self, ontology, storage, search, resolver, state):
         self.ontology,self.storage,self.search,self.resolver,self.state=ontology,storage,search,resolver,state
+        self.path_policy=PathPolicy(ontology)
         self.session=requests.Session(); self.session.headers.update({'User-Agent':settings.crawler_user_agent})
 
     @staticmethod
@@ -90,6 +92,10 @@ class PageWorker:
     def _process_claimed(self, task, job_id, domain, url, depth, job, claim_token):
         if depth>int(job.get('max_depth',settings.max_crawl_depth)):
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'depth_limit'},pages_skipped=1); return {'status': 'completed'}
+        # Pages under a path the ontology excludes for this domain are never fetched. They are not
+        # counted as skipped, so excluding a section does not block stale-page cleanup.
+        if self.path_policy.is_excluded(domain,url):
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'path_excluded'}); return {'status': 'completed'}
         if not self.same_site(url,domain) or not self.safe_public_host(urlparse(url).hostname or ''):
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'off_site_or_non_public'},pages_skipped=1); return {'status': 'completed'}
         # Require an explicit robots policy response for the actual host.
@@ -112,6 +118,7 @@ class PageWorker:
                                if line.strip().lower().startswith("sitemap:")]
                 sitemap_urls, _, _, _ = sitemap_crawler._sitemap_urls(domain,sitemap_seeds)
                 for sitemap_url in sitemap_urls:
+                    if self.path_policy.is_excluded(domain,sitemap_url): continue
                     self.state.enqueue_page(job_id,domain,sitemap_url,1)
         except PermanentPageError as exc:
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'robots_'+exc.reason},pages_skipped=1); return {'status': 'completed'}
@@ -157,7 +164,7 @@ class PageWorker:
                 if self.same_site(canonical_url,domain): final_url=canonical_url
             for a in soup.find_all('a',href=True):
                 candidate=self.normalize(urljoin(final_url,a['href']))
-                if self.same_site(candidate,domain) and (not urlparse(candidate).path.rsplit('/',1)[-1].count('.') or urlparse(candidate).path.lower().endswith(tuple(settings.allowed_extensions))):
+                if self.same_site(candidate,domain) and not self.path_policy.is_excluded(domain,candidate) and (not urlparse(candidate).path.rsplit('/',1)[-1].count('.') or urlparse(candidate).path.lower().endswith(tuple(settings.allowed_extensions))):
                     discovered.append(candidate)
             for tag in soup(['script','style','nav','footer','header','noscript','svg','form']): tag.decompose()
             for node in soup.select('[role=navigation],.cookie,.cookie-banner,.cookie-consent,.advertisement,.ads'):

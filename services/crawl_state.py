@@ -238,6 +238,10 @@ class CrawlState:
         e.update(values)
         self.manifest.upsert_entity(e,mode=UpdateMode.MERGE)
 
+    def manifest_delete(self, domain, url):
+        try: self.manifest.delete_entity(digest(domain),digest(url))
+        except Exception: pass
+
     def manifest_for_domain(self, domain):
         return list(self.manifest.query_entities(f"PartitionKey eq '{digest(domain)}'"))
 

@@ -1,10 +1,12 @@
 """Azure Queue adapter for crawl and Azure AI Search indexing tasks."""
 import json
+from urllib.parse import urlparse
 import logging
 from azure.storage.queue import QueueClient, TextBase64EncodePolicy
 from services.config import settings
 from services.crawl_state import CrawlState
 from services.page_worker import PageWorker
+from services.path_rules import is_excluded_url
 
 log = logging.getLogger("sujeeth-web-search.crawl-worker")
 
@@ -83,6 +85,53 @@ class QueueProcessor:
         return {"status": "preview", "blob_names_scanned": len(names), **stats,
                 "would_change": len(changes), "examples": sample}
 
+    def _purge_matches(self, names, domains=None):
+        """Find stored chunks whose page is under an excluded path for its domain."""
+        only = {str(x).lower() for x in (domains or []) if str(x).strip()}
+        rules_by_domain = self.worker.path_policy.all_rules()
+        matches = []
+        stats = {"read": 0}
+        for name in names:
+            doc = self.storage.get(name)
+            if not doc or not doc.get("id"):
+                continue
+            stats["read"] += 1
+            domain = str(doc.get("domain") or "").lower()
+            if only and domain not in only:
+                continue
+            rules = rules_by_domain.get(domain)
+            if rules and is_excluded_url(doc.get("url"), rules):
+                matches.append((name, doc))
+        return matches, stats
+
+    def purge_blobs(self, names, domains=None):
+        """Delete stored chunks under excluded paths: index entries, blobs, and manifest rows."""
+        matches, stats = self._purge_matches(names, domains)
+        ids = [doc["id"] for _, doc in matches]
+        # Index first. If that fails the blobs are still there and the retry finds them again.
+        index_deleted = self.search.delete_ids(ids) if ids else 0
+        for name, doc in matches:
+            self.storage.delete(name)
+            self.state.manifest_delete(str(doc.get("domain") or "").lower(), doc.get("url"))
+        log.info("Purge batch read=%s removed=%s index_deleted=%s", stats["read"], len(matches), index_deleted)
+        return {"status": "purged", **stats, "removed": len(matches), "index_deleted": index_deleted}
+
+    def purge_preview(self, domains=None, scan_limit=1000, examples=5):
+        """Read-only sample of how many stored chunks a purge would remove. Writes nothing."""
+        names, _ = self.storage.list_blob_name_page("documents/", page_size=max(1, min(int(scan_limit), 1000)))
+        matches, stats = self._purge_matches(names, domains)
+        by_section = {}
+        for _, doc in matches:
+            section = (urlparse(str(doc.get("url") or "")).path.strip("/").split("/") or [""])[0]
+            key = f"{str(doc.get('domain') or '').lower()}/{section}"
+            by_section[key] = by_section.get(key, 0) + 1
+        return {
+            "status": "preview", "blob_names_scanned": len(names), **stats,
+            "would_remove": len(matches), "by_section": by_section,
+            "examples": [doc.get("url") for _, doc in matches[:examples]],
+            "rules": {d: list(r) for d, r in self.worker.path_policy.all_rules().items()},
+        }
+
     def process(self, message):
         task = json.loads(message)
         task_type = task.get("task_type", "crawl_page")
@@ -141,6 +190,35 @@ class QueueProcessor:
             }
         elif task_type == "index_retag_batch":
             result = self.retag_blobs(task.get("blob_names") or [], task.get("domains") or [])
+        elif task_type == "index_purge_page":
+            domains = task.get("domains") or []
+            names, next_token = self.storage.list_blob_name_page(
+                "documents/",
+                continuation_token=task.get("continuation_token"),
+                page_size=500,
+            )
+            queued = 0
+            for start in range(0, len(names), 25):
+                self.queue.send_message(json.dumps({
+                    "task_type": "index_purge_batch",
+                    "blob_names": names[start:start + 25],
+                    "domains": domains,
+                }))
+                queued += 1
+            if next_token:
+                self.queue.send_message(json.dumps({
+                    "task_type": "index_purge_page",
+                    "continuation_token": next_token,
+                    "domains": domains,
+                }))
+            result = {
+                "status": "purge_page_queued",
+                "blob_names_found": len(names),
+                "purge_batches_queued": queued,
+                "more_pages": bool(next_token),
+            }
+        elif task_type == "index_purge_batch":
+            result = self.purge_blobs(task.get("blob_names") or [], task.get("domains") or [])
         elif task_type == "index_blob_batch":
             names = task.get("blob_names") or []
             indexed = self.search.index_existing_blobs(names)

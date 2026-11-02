@@ -1,11 +1,34 @@
 """Azure AI Search indexing and hybrid retrieval; Blob Storage remains canonical."""
 import logging
+import os
+import threading
 import time
 import requests
 from services.config import settings
 from services.embedding_service import EmbeddingService
 
 log = logging.getLogger("sujeeth-web-search.ai-search")
+
+# Index write pacing and patience. The search service rejects writes with 429 or 503 when it is
+# busy. SEARCH_MIN_INTERVAL_SECONDS spaces index writes at least this far apart on each running
+# instance (0 = off). SEARCH_WRITE_ATTEMPTS is how many times one write is tried; the waits grow
+# from 2 seconds to 60, so 8 attempts is about 3 minutes, well inside the queue's 15-minute lease.
+SEARCH_MIN_INTERVAL = float(os.getenv("SEARCH_MIN_INTERVAL_SECONDS", "0") or 0)
+SEARCH_WRITE_ATTEMPTS = max(1, int(os.getenv("SEARCH_WRITE_ATTEMPTS", "8") or 8))
+_pace_lock = threading.Lock()
+_next_write_slot = 0.0
+
+
+def _pace_writes():
+    global _next_write_slot
+    if SEARCH_MIN_INTERVAL <= 0:
+        return
+    with _pace_lock:
+        now = time.monotonic()
+        wait = _next_write_slot - now
+        _next_write_slot = max(now, _next_write_slot) + SEARCH_MIN_INTERVAL
+    if wait > 0:
+        time.sleep(wait)
 
 
 class SearchService:
@@ -47,13 +70,14 @@ class SearchService:
             return response
         return response
 
-    def _write_batch(self, actions, rounds=5):
+    def _write_batch(self, actions, rounds=3):
         """Send index actions and retry the documents the service reports as busy (429 or 503
         inside an otherwise successful response). Returns the final result for each document."""
         pending = list(actions)
         final = {}
         for round_number in range(rounds):
-            response = self._post("index", {"value": pending}, 90)
+            _pace_writes()
+            response = self._post("index", {"value": pending}, 90, attempts=SEARCH_WRITE_ATTEMPTS)
             response.raise_for_status()
             retry_ids = set()
             for item in response.json().get("value", []):
@@ -159,6 +183,17 @@ class SearchService:
             counted.raise_for_status()
             total = counted.json().get("@odata.count")
         return rows, focus, total
+
+    def delete_ids(self, ids):
+        """Delete documents from the index by id. Deleting an id that is not there is not an error."""
+        ids = [str(x) for x in ids if x]
+        if not self.configured or not ids:
+            return 0
+        results = self._write_batch([{"@search.action": "delete", "id": doc_id} for doc_id in ids])
+        failed = [x for x in results if not x.get("status")]
+        if failed:
+            raise RuntimeError(f"Azure AI Search could not delete {len(failed)} document(s): {failed[:3]}")
+        return len(ids)
 
     def upsert_many(self, documents, persist_blobs=True):
         documents = [dict(x) for x in documents if x and x.get("id")]

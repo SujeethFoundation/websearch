@@ -312,6 +312,53 @@ def index_retag_preview(req):
         return response({"error": str(exc)}, 502)
 
 
+@app.route(route="index/purge-preview", methods=["POST"])
+def index_purge_preview(req):
+    """Read-only sample of how many stored chunks fall under the ontology's excluded paths."""
+    if not storage.container or not queue_processor:
+        return response({"error": "Azure Blob Storage must be configured."}, 503)
+    body = read_body(req)
+    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    try:
+        return response(queue_processor.purge_preview(domains, scan_limit=int(body.get("scan_limit", 1000))))
+    except Exception as exc:
+        log.exception("Purge preview failed")
+        return response({"error": str(exc)}, 502)
+
+
+@app.route(route="index/purge", methods=["POST"])
+def index_purge(req):
+    """Queue a resumable purge of stored chunks under the ontology's excluded paths.
+
+    Removes the chunks from the search index and Blob Storage and clears their crawl manifest
+    rows. Optional body: {"domains": ["tealhq.com"]} to limit it to some domains.
+    """
+    if not settings.azure_storage_connection or not storage.container or not queue_processor:
+        return response({"error": "Azure Blob Storage and AzureWebJobsStorage must be configured."}, 503)
+    body = read_body(req)
+    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    try:
+        queue = QueueClient.from_connection_string(
+            settings.azure_storage_connection,
+            settings.crawl_queue,
+            message_encode_policy=TextBase64EncodePolicy(),
+        )
+        queue.send_message(json.dumps({
+            "task_type": "index_purge_page",
+            "continuation_token": None,
+            "domains": domains,
+        }))
+        return response({
+            "status": "queued",
+            "task_type": "index_purge_page",
+            "domains": domains or "all",
+            "message": "The queue worker will page through Blob Storage and remove chunks whose pages fall under an excluded path.",
+        }, 202)
+    except Exception as exc:
+        log.exception("Purge enqueue failed")
+        return response({"error": str(exc)}, 500)
+
+
 @app.route(route="document", methods=["POST"])
 def document(req):
     """Return one indexed page, or a passage with its neighbors, within size limits.
