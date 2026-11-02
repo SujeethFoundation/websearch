@@ -59,6 +59,8 @@ Note: the status and dashboard routes use a hyphen (`crawl-status`, `crawl-dashb
 | `POST /index/backfill` | Queue a resumable backfill of all Blob documents into the index (re-embeds everything; start it once) |
 | `POST /index/retag-preview` | Read-only sample of how many stored documents a re-tag would change. Body: optional `domains`, `scan_limit` (max 1000) |
 | `POST /index/retag` | Queue a re-tag of stored documents with the current ontology. Updates Blob Storage and merges tags into the index. Uses no embedding quota. Body: optional `domains` |
+| `POST /index/purge-preview` | Read-only sample of how many stored chunks fall under the ontology's `exclude_paths`. Body: optional `domains`, `scan_limit` (max 1000) |
+| `POST /index/purge` | Queue a purge of stored chunks under excluded paths: removes them from the index and Blob Storage and clears their manifest rows. Body: optional `domains` |
 | `POST /refresh`, `POST /enrich`, `POST /reindex` | Legacy. `reindex` returns 409 and points to backfill |
 
 ## Scheduled jobs (UTC)
@@ -98,6 +100,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 - **Permanent failures are skipped, not retried:** off-site redirects, redirect loops, non-public IPs, and HTTP 400/401/403/404/405/406/410/451. Timeouts, 429, and 5xx still retry (up to 5 deliveries).
 - **Stale-page cleanup** only runs after a clean crawl: no skipped or failed pages and below the page cap. Because skipped pages block it, domains with dead links will not purge removed pages.
 - **Re-tagging:** tags are assigned at crawl time, and unchanged pages are not re-tagged on later crawls. After an ontology alias or domain-concept change, run `index/retag-preview`, then `index/retag`. The resolver caches the ontology in memory, so restart the app after an ontology deploy.
+- **Excluded paths.** A domain's `crawl_policy.exclude_paths` in the ontology (for example TealHQ's `/job` and `/jobs`) stops the crawler from queuing or fetching those URLs. This covers sitemap URLs, discovered links, and pages already waiting in the queue. Excluded pages are not counted as skipped, so they do not block stale-page cleanup. The rules are cached for 10 minutes, so after changing them, restart the app, then run `index/purge-preview` and `index/purge` to remove what is already stored. Run the purge before a backfill, or the backfill will re-index the excluded pages from Blob Storage.
 - **Backfill** re-embeds every blob. Run it once, after the crawl queue has drained, and watch `index-status` and the poison queue. A second pass fixes gaps (writes are idempotent).
 - **Queue messages are at-least-once.** Writes use deterministic IDs.
 
