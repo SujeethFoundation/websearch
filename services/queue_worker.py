@@ -240,7 +240,21 @@ class QueueProcessor:
                 "more_pages": bool(next_token),
             }
         elif task_type == "index_purge_batch":
-            result = self.purge_blobs(task.get("blob_names") or [], task.get("domains") or [])
+            names = task.get("blob_names") or []
+            domains = task.get("domains") or []
+            attempt = int(task.get("attempt", 0))
+            try:
+                result = self.purge_blobs(names, domains)
+            except IndexBusyError:
+                # The index delete runs before any blob is removed, so nothing was lost: try again later.
+                if attempt >= MAX_INDEX_DEFERRALS:
+                    raise
+                delay = DEFERRAL_DELAYS[min(attempt, len(DEFERRAL_DELAYS) - 1)]
+                self.queue.send_message(
+                    json.dumps({"task_type": "index_purge_batch", "blob_names": names, "domains": domains, "attempt": attempt + 1}),
+                    visibility_timeout=delay,
+                )
+                result = {"status": "index_busy_deferred", "blobs": len(names), "attempt": attempt + 1, "retry_in_seconds": delay}
         elif task_type == "index_blob_batch":
             names = task.get("blob_names") or []
             attempt = int(task.get("attempt", 0))

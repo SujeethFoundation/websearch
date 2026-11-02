@@ -172,3 +172,27 @@ def test_large_deferrals_are_split_into_small_messages():
     proc = processor(None)
     proc._defer_index_batch([f"documents/{i}.json" for i in range(250)], attempt=0)
     assert [len(m[0]["blob_names"]) for m in proc.queue.sent] == [100, 100, 50]
+
+
+def test_purge_waits_for_a_busy_index_and_removes_nothing_meanwhile():
+    store = Store()
+    store.blobs["documents/p0-0.json"] = {"id": "p0-0", "domain": "tealhq.com", "url": "https://www.tealhq.com/job/a"}
+    store.blobs["vectors/p0-0.json"] = {"v": "x"}
+
+    class Policy:
+        def all_rules(self):
+            return {"tealhq.com": ("/job",)}
+
+    class BusySearch:
+        vector_key = staticmethod(ss.SearchService.vector_key)
+
+        def delete_ids(self, ids):
+            raise ss.IndexBusyError("busy")
+
+    proc = object.__new__(qw.QueueProcessor)
+    proc.queue, proc.storage, proc.search = Queue(), store, BusySearch()
+    proc.worker = types.SimpleNamespace(path_policy=Policy())
+    out = proc.process(json.dumps({"task_type": "index_purge_batch", "blob_names": ["documents/p0-0.json"], "domains": []}))
+    assert out["status"] == "index_busy_deferred" and out["retry_in_seconds"] == 120
+    assert proc.queue.sent[-1][0]["attempt"] == 1
+    assert sorted(store.blobs) == ["documents/p0-0.json", "vectors/p0-0.json"]  # nothing removed yet
