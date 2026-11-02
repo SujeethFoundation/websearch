@@ -81,7 +81,7 @@ class QueueProcessor:
             updates.append((doc["id"], new_concepts))
         indexed = not_indexed = 0
         if updates:
-            indexed, not_indexed = self.search.update_concepts(updates)
+            indexed, not_indexed = self.search.update_concepts(updates, docs=[doc for _, doc, _ in changes])
         log.info("Retag batch read=%s checked=%s changed=%s indexed=%s not_indexed=%s",
                  stats["read"], stats["checked"], len(changes), indexed, not_indexed)
         return {"status": "retagged", **stats, "changed": len(changes),

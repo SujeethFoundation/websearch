@@ -135,7 +135,10 @@ class SearchService:
             "content": str(doc.get("content") or ""),
         }
         if vector is not None:
-            item["contentVector"] = vector
+            item[settings.search_vector_field] = vector
+            for old in settings.search_null_vector_fields:
+                if old != settings.search_vector_field:
+                    item[old] = None  # drop the old vector so it stops using quota
         return item
 
     def _upload(self, docs):
@@ -144,7 +147,9 @@ class SearchService:
         outcomes = []
         for start in range(0, len(docs), settings.search_batch_size):
             batch = docs[start:start + settings.search_batch_size]
-            actions = [{"@search.action": "mergeOrUpload", **x} for x in batch]
+            # Blob-backed indexes keep no stored vector copy, so a merge cannot update a vector: replace whole documents.
+            action = "upload" if settings.search_blob_backed else "mergeOrUpload"
+            actions = [{"@search.action": action, **x} for x in batch]
             result = self._write_batch(actions)
             failures = [x for x in result if not x.get("status")]
             if failures:
@@ -152,15 +157,44 @@ class SearchService:
             outcomes.extend(result)
         return outcomes
 
-    def update_concepts(self, updates):
-        """Merge new concept tags into documents already in the index. No re-embedding.
+    def _blob_content(self, ids):
+        """Chunk text for these ids, read from Blob Storage."""
+        found = {}
+        for doc_id in ids:
+            doc = self.storage.get("documents/" + str(doc_id) + ".json")
+            if doc:
+                found[str(doc_id)] = str(doc.get("content") or "")
+        return found
 
-        updates is a list of (document_id, concepts). Uses the 'merge' action so a
-        document that is not indexed yet is skipped, never created as an empty stub.
+    def _rewrite_existing(self, updates, docs):
+        """Blob-backed retag: re-upload whole documents (with their stored vectors) for chunks already indexed."""
+        by_id = {str(d["id"]): d for d in (docs or []) if d.get("id")}
+        ids = [str(doc_id) for doc_id, _ in updates]
+        present = self._existing_ids(ids)
+        todo = []
+        for doc_id, concepts in updates:
+            doc = by_id.get(str(doc_id))
+            if str(doc_id) in present and doc:
+                fresh = dict(doc)
+                fresh["concepts"] = [str(c) for c in concepts]
+                todo.append(fresh)
+        if todo:
+            vectors = self._vectors_for(todo)
+            self._upload([self._search_doc(d, v) for d, v in zip(todo, vectors)])
+        return len(todo), len(ids) - len(present)
+
+    def update_concepts(self, updates, docs=None):
+        """Apply new concept tags to documents already in the index. No re-embedding of unchanged text.
+
+        updates is a list of (document_id, concepts). Normally this uses the 'merge' action, so a
+        document that is not indexed yet is skipped, never created as an empty stub. A blob-backed index
+        stores no vector copy, so there the whole document is re-uploaded from `docs` instead.
         Returns (updated, not_indexed).
         """
         if not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
+        if settings.search_blob_backed:
+            return self._rewrite_existing(updates, docs)
         updated = 0
         not_indexed = 0
         for start in range(0, len(updates), settings.search_batch_size):
@@ -202,12 +236,17 @@ class SearchService:
             filter_expr = f"search.in(url, '{joined}', '|')"
         else:
             raise ValueError("Provide url or chunk_id.")
+        select = "id,title,url,domain,concepts" if settings.search_blob_backed else "id,title,url,domain,concepts,content"
         response = self._post("search", {
-            "search": "*", "filter": filter_expr, "top": 1000,
-            "select": "id,title,url,domain,concepts,content",
+            "search": "*", "filter": filter_expr, "top": 1000, "select": select,
         }, 45, attempts=3, max_wait=5)
         response.raise_for_status()
         rows = response.json().get("value", [])
+        if settings.search_blob_backed:
+            rows = rows[:400]  # a page this long is cut off at 400 chunks
+            texts = self._blob_content([r.get("id") for r in rows])
+            for row in rows:
+                row["content"] = texts.get(str(row.get("id")), "")
         total = None
         if rows:
             page_url = str(rows[0].get("url") or "").replace("'", "''")
@@ -400,10 +439,10 @@ class SearchService:
             "vectorQueries": [{
                 "kind": "text",
                 "text": query,
-                "fields": "contentVector",
+                "fields": settings.search_vector_field,
                 "k": max(50, limit * 10),
             }],
-            "select": "id,title,url,domain,concepts,content",
+            "select": "id,title,url,domain,concepts" if settings.search_blob_backed else "id,title,url,domain,concepts,content",
             "top": limit,
             "count": True,
         }
@@ -411,11 +450,14 @@ class SearchService:
         response.raise_for_status()
         payload = response.json()
         results = []
-        for item in payload.get("value", []):
+        items = payload.get("value", [])
+        texts = self._blob_content([i.get("id") for i in items]) if settings.search_blob_backed else {}
+        for item in items:
+            text = texts.get(str(item.get("id")), "") if settings.search_blob_backed else (item.get("content") or "")
             results.append({
                 "title": item.get("title"),
                 "url": item.get("url"),
-                "snippet": (item.get("content") or "")[:700],
+                "snippet": text[:700],
                 "domain": item.get("domain"),
                 "concepts": item.get("concepts", []),
                 "score": round(float(item.get("@search.score", 0.0)), 6),

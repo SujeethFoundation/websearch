@@ -37,6 +37,16 @@ class Settings:
     search_index_name = os.getenv("AZURE_SEARCH_INDEX_NAME", "sf-knowledge")
     search_api_version = os.getenv("AZURE_SEARCH_API_VERSION", "2025-09-01")
     search_batch_size = max(1, min(int(os.getenv("AZURE_SEARCH_BATCH_SIZE", "100")), 500))
+    # The vector field that receives chunk vectors and is searched. To move to a compressed field in the same
+    # index, add that field (index_v2.py add-field), point AZURE_SEARCH_VECTOR_FIELD at it, and list the old field
+    # in AZURE_SEARCH_NULL_VECTOR_FIELDS so every rewritten chunk drops its old vector and frees that quota.
+    search_vector_field = os.getenv("AZURE_SEARCH_VECTOR_FIELD", "contentVector").strip() or "contentVector"
+    # When true, Blob Storage is the only copy of chunk text and vectors. The index keeps no retrievable text and no
+    # stored vector copy, so every index write replaces the whole document and result text is read from blobs.
+    search_blob_backed = os.getenv("AZURE_SEARCH_BLOB_BACKED", "false").strip().lower() in ("1", "true", "yes", "on")
+    search_null_vector_fields = tuple(
+        x.strip() for x in os.getenv("AZURE_SEARCH_NULL_VECTOR_FIELDS", "").split(",") if x.strip()
+    )
     index_backfill_batch_size = max(1, min(int(os.getenv("INDEX_BACKFILL_BATCH_SIZE", "10")), 25))
 
     max_pages = int(os.getenv("MAX_PAGES_PER_DOMAIN", "1000"))
