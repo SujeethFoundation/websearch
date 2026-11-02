@@ -38,7 +38,7 @@ class Settings:
     search_api_version = os.getenv("AZURE_SEARCH_API_VERSION", "2025-09-01")
     search_batch_size = max(1, min(int(os.getenv("AZURE_SEARCH_BATCH_SIZE", "100")), 500))
     # The vector field that receives chunk vectors and is searched. To move to a compressed field in the same
-    # index, add that field (index_v2.py add-field), point AZURE_SEARCH_VECTOR_FIELD at it, and list the old field
+    # index, add that field to the index definition, point AZURE_SEARCH_VECTOR_FIELD at it, and list the old field
     # in AZURE_SEARCH_NULL_VECTOR_FIELDS so every rewritten chunk drops its old vector and frees that quota.
     search_vector_field = os.getenv("AZURE_SEARCH_VECTOR_FIELD", "contentVector").strip() or "contentVector"
     # When true, Blob Storage is the only copy of chunk text and vectors. The index keeps no retrievable text and no
