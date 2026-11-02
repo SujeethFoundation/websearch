@@ -75,9 +75,10 @@ class StorageService:
             page = names[start:start + page_size]
             next_token = str(start + len(page)) if start + len(page) < len(names) else None
             return page, next_token
-        pager = self.container.list_blobs(name_starts_with=prefix).by_page(
-            continuation_token=continuation_token, results_per_page=page_size
-        )
+        # results_per_page belongs to list_blobs(); by_page() only accepts the continuation token.
+        pager = self.container.list_blobs(
+            name_starts_with=prefix, results_per_page=page_size
+        ).by_page(continuation_token=continuation_token)
         try:
             page = next(pager)
         except StopIteration:
