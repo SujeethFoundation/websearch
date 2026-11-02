@@ -12,6 +12,11 @@ from services.storage_service import StorageService
 from services.search_service import SearchService, assemble_document, chunk_index
 from services.crawler import Crawler
 from services.crawl_state import CrawlState
+
+# The Azure SDKs log every request and every response at INFO: two multi-line records per storage or table
+# call. At hundreds of thousands of calls a day that floods the logs and the monitoring bill. Warnings and
+# errors from the SDKs still come through.
+logging.getLogger("azure").setLevel(logging.WARNING)
 from services.queue_worker import QueueProcessor
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
