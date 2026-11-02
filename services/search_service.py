@@ -1,5 +1,6 @@
 """Azure AI Search indexing and hybrid retrieval; Blob Storage remains canonical."""
 import logging
+import time
 import requests
 from services.config import settings
 from services.embedding_service import EmbeddingService
@@ -22,6 +23,49 @@ class SearchService:
         return (f"{settings.search_endpoint}/indexes/{settings.search_index_name}/docs/"
                 f"{suffix}?api-version={settings.search_api_version}")
 
+    def _post(self, kind, payload, timeout, attempts=6, max_wait=60):
+        """POST to the index with backoff when the service is busy (429, 502, 503, 504) or the
+        connection drops. Honors Retry-After. Returns the final response; callers check it."""
+        response = None
+        for attempt in range(attempts):
+            try:
+                response = self.session.post(self._url(kind), json=payload, timeout=timeout)
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(min(2 ** attempt, max_wait))
+                continue
+            if response.status_code in (429, 502, 503, 504) and attempt < attempts - 1:
+                try:
+                    wait = float(response.headers.get("Retry-After", 2 ** (attempt + 1)))
+                except ValueError:
+                    wait = 2 ** (attempt + 1)
+                log.warning("Azure AI Search returned %s; retry %d/%d in %.0fs",
+                            response.status_code, attempt + 1, attempts - 1, min(wait, max_wait))
+                time.sleep(min(wait, max_wait))
+                continue
+            return response
+        return response
+
+    def _write_batch(self, actions, rounds=5):
+        """Send index actions and retry the documents the service reports as busy (429 or 503
+        inside an otherwise successful response). Returns the final result for each document."""
+        pending = list(actions)
+        final = {}
+        for round_number in range(rounds):
+            response = self._post("index", {"value": pending}, 90)
+            response.raise_for_status()
+            retry_ids = set()
+            for item in response.json().get("value", []):
+                final[item.get("key")] = item
+                if not item.get("status") and item.get("statusCode") in (429, 503):
+                    retry_ids.add(item.get("key"))
+            if not retry_ids or round_number == rounds - 1:
+                break
+            pending = [a for a in pending if str(a.get("id")) in retry_ids]
+            time.sleep(min(5 * (round_number + 1), 30))
+        return list(final.values())
+
     @staticmethod
     def _search_doc(doc, vector=None):
         item = {
@@ -42,10 +86,8 @@ class SearchService:
         outcomes = []
         for start in range(0, len(docs), settings.search_batch_size):
             batch = docs[start:start + settings.search_batch_size]
-            payload = {"value": [{"@search.action": "mergeOrUpload", **x} for x in batch]}
-            response = self.session.post(self._url("index"), json=payload, timeout=90)
-            response.raise_for_status()
-            result = response.json().get("value", [])
+            actions = [{"@search.action": "mergeOrUpload", **x} for x in batch]
+            result = self._write_batch(actions)
             failures = [x for x in result if not x.get("status")]
             if failures:
                 raise RuntimeError(f"Azure AI Search rejected {len(failures)} document(s): {failures[:3]}")
@@ -65,13 +107,11 @@ class SearchService:
         not_indexed = 0
         for start in range(0, len(updates), settings.search_batch_size):
             batch = updates[start:start + settings.search_batch_size]
-            payload = {"value": [
+            actions = [
                 {"@search.action": "merge", "id": str(doc_id), "concepts": [str(c) for c in concepts]}
                 for doc_id, concepts in batch
-            ]}
-            response = self.session.post(self._url("index"), json=payload, timeout=90)
-            response.raise_for_status()
-            for item in response.json().get("value", []):
+            ]
+            for item in self._write_batch(actions):
                 if item.get("status"):
                     updated += 1
                 elif item.get("statusCode") == 404:
@@ -104,18 +144,18 @@ class SearchService:
             filter_expr = f"search.in(url, '{joined}', '|')"
         else:
             raise ValueError("Provide url or chunk_id.")
-        response = self.session.post(self._url("search"), json={
+        response = self._post("search", {
             "search": "*", "filter": filter_expr, "top": 1000,
             "select": "id,title,url,domain,concepts,content",
-        }, timeout=45)
+        }, 45, attempts=3, max_wait=5)
         response.raise_for_status()
         rows = response.json().get("value", [])
         total = None
         if rows:
             page_url = str(rows[0].get("url") or "").replace("'", "''")
-            counted = self.session.post(self._url("search"), json={
+            counted = self._post("search", {
                 "search": "*", "filter": f"url eq '{page_url}'", "top": 0, "count": True,
-            }, timeout=45)
+            }, 45, attempts=3, max_wait=5)
             counted.raise_for_status()
             total = counted.json().get("@odata.count")
         return rows, focus, total
@@ -182,7 +222,7 @@ class SearchService:
             "top": limit,
             "count": True,
         }
-        response = self.session.post(self._url("search"), json=body, timeout=45)
+        response = self._post("search", body, 45, attempts=3, max_wait=5)
         response.raise_for_status()
         payload = response.json()
         results = []
@@ -216,16 +256,14 @@ class SearchService:
                     removed += 1
             return removed
         filter_expr = "url eq '" + str(url).replace("'", "''") + "'"
-        response = self.session.post(self._url("search"), json={
+        response = self._post("search", {
             "search": "*", "filter": filter_expr, "select": "id", "top": 1000
-        }, timeout=45)
+        }, 45, attempts=3, max_wait=5)
         response.raise_for_status()
         ids = [x.get("id") for x in response.json().get("value", []) if x.get("id")]
         if not ids:
             return 0
-        payload = {"value": [{"@search.action": "delete", "id": doc_id} for doc_id in ids]}
-        delete_response = self.session.post(self._url("index"), json=payload, timeout=90)
-        delete_response.raise_for_status()
+        self._write_batch([{"@search.action": "delete", "id": doc_id} for doc_id in ids])
         for doc_id in ids:
             self.storage.delete("documents/" + str(doc_id) + ".json")
         return len(ids)
@@ -236,9 +274,9 @@ class SearchService:
     def status(self):
         if not self.configured:
             return {"configured": False, "index": settings.search_index_name}
-        response = self.session.post(self._url("search"), json={
+        response = self._post("search", {
             "search": "*", "top": 0, "count": True
-        }, timeout=30)
+        }, 30, attempts=3, max_wait=5)
         response.raise_for_status()
         payload = response.json()
         return {
