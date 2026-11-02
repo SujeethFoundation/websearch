@@ -93,3 +93,21 @@ def test_policy_keeps_old_rules_when_the_ontology_cannot_be_read():
 def test_policy_allows_everything_if_the_ontology_never_answered():
     policy = PathPolicy(FakeOntology(fail=True))
     assert not policy.is_excluded("tealhq.com", "https://www.tealhq.com/job/x")
+
+
+
+def test_wildcards_match_within_one_segment():
+    rules = normalize_rules(["/career-paths/*-certifications"])
+    assert is_excluded_path("/career-paths/snowflake-developer-certifications", rules)
+    assert is_excluded_path("/career-paths/aws-certifications/extra", rules)
+    assert not is_excluded_path("/career-paths/certifications-guide", rules)
+    assert not is_excluded_path("/career-paths/a/b-certifications", rules)  # "*" never crosses a "/"
+    assert not is_excluded_path("/career-paths", rules)
+
+
+def test_wildcard_rules_mix_with_plain_rules():
+    rules = normalize_rules(["/job", "/career-paths/*-interview-questions", "/tag"])
+    assert is_excluded_path("/job/x", rules) and is_excluded_path("/tag/leadership", rules)
+    assert is_excluded_path("/career-paths/sales-engineer-interview-questions", rules)
+    assert not is_excluded_path("/career-paths/sales-engineer", rules)
+    assert is_excluded_url("https://www.tealhq.com/CAREER-PATHS/Sales-Interview-Questions?x=1", rules)

@@ -4,8 +4,14 @@ A domain in the ontology may list crawl_policy.exclude_paths, for example ["/job
 A rule matches that path and everything beneath it, compared on whole path segments: "/job"
 matches /job and /job/anything, but not /jobs or /jobsite. Matching ignores letter case, a
 trailing slash, and percent-encoding.
+
+A "*" inside a rule matches any characters within one path segment (never a "/"). For example
+"/career-paths/*-certifications" matches /career-paths/snowflake-developer-certifications and
+anything beneath it, but not /career-paths/certifications-guide.
 """
+import functools
 import logging
+import re
 import threading
 import time
 from urllib.parse import unquote, urlparse
@@ -30,12 +36,23 @@ def normalize_rules(rules):
     return tuple(cleaned)
 
 
+@functools.lru_cache(maxsize=512)
+def _wildcard_pattern(rule):
+    return re.compile("^" + re.escape(rule).replace(r"\*", "[^/]*") + "(?:/|$)")
+
+
 def is_excluded_path(path, rules):
     if not rules:
         return False
     trimmed = unquote(path or "/").lower().strip("/")
     candidate = "/" + trimmed if trimmed else "/"
-    return any(candidate == rule or candidate.startswith(rule + "/") for rule in rules)
+    for rule in rules:
+        if "*" in rule:
+            if _wildcard_pattern(rule).match(candidate):
+                return True
+        elif candidate == rule or candidate.startswith(rule + "/"):
+            return True
+    return False
 
 
 def is_excluded_url(url, rules):
