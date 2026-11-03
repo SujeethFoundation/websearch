@@ -832,20 +832,31 @@ def scheduled_crawl_recovery(timer: func.TimerRequest) -> None:
     log.info("Daily crawl recovery finished; jobs examined: %d", examined)
 
 
-@app.timer_trigger(schedule="0 0 8 * * 0", arg_name="timer", run_on_startup=False)
-def scheduled_weekly_crawl(timer: func.TimerRequest) -> None:
-    """Sundays 08:00 UTC: start an incremental crawl for each allowed domain.
+# Domains that get a crawl every week. Every other crawl-enabled ontology domain is crawled monthly.
+# Override with the WEEKLY_CRAWL_DOMAINS app setting (comma-separated). "*" or "all" puts every domain
+# on the weekly schedule and leaves the monthly crawl with nothing to do.
+WEEKLY_CRAWL_DEFAULT = "sujeeth.org,topics.sujeeth.org"
 
-    ETag/Last-Modified checks and content hashes skip unchanged pages. By default every
-    crawl-enabled ontology domain is crawled. Set WEEKLY_CRAWL_DOMAINS to a comma-separated
-    list to restrict it. Each domain is limited to MAX_PAGES_PER_DOMAIN pages.
+
+def _weekly_allowlist():
+    configured = os.getenv("WEEKLY_CRAWL_DOMAINS", WEEKLY_CRAWL_DEFAULT)
+    return {x.strip().lower() for x in configured.split(",") if x.strip()}
+
+
+def _is_weekly_domain(domain, allowlist):
+    return bool(allowlist & {"*", "all"}) or domain in allowlist
+
+
+def _start_scheduled_crawls(label, wanted):
+    """Start an incremental crawl for each crawl-enabled ontology domain that wanted(domain) accepts.
+
+    ETag/Last-Modified checks and content hashes skip unchanged pages, so every run walks the whole
+    domain but only re-embeds and re-indexes what changed. Each domain is limited to MAX_PAGES_PER_DOMAIN
+    pages. A domain with a job still open is skipped.
     """
     if not crawl_state:
-        log.error("Weekly crawl skipped: crawl state is not configured")
+        log.error("%s crawl skipped: crawl state is not configured", label)
         return
-    configured = os.getenv("WEEKLY_CRAWL_DOMAINS", "*")
-    allowlist = {x.strip().lower() for x in configured.split(",") if x.strip()}
-    crawl_everything = bool(allowlist & {"*", "all"})
     open_domains = {
         str(j.get("domain", "")).lower()
         for j in crawl_state.list_jobs(1000)
@@ -854,25 +865,42 @@ def scheduled_weekly_crawl(timer: func.TimerRequest) -> None:
     try:
         entries = ontology.crawl_manifest().get("crawl_domains", [])
     except Exception:
-        log.exception("Weekly crawl: could not read ontology crawl manifest")
+        log.exception("%s crawl: could not read ontology crawl manifest", label)
         return
+    started = 0
     for item in entries:
         domain = str(item.get("domain") if isinstance(item, dict) else item).lower().strip()
-        if not crawl_everything and domain not in allowlist:
+        if not domain or not wanted(domain):
             continue
         if domain in open_domains:
-            log.warning("Weekly crawl: skipping %s, a job is still open", domain)
+            log.warning("%s crawl: skipping %s, a job is still open", label, domain)
             continue
         try:
             cap, depth = _crawl_limits(item)
             job_id = crawl_state.create_job(domain, cap, depth, ontology.domain_concepts(domain))
             if crawl_state.enqueue_pages(job_id, domain, [(f"https://{domain}/", 0)]):
-                log.info("Weekly crawl started domain=%s job=%s", domain, job_id)
+                started += 1
+                log.info("%s crawl started domain=%s job=%s", label, domain, job_id)
             else:
                 crawl_state._change(job_id, status="failed", error="Could not enqueue homepage.")
-                log.error("Weekly crawl could not enqueue homepage for %s", domain)
+                log.error("%s crawl could not enqueue homepage for %s", label, domain)
         except Exception:
-            log.exception("Weekly crawl failed to start for %s", domain)
+            log.exception("%s crawl failed to start for %s", label, domain)
+    log.info("%s crawl finished starting jobs; domains started: %d", label, started)
+
+
+@app.timer_trigger(schedule="0 0 8 * * 0", arg_name="timer", run_on_startup=False)
+def scheduled_weekly_crawl(timer: func.TimerRequest) -> None:
+    """Sundays 08:00 UTC: incremental crawl of the domains in WEEKLY_CRAWL_DOMAINS."""
+    allowlist = _weekly_allowlist()
+    _start_scheduled_crawls("Weekly", lambda domain: _is_weekly_domain(domain, allowlist))
+
+
+@app.timer_trigger(schedule="0 0 9 1 * *", arg_name="timer", run_on_startup=False)
+def scheduled_monthly_crawl(timer: func.TimerRequest) -> None:
+    """1st of each month, 09:00 UTC: incremental crawl of every crawl-enabled domain that is not weekly."""
+    allowlist = _weekly_allowlist()
+    _start_scheduled_crawls("Monthly", lambda domain: not _is_weekly_domain(domain, allowlist))
 
 
 @app.timer_trigger(schedule="0 0 11 * * *", arg_name="timer", run_on_startup=False)

@@ -1,0 +1,34 @@
+$azureUrl = "https://websearch-h9arcweeftfrd8e0.eastus-01.azurewebsites.net"
+$key      = Read-Host "Websearch Function key" -AsSecureString
+$headers  = @{ "x-functions-key" = [System.Net.NetworkCredential]::new("", $key).Password }
+
+function Call($method, $path, $body = $null) {
+    $p = @{ Method = $method; Uri = "$azureUrl$path"; Headers = $headers; ContentType = "application/json" }
+    if ($body) { $p.Body = ($body | ConvertTo-Json -Depth 5) }
+    try { Invoke-RestMethod @p }
+    catch { Write-Warning "$method $path -> $($_.Exception.Message)"; $_.ErrorDetails.Message }
+}
+----
+$awjs = Read-Host "AzureWebJobsStorage connection string" -AsSecureString
+$env:QCONN = [System.Net.NetworkCredential]::new("", $awjs).Password
+$n = 0
+
+try {
+    do {
+        $out = python .\qdepth.py web-crawl-pages web-crawl-pages-poison
+        $q = [int]$out[0]; $pq = [int]$out[1]
+        $s = Call GET "/api/index-status"
+        $blobs = $s.blob_storage.document_count 
+	$indexed = $s.ai_search.document_count
+        
+        "{0}  queue={1}  poison={2}  blobs={3}  indexed={4}" -f (Get-Date -f HH:mm:ss), $q, $pq, $blobs, $indexed
+        Start-Sleep 60
+    } while ($q -gt 0 -or $n -lt 3)
+    Write-Host "`nQueue is empty." -ForegroundColor Green
+}
+finally { }
+
+----------------
+
+$env:BCONN = $env:QCONN
+python .\blob_paths_report.py --ontology ..\ontology\ontology\ontology.json --top 10
