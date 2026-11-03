@@ -3,6 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 import azure.functions as func
+from urllib.parse import urlparse
 from azure.storage.queue import QueueClient, TextBase64EncodePolicy
 
 from services.config import settings
@@ -12,6 +13,8 @@ from services.storage_service import StorageService
 from services.search_service import SearchService, assemble_document, chunk_index
 from services.crawler import Crawler
 from services.crawl_state import CrawlState
+from services.manual_page import build_page_documents
+from services.best_bets import best_bet_domains, merge_best_bets
 
 # The Azure SDKs log every request and every response at INFO: two multi-line records per storage or table
 # call. At hundreds of thousands of calls a day that floods the logs and the monitoring bill. Warnings and
@@ -102,7 +105,29 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5):
         "domains": selected_domains,
         "resolution": resolution,
     })
+    add_best_bets(result, query, resolution["matched_concepts"], selected_domains)
     return result
+
+
+BEST_BETS_MAX = max(0, min(int(os.getenv("BEST_BETS_MAX", "3")), 3))
+
+
+def add_best_bets(result, query, concepts, selected_domains):
+    """Put matching manually added pages first, flagged best_bet. Never fails the search."""
+    status, count = "none", 0
+    try:
+        manual_domains = best_bet_domains(ontology.search_manifest(), selected_domains) if BEST_BETS_MAX else []
+        if manual_domains:
+            manual = searcher.search(query, concepts=concepts, domains=manual_domains, limit=10)
+            merged = merge_best_bets(result.get("results", []), manual.get("results", []), BEST_BETS_MAX)
+            count = sum(1 for x in merged if x.get("best_bet"))
+            result["results"] = merged
+            result["count"] = len(merged)
+            status = "applied" if count else "no_match"
+    except Exception:
+        log.exception("Best-bet lookup failed; returning normal results only")
+        status = "unavailable"
+    result["best_bets"] = {"status": status, "count": count, "max": BEST_BETS_MAX}
 
 
 @app.route(route="health", methods=["GET"])
@@ -282,6 +307,66 @@ def index_backfill(req):
         log.exception("AI Search backfill enqueue failed")
         return response({"error": str(exc)}, 500)
 
+
+
+@app.route(route="index/page", methods=["POST"])
+def index_page(req):
+    """Add or replace one page whose text you supply, for sites the crawler cannot fetch.
+
+    Body: {"url": "https://...", "title": "...", "content": "page text",
+           "concepts": ["optional", "class_ids"], "allow_crawled_domain": false}
+    The page's domain must be search-enabled in the ontology and marked "manual_only": true,
+    so a later crawl cannot replace the page. Resubmitting the same URL replaces its chunks.
+    """
+    body = read_body(req)
+    if not settings.search_configured or not settings.embedding_configured:
+        return response({"error": "Configure Azure AI Search and Foundry embeddings before adding pages."}, 503)
+    try:
+        url = Crawler._normalize_url(str(body.get("url") or "").strip())
+        host = (urlparse(url).hostname or "").lower()
+        validation = ontology.validate_domains([host], "search")
+        approved = validation.get("approved") or []
+        if not approved or validation.get("rejected"):
+            return response({"error": f"{host or 'This domain'} is not search-enabled in the ontology. Add it there first."}, 403)
+        if not approved[0].get("manual_only") and not body.get("allow_crawled_domain"):
+            return response({"error": f"{host} is crawled, so a crawl would replace this page. Mark the domain "
+                                      "manual_only in the ontology, or send allow_crawled_domain: true."}, 409)
+        explicit = body.get("concepts")
+        if explicit is not None and not (isinstance(explicit, list) and all(isinstance(x, str) for x in explicit)):
+            return response({"error": "concepts must be an array of strings"}, 400)
+        documents, domain, _ = build_page_documents(
+            url=url, title=body.get("title"), text=body.get("content"),
+            allowed_concepts=ontology.domain_concepts(host), tag_fn=concept_resolver.tag_document,
+            chunk_chars=settings.chunk_chars, min_chars=settings.min_text_chars, explicit_concepts=explicit)
+        replaced = searcher.delete_url(url)
+        indexed, deferred = searcher.upsert_or_defer(documents, persist_blobs=True)
+        tagged = sum(1 for d in documents if d["concepts"])
+        return response({
+            "status": "indexed" if not deferred else "stored_pending_index",
+            "url": url, "domain": domain, "chunks": len(documents), "chunks_tagged": tagged,
+            "chunks_untagged": len(documents) - tagged, "chunks_replaced": replaced, "chunks_indexed": indexed,
+            "message": None if not deferred else "Chunks are stored; the search index was busy. Run POST /api/index/backfill with mode 'missing' to index them.",
+        }, 200 if not deferred else 202)
+    except ValueError as exc:
+        return response({"error": str(exc)}, 400)
+    except Exception as exc:
+        log.exception("Manual page add failed")
+        return response({"error": str(exc)}, 502)
+
+
+@app.route(route="index/page/delete", methods=["POST"])
+def index_page_delete(req):
+    """Remove one page (all its chunks) from the search index and Blob Storage. Body: {"url": "https://..."}"""
+    body = read_body(req)
+    url = str(body.get("url") or "").strip()
+    if not url:
+        return response({"error": "JSON body requires url"}, 400)
+    try:
+        removed = searcher.delete_url(Crawler._normalize_url(url))
+        return response({"status": "deleted" if removed else "not_found", "chunks_removed": removed})
+    except Exception as exc:
+        log.exception("Manual page delete failed")
+        return response({"error": str(exc)}, 502)
 
 
 @app.route(route="index/retag", methods=["POST"])
