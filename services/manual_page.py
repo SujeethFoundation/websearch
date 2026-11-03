@@ -1,4 +1,4 @@
-"""Build search chunks for one page whose text is supplied by hand instead of crawled.
+"""Build search chunks for one page added through POST /api/index/page (crawled once, or text supplied).
 
 Used by POST /api/index/page for pages a crawler cannot fetch (bot-blocked or login-gated
 sites). The chunks have the same shape and ids the crawler writes, so search, document
@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 
 def build_page_documents(*, url, title, text, allowed_concepts, tag_fn, chunk_chars, min_chars,
-                         explicit_concepts=None, now=None):
+                         explicit_concepts=None, now=None, description=None):
     """Return (documents, domain, content_hash). Raises ValueError for input the caller must fix.
 
     url must already be normalized. Concepts come from explicit_concepts (which must all be
@@ -47,6 +47,6 @@ def build_page_documents(*, url, title, text, allowed_concepts, tag_fn, chunk_ch
             "id": f"{page_id}-{index}", "title": title, "content": chunk, "url": url,
             "domain": domain, "concepts": concepts, "content_hash": digest, "page_hash": digest,
             "crawl_depth": 0, "page_type": "manual", "etag": None, "last_modified": None,
-            "crawled_utc": stamp,
+            "crawled_utc": stamp, "description": description,
         })
     return documents, domain, digest

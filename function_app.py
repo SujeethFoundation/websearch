@@ -14,6 +14,8 @@ from services.search_service import SearchService, assemble_document, chunk_inde
 from services.crawler import Crawler
 from services.crawl_state import CrawlState
 from services.manual_page import build_page_documents
+from services.page_fetch import fetch_page, PageFetchError
+from services.page_extract import infer_description
 from services.best_bets import best_bet_domains, merge_best_bets
 
 # The Azure SDKs log every request and every response at INFO: two multi-line records per storage or table
@@ -311,10 +313,15 @@ def index_backfill(req):
 
 @app.route(route="index/page", methods=["POST"])
 def index_page(req):
-    """Add or replace one page whose text you supply, for sites the crawler cannot fetch.
+    """Add or replace one page. The server crawls it and infers the description from what it finds.
 
-    Body: {"url": "https://...", "title": "...", "content": "page text",
-           "concepts": ["optional", "class_ids"], "allow_crawled_domain": false}
+    Body: {"url": "https://...", "content": "optional page text", "title": "optional override",
+           "concepts": ["optional", "class_ids"], "allow_crawled_domain": false, "preview": false}
+    Without content the page is fetched like a crawl (crawler user agent, robots.txt respected). The
+    title comes from the page, and the description from its summary tags or opening text. Send
+    content only for a site that blocks the crawler; the description is then inferred from that
+    text and a title is required. A description in the request is ignored. preview: true crawls and
+    returns what would be stored, without writing.
     The page's domain must be search-enabled in the ontology and marked "manual_only": true,
     so a later crawl cannot replace the page. Resubmitting the same URL replaces its chunks.
     """
@@ -334,17 +341,38 @@ def index_page(req):
         explicit = body.get("concepts")
         if explicit is not None and not (isinstance(explicit, list) and all(isinstance(x, str) for x in explicit)):
             return response({"error": "concepts must be an array of strings"}, 400)
+        supplied = str(body.get("content") or "").strip()
+        title = str(body.get("title") or "").strip()
+        if supplied:
+            text, origin = supplied, "supplied_text"
+            description, description_source = infer_description(supplied), "supplied_text"
+            if not title:
+                return response({"error": "title is required when you send content; a crawl finds it from the page."}, 400)
+        else:
+            try:
+                page = fetch_page(url)
+            except PageFetchError as exc:
+                return response({"error": str(exc)}, 422)
+            text, origin = page["text"], "crawl"
+            title = title or page["title"]
+            description, description_source = page["description"], page["description_source"]
+            if not title:
+                return response({"error": "The page has no title tag. Send a title."}, 400)
         documents, domain, _ = build_page_documents(
-            url=url, title=body.get("title"), text=body.get("content"),
+            url=url, title=title, text=text, description=description,
             allowed_concepts=ontology.domain_concepts(host), tag_fn=concept_resolver.tag_document,
             chunk_chars=settings.chunk_chars, min_chars=settings.min_text_chars, explicit_concepts=explicit)
+        tagged = sum(1 for d in documents if d["concepts"])
+        summary = {"url": url, "domain": domain, "title": title, "description": description,
+                   "description_source": description_source, "text_from": origin, "characters": len(text),
+                   "chunks": len(documents), "chunks_tagged": tagged, "chunks_untagged": len(documents) - tagged}
+        if body.get("preview"):
+            return response({"status": "preview", **summary})
         replaced = searcher.delete_url(url)
         indexed, deferred = searcher.upsert_or_defer(documents, persist_blobs=True)
-        tagged = sum(1 for d in documents if d["concepts"])
         return response({
-            "status": "indexed" if not deferred else "stored_pending_index",
-            "url": url, "domain": domain, "chunks": len(documents), "chunks_tagged": tagged,
-            "chunks_untagged": len(documents) - tagged, "chunks_replaced": replaced, "chunks_indexed": indexed,
+            "status": "indexed" if not deferred else "stored_pending_index", **summary,
+            "chunks_replaced": replaced, "chunks_indexed": indexed,
             "message": None if not deferred else "Chunks are stored; the search index was busy. Run POST /api/index/backfill with mode 'missing' to index them.",
         }, 200 if not deferred else 202)
     except ValueError as exc:

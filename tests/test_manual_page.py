@@ -52,3 +52,8 @@ def test_same_text_gives_same_ids_so_resubmitting_replaces_rather_than_duplicate
     a, _, _ = build()
     b, _, _ = build()
     assert [d["id"] for d in a] == [d["id"] for d in b]
+
+
+def test_description_is_stored_on_every_chunk():
+    docs, _, _ = build(description="A short description of the page.")
+    assert {d["description"] for d in docs} == {"A short description of the page."}
