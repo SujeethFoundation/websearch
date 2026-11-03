@@ -32,3 +32,16 @@ finally { }
 
 $env:BCONN = $env:QCONN
 python .\blob_paths_report.py --ontology ..\ontology\ontology\ontology.json --top 10
+
+----------
+
+# Candid, as before
+.\Add-ManualPage.ps1 -Url "https://app.candid.org/profile/15027428/the-sujeeth-foundation-93-1506908" `
+    -Title "The Sujeeth Foundation | EIN 93-1506908 | Candid"
+
+# Any other page, text from a file
+.\Add-ManualPage.ps1 -Url https://example.org/page -TextFile .\page.txt
+
+# Preview, then remove
+.\Add-ManualPage.ps1 -Url https://example.org/page -DryRun
+.\Add-ManualPage.ps1 -Url https://example.org/page -Delete
