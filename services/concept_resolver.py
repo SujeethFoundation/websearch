@@ -1,4 +1,5 @@
 import re
+import time
 from services.config import settings
 
 
@@ -38,13 +39,28 @@ class ConceptResolver:
     It then asks the ontology service to authorize the domain selection.
     """
 
-    def __init__(self, ontology):
+    def __init__(self, ontology, ttl_seconds=600):
         self.ontology = ontology
+        self.ttl = ttl_seconds
         self._catalog = None
+        self._loaded_at = None
 
     def _load_catalog(self):
-        if self._catalog is not None:
+        # Reload after the TTL so ontology changes (new aliases, new classes) reach a running
+        # instance without a restart. If the reload fails, keep serving the previous catalog.
+        if self._catalog is not None and self._loaded_at is not None \
+                and time.monotonic() - self._loaded_at < self.ttl:
             return self._catalog
+        previous = self._catalog
+        try:
+            return self._build_catalog()
+        except Exception:
+            if previous is not None:
+                self._loaded_at = time.monotonic() - self.ttl + 60
+                return previous
+            raise
+
+    def _build_catalog(self):
 
         ontology_doc = self.ontology.ontology()
         classes = get_items(ontology_doc, ("classes", "ontology_classes"))
@@ -67,6 +83,7 @@ class ConceptResolver:
             "terminology": terminology,
             "relationships": relationships,
         }
+        self._loaded_at = time.monotonic()
         return self._catalog
 
     @staticmethod
