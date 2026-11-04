@@ -108,7 +108,49 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5):
         "resolution": resolution,
     })
     add_best_bets(result, query, resolution["matched_concepts"], selected_domains)
+    add_spotlights(result, query, resolution, selected_domains)
     return result
+
+
+SPOTLIGHT_SLOTS = max(0, min(int(os.getenv("SPOTLIGHT_SLOTS", "2")), 3))
+
+
+def add_spotlights(result, query, resolution, selected_domains):
+    """Reserve result slots for Spotlight pages on questions the ontology says Spotlights illustrate.
+
+    Added only when "spotlight" came in through a relationship (for example a career question),
+    not when the person asked for spotlights directly. Spotlight pages carry the spotlight tag
+    and compete with larger sites in ranking, so they get their own query and are placed first,
+    flagged spotlight=True. Never fails the search.
+    """
+    try:
+        via_relationship = any(
+            m.get("concept_id") == "spotlight" and m.get("source") == "relationship"
+            for m in resolution.get("concept_matches", [])
+        )
+        if not SPOTLIGHT_SLOTS or not via_relationship:
+            return
+        domains = [d for d in selected_domains if d == "sujeeth.org"]
+        if not domains:
+            return
+        found = searcher.search(query, concepts=["spotlight"], domains=domains, limit=SPOTLIGHT_SLOTS * 3)
+        existing = {str(x.get("url") or "").strip().lower(): x for x in result.get("results", [])}
+        picked, seen = [], set()
+        for item in found.get("results", []):
+            key = str(item.get("url") or "").strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            picked.append({**item, "spotlight": True})
+            if len(picked) >= SPOTLIGHT_SLOTS:
+                break
+        keep = [x for x in result.get("results", []) if str(x.get("url") or "").strip().lower() not in seen]
+        result["results"] = picked + keep
+        result["count"] = len(result["results"])
+        result["spotlights"] = {"status": "applied" if picked else "no_match", "count": len(picked), "max": SPOTLIGHT_SLOTS}
+    except Exception:
+        log.exception("Spotlight lookup failed; returning normal results only")
+        result["spotlights"] = {"status": "unavailable", "count": 0, "max": SPOTLIGHT_SLOTS}
 
 
 BEST_BETS_MAX = max(0, min(int(os.getenv("BEST_BETS_MAX", "3")), 3))
