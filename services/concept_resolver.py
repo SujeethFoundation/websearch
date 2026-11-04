@@ -143,6 +143,24 @@ class ConceptResolver:
                 best, matched = score, alias
         return best, matched
 
+    def _illustrating_concepts(self, selected):
+        """Concepts the ontology says illustrate a selected concept.
+
+        A relationship such as "spotlight illustrates career_development" means questions about
+        the object can draw on the subject. The search filter keeps a chunk only when it carries a
+        selected concept, so without this a Spotlight page (tagged "spotlight") can never appear
+        for a career question. Returns subject ids not already selected.
+        """
+        chosen = {str(c).lower() for c in selected}
+        extra = []
+        for rel in self._load_catalog().get("relationships") or []:
+            if not isinstance(rel, dict) or str(rel.get("predicate", "")).lower() != "illustrates":
+                continue
+            subject, obj = str(rel.get("subject", "")).strip(), str(rel.get("object", "")).strip()
+            if subject and obj.lower() in chosen and subject.lower() not in chosen and subject not in extra:
+                extra.append(subject)
+        return extra
+
     def resolve_query(self, query, explicit_concepts=None, explicit_domains=None, purpose="search"):
         catalog = self._load_catalog()
         classes = catalog["classes"]
@@ -196,6 +214,9 @@ class ConceptResolver:
                 "message": "No ontology concepts matched; broad search is intentionally disabled.",
             }
 
+        related = [c for c in self._illustrating_concepts(selected) if c.lower() in by_id]
+        selected = list(dict.fromkeys(selected + related))
+
         domain_result = self.ontology.resolve_domains(selected, purpose)
         raw_domains = domain_result.get("domains", [])
         domains = []
@@ -232,8 +253,12 @@ class ConceptResolver:
                     "concept_id": cid,
                     "name": by_id.get(cid.lower(), {}).get("name", cid),
                     "matched_term": score_map.get(cid, (None, None))[1],
-                    "confidence": round(score_map.get(cid, (1.0, "explicit"))[0], 3),
-                    "source": "explicit" if cid in explicit else "query_match",
+                    "confidence": round(score_map.get(cid, (1.0, "explicit"))[0], 3) if cid not in related else None,
+                    "source": (
+                        "explicit" if cid in explicit
+                        else "relationship" if cid in related
+                        else "query_match"
+                    ),
                 }
                 for cid in selected
             ],
