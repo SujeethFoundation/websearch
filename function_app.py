@@ -118,17 +118,15 @@ SPOTLIGHT_SLOTS = max(0, min(int(os.getenv("SPOTLIGHT_SLOTS", "2")), 3))
 def add_spotlights(result, query, resolution, selected_domains):
     """Reserve result slots for Spotlight pages on questions the ontology says Spotlights illustrate.
 
-    Added only when "spotlight" came in through a relationship (for example a career question),
-    not when the person asked for spotlights directly. Spotlight pages carry the spotlight tag
+    Added whenever "spotlight" is among the matched concepts, whether the person asked for it or
+    the ontology added it through a relationship (a career question). Spotlight pages carry the spotlight tag
     and compete with larger sites in ranking, so they get their own query and are placed first,
     flagged spotlight=True. Never fails the search.
     """
     try:
-        via_relationship = any(
-            m.get("concept_id") == "spotlight" and m.get("source") == "relationship"
-            for m in resolution.get("concept_matches", [])
-        )
-        if not SPOTLIGHT_SLOTS or not via_relationship:
+        # The MCP server resolves first and sends the matched concepts back as explicit concepts,
+        # so the match source is not reliable here. Spotlight among the matched concepts is enough.
+        if not SPOTLIGHT_SLOTS or "spotlight" not in [str(c).lower() for c in resolution.get("matched_concepts", [])]:
             return
         domains = [d for d in selected_domains if d == "sujeeth.org"]
         if not domains:
