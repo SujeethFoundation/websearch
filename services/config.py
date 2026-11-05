@@ -54,6 +54,13 @@ class Settings:
     crawl_delay = float(os.getenv("CRAWL_DELAY_SECONDS", "0.5"))
     max_sitemap_urls = int(os.getenv("MAX_SITEMAP_URLS", "5000"))
     max_sitemaps = int(os.getenv("MAX_SITEMAPS_PER_DOMAIN", "100"))
+    # Memory guards (see services/limits.py). HTML takes about 35x its size in memory to parse, so it has
+    # the lowest cap. MAX_PAGE_BYTES stays the ceiling for every kind. MAX_CHUNKS_PER_PAGE of 0 means no limit.
+    max_html_bytes = min(int(os.getenv("MAX_HTML_BYTES", "1500000")), max_page_bytes)
+    max_doc_bytes = min(int(os.getenv("MAX_DOC_BYTES", str(max_page_bytes))), max_page_bytes)
+    max_sitemap_bytes = int(os.getenv("MAX_SITEMAP_BYTES", "10000000"))
+    max_chunks_per_page = max(0, int(os.getenv("MAX_CHUNKS_PER_PAGE", "400")))
+    chunk_group_size = max(1, int(os.getenv("CHUNK_GROUP_SIZE", "50")))
     timeout = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
     max_query_concepts = int(os.getenv("MAX_QUERY_CONCEPTS", "5"))
 

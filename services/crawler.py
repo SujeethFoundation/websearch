@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from urllib.robotparser import RobotFileParser
 
 from services.config import settings
+from services.limits import TooLarge, iter_sitemap_locs, read_capped
 
 
 class Crawler:
@@ -142,8 +143,9 @@ class Crawler:
             if not self._same_site(sitemap_url, domain) or not self._public_host(urlparse(sitemap_url).hostname or ""):
                 continue
             try:
-                response = self.session.get(sitemap_url, timeout=settings.timeout, allow_redirects=False)
+                response = self.session.get(sitemap_url, timeout=settings.timeout, allow_redirects=False, stream=True)
                 if response.status_code in (301,302,303,307,308):
+                    response.close()
                     redirect_target = self._normalize_url(urljoin(sitemap_url, response.headers.get("Location", "")))
                     if redirect_target and self._same_site(redirect_target, domain) and self._public_host(urlparse(redirect_target).hostname or ""):
                         candidates.append(redirect_target)
@@ -151,21 +153,19 @@ class Crawler:
                         failures.append({"url": sitemap_url, "error": "off_site_sitemap_redirect"})
                     continue
                 if response.status_code >= 400:
+                    response.close()
                     failures.append({"url": sitemap_url, "status_code": response.status_code})
                     continue
-                if len(response.content) > 10_000_000:
+                try:
+                    data = read_capped(response, settings.max_sitemap_bytes)
+                except TooLarge:
                     failures.append({"url": sitemap_url, "error": "sitemap_too_large"})
                     continue
-                root = ET.fromstring(response.content)
-                for element in root.iter():
-                    if not element.tag.lower().endswith("loc") or not element.text:
-                        continue
-                    target = self._normalize_url(element.text.strip())
+                # Stream the XML instead of building a tree: a 10 MB sitemap costs about 60 MB as a tree.
+                for root_kind, loc in iter_sitemap_locs(data):
+                    target = self._normalize_url(loc)
                     if not self._same_site(target, domain):
                         continue
-                    parent_tag = element.getparent().tag if hasattr(element, "getparent") else ""
-                    # ElementTree has no parent pointer. Infer sitemap vs URL entry from root.
-                    root_kind = root.tag.lower().split("}")[-1]
                     if root_kind == "sitemapindex" or urlparse(target).path.lower().endswith(".xml"):
                         if target not in visited_sitemaps:
                             candidates.append(target)
@@ -174,6 +174,7 @@ class Crawler:
                         metadata[target] = {"sitemap": sitemap_url}
                         if len(found) >= settings.max_sitemap_urls:
                             break
+                del data
             except (requests.RequestException, ET.ParseError, ValueError) as exc:
                 failures.append({"url": sitemap_url, "error": str(exc)[:200]})
         # Stable de-duplication while preserving sitemap order.

@@ -1,5 +1,5 @@
 """One-URL-at-a-time crawler worker. Queue retries make page work resumable."""
-import hashlib, re, ipaddress, socket, time, json
+import gc, hashlib, re, ipaddress, socket, time, json
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
 import requests
@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from services.config import settings
 from services.path_rules import PathPolicy
 from services.search_service import IndexBusyError
+from services.limits import TooLarge, chunk_groups, read_capped
 
 # HTTP statuses that retrying will not fix. 408/429/5xx are not listed and stay retryable.
 PERMANENT_HTTP_STATUSES = {400, 401, 403, 404, 405, 406, 410, 451}
@@ -81,6 +82,10 @@ class PageWorker:
             # without waiting for the lease to expire or consuming a duplicate message.
             self.state.release_page_claim(job_id, url, claim_token, error=str(exc))
             raise
+        finally:
+            # Python keeps freed memory for itself unless the cycle collector runs. Parsing a page builds
+            # a large object tree, so collect after every page.
+            gc.collect()
 
     def _complete(self, job_id, url, claim_token, status='processed', page_fields=None, **increments):
         completed = self.state.complete_page(
@@ -147,18 +152,22 @@ class PageWorker:
         if not self.same_site(final_url,domain):
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'redirected_off_site'},pages_skipped=1); return {'status': 'completed'}
         content_type=response.headers.get('content-type','').lower()
-        raw=bytearray()
-        for block in response.iter_content(chunk_size=65536):
-            if block:
-                raw.extend(block)
-                if len(raw)>settings.max_page_bytes: break
-        if len(raw)>settings.max_page_bytes:
+        # Pick the kind from the headers first. An unsupported file is then never downloaded, and each kind
+        # gets its own size cap: HTML costs about 35x its size in memory to parse, so it is capped lowest.
+        if 'text/html' in content_type or 'application/xhtml' in content_type: kind='html'
+        elif 'application/pdf' in content_type or urlparse(final_url).path.lower().endswith('.pdf'): kind='pdf'
+        elif 'wordprocessingml.document' in content_type or final_url.lower().endswith('.docx'): kind='docx'
+        else:
+            response.close()
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'unsupported_content_type'},pages_skipped=1); return {'status': 'completed'}
+        try:
+            raw=read_capped(response, settings.max_html_bytes if kind=='html' else settings.max_doc_bytes)
+        except TooLarge:
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'page_too_large'},pages_skipped=1); return {'status': 'completed'}
         title=final_url; text=''; discovered=[]; page_type='html'
-        if 'text/html' in content_type or 'application/xhtml' in content_type:
-            raw_bytes = bytes(raw) if isinstance(raw, (bytes, bytearray)) else raw
-            raw_text = raw_bytes.decode('utf-8', errors='replace') if isinstance(raw_bytes, bytes) else str(raw_bytes)
-            soup = BeautifulSoup(raw_text, 'html.parser')
+        if kind=='html':
+            raw_text = raw.decode('utf-8', errors='replace'); del raw
+            soup = BeautifulSoup(raw_text, 'html.parser'); del raw_text
             title=soup.title.get_text(' ',strip=True) if soup.title else final_url
             canonical=soup.find('link',rel=lambda x:x and 'canonical' in x)
             if canonical and canonical.get('href'):
@@ -172,19 +181,26 @@ class PageWorker:
             for node in soup.select('[role=navigation],.cookie,.cookie-banner,.cookie-consent,.advertisement,.ads'):
                 node.decompose()
             text=re.sub(r'\s+',' ',soup.get_text(' ',strip=True)).strip()
-        elif 'application/pdf' in content_type or urlparse(final_url).path.lower().endswith('.pdf'):
+            try: soup.decompose()
+            except Exception: pass
+            del soup
+        elif kind=='pdf':
             from pypdf import PdfReader
             import io
             page_type='pdf'; reader=PdfReader(io.BytesIO(raw)); text=' '.join((p.extract_text() or '') for p in reader.pages)
             title=urlparse(final_url).path.rsplit('/',1)[-1]
-        elif 'wordprocessingml.document' in content_type or final_url.lower().endswith('.docx'):
+            del reader, raw
+        else:
             from docx import Document
             import io
             page_type='docx'; doc=Document(io.BytesIO(raw)); text=' '.join(p.text for p in doc.paragraphs)
             title=urlparse(final_url).path.rsplit('/',1)[-1]
-        else:
-            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'unsupported_content_type'},pages_skipped=1); return {'status': 'completed'}
+            del doc, raw
         text=re.sub(r'\s+',' ',text).strip()
+        # A page this long is cut at the chunk cap. Hash and index the same text, so a later crawl compares like with like.
+        truncated=False
+        if settings.max_chunks_per_page and len(text)>settings.max_chunks_per_page*settings.chunk_chars:
+            text=text[:settings.max_chunks_per_page*settings.chunk_chars]; truncated=True
         digest=hashlib.sha256(text.encode('utf-8')).hexdigest()
         if len(text)<settings.min_text_chars:
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'insufficient_text'},pages_skipped=1); return {'status': 'completed'}
@@ -197,30 +213,33 @@ class PageWorker:
         self.search.delete_url(final_url)
         page_id=hashlib.sha256(final_url.encode()).hexdigest(); chunks=tagged=untagged=0
         allowed=json.loads(job.get('allowed_concepts_json','[]'))
-        page_documents=[]
-        for index,start in enumerate(range(0,len(text),settings.chunk_chars)):
-            chunk=text[start:start+settings.chunk_chars]
-            concepts=self.resolver.tag_document(title,chunk,allowed)
-            page_documents.append({'id':f'{page_id}-{index}','title':title,'content':chunk,'url':final_url,'domain':domain,
-                'concepts':concepts,'content_hash':digest,'page_hash':digest,'crawl_depth':depth,'page_type':page_type,
-                'etag':response.headers.get('ETag'),'last_modified':response.headers.get('Last-Modified'),
-                'crawled_utc':datetime.now(timezone.utc).isoformat()})
-            chunks+=1; tagged+=bool(concepts); untagged+=not bool(concepts)
+        # Embed and store a few chunks at a time. Each vector is about 50 KB as a Python list, so holding every
+        # chunk of a long page at once costs tens of megabytes.
+        deferred=[]
+        for group in chunk_groups(text,settings.chunk_chars,settings.max_chunks_per_page,settings.chunk_group_size):
+            page_documents=[]
+            for index,chunk in group:
+                concepts=self.resolver.tag_document(title,chunk,allowed)
+                page_documents.append({'id':f'{page_id}-{index}','title':title,'content':chunk,'url':final_url,'domain':domain,
+                    'concepts':concepts,'content_hash':digest,'page_hash':digest,'crawl_depth':depth,'page_type':page_type,
+                    'etag':response.headers.get('ETag'),'last_modified':response.headers.get('Last-Modified'),
+                    'crawled_utc':datetime.now(timezone.utc).isoformat()})
+                chunks+=1; tagged+=bool(concepts); untagged+=not bool(concepts)
+            _, group_deferred=self.search.upsert_or_defer(page_documents, persist_blobs=True)
+            deferred.extend(group_deferred)
         index_deferred=False
-        if page_documents:
-            _, deferred=self.search.upsert_or_defer(page_documents, persist_blobs=True)
-            if deferred:
-                # The chunks and their vectors are safely stored. Index them later instead of
-                # failing the page, which would re-fetch and re-embed it on every retry.
-                if not self.defer_indexing:
-                    raise IndexBusyError(f'Search index busy; {len(deferred)} chunk(s) stored but not indexed.')
-                self.defer_indexing(deferred); index_deferred=True
+        if deferred:
+            # The chunks and their vectors are safely stored. Index them later instead of
+            # failing the page, which would re-fetch and re-embed it on every retry.
+            if not self.defer_indexing:
+                raise IndexBusyError(f'Search index busy; {len(deferred)} chunk(s) stored but not indexed.')
+            self.defer_indexing(deferred); index_deferred=True
         self.state.manifest_put(domain,final_url,content_hash=digest,last_seen_job=job_id,etag=response.headers.get('ETag'),
             last_modified=response.headers.get('Last-Modified'),page_type=page_type,chunk_count=chunks)
         # Discover URLs before marking this page complete, so pending never transiently reaches zero.
         for link in dict.fromkeys(discovered):
             if self.state.enqueue_page(job_id,domain,link,depth+1): pass
-        self._complete(job_id,url,claim_token,'processed',page_fields={'content_hash':digest,'final_url':final_url,**({'index_deferred':True} if index_deferred else {})},pages_processed=1,chunks_indexed=chunks,chunks_tagged=tagged,chunks_untagged=untagged)
+        self._complete(job_id,url,claim_token,'processed',page_fields={'content_hash':digest,'final_url':final_url,**({'index_deferred':True} if index_deferred else {}),**({'truncated_at_chunk_cap':True} if truncated else {})},pages_processed=1,chunks_indexed=chunks,chunks_tagged=tagged,chunks_untagged=untagged)
         self._finalize_if_safe(job_id,domain)
         if settings.crawl_delay > 0: time.sleep(settings.crawl_delay)
         return {'status': 'completed'}
