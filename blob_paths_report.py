@@ -1,4 +1,4 @@
-"""Count stored chunk blobs by domain and first path segment, and flag any the crawl rules would not allow:
+"""Count stored chunk blobs by domain and two-level path section, and flag any the crawl rules would not allow:
 under an excluded path (exclude_paths) or outside a domain's allow-list (include_paths).
 
 It only reads. Every blob under documents/ is opened once, because blob names don't say which site a chunk came from.
@@ -9,11 +9,16 @@ Run it from the websearch folder, in the websearch virtual environment:
     python .\\blob_paths_report.py --ontology ..\\ontology\\ontology\\ontology.json
     python .\\blob_paths_report.py --ontology ..\\ontology\\ontology\\ontology.json --csv blob_paths.csv --top 25
     python .\\blob_paths_report.py --ontology ..\\ontology\\ontology\\ontology.json --domain tealhq.com
+    python .\\blob_paths_report.py --ontology ..\\ontology\\ontology\\ontology.json --domain tealhq.com --depth 1 --top 15
     Remove-Item Env:BCONN
 
 Output:
   1. Chunks per domain (with pages and how many chunks are out of scope).
-  2. Per domain, every first path segment with its chunk count, page count, and an OUT OF SCOPE flag.
+  2. Per domain, every path section with its chunk count, page count, and an OUT OF SCOPE flag. A section is the
+     first path segment (/post), or the first two (/post/some-article), which is the default (--depth 1 gives
+     one). Only the top 10 sections per domain are printed (--top); the rest are summarized on one line, with
+     how many of their chunks are out of scope. With --collapse N, a segment with more than N children is shown as one row, for example career-paths/*.
+     --csv always writes the full, uncollapsed table.
   3. A violations list: each (domain, rule) with its blob count and sample URLs. A chunk outside an
      allow-list is listed under "outside include_paths [...]".
 
@@ -58,9 +63,46 @@ def load_rules(path):
     return data.get("ontology_version"), rules, includes, domains
 
 
+DEFAULT_DEPTH = 2      # path segments per section: /post/some-article
+DEFAULT_TOP = 10       # sections shown per domain, largest first
+DEFAULT_COLLAPSE = 0   # 0 = list real two-level sections; set e.g. 10 to fold wide ones into career-paths/*
+
+
+def path_section(url, depth=1):
+    """The first `depth` path segments of a URL, lowercased, or "(home)" for the bare domain."""
+    parts = [part for part in urlparse(url).path.lower().split("/") if part][:max(1, depth)]
+    return "/".join(parts) or "(home)"
+
+
 def first_segment(url):
-    segment = urlparse(url).path.strip("/").split("/")[0].lower()
-    return segment or "(home)"
+    return path_section(url, 1)
+
+
+def group_sections(counter, flagged, pages, depth, collapse):
+    """Fold wide second levels into one "segment/*" row. Only used for the console table.
+
+    With depth 1, or collapse 0, the table is returned unchanged. Otherwise a first segment that
+    has more than `collapse` distinct sections beneath it becomes a single row with their chunks,
+    pages and out-of-scope counts added together.
+    """
+    if depth <= 1 or collapse <= 0:
+        return Counter(counter), Counter(flagged), {s: set(p) for s, p in pages.items()}
+    children = defaultdict(list)
+    for section in counter:
+        children[section.split("/")[0]].append(section)
+    out_chunks, out_flagged, out_pages = Counter(), Counter(), {}
+    for first, sections in children.items():
+        if len(sections) > collapse:
+            key = first + "/*"
+            out_chunks[key] = sum(counter[s] for s in sections)
+            out_flagged[key] = sum(flagged[s] for s in sections)
+            out_pages[key] = set().union(*(pages[s] for s in sections))
+        else:
+            for section in sections:
+                out_chunks[section] = counter[section]
+                out_flagged[section] = flagged[section]
+                out_pages[section] = set(pages[section])
+    return out_chunks, out_flagged, out_pages
 
 
 def matching_rule(url, rules, includes=()):
@@ -89,7 +131,7 @@ def read_one(container, name):
     return None, None
 
 
-def scan(container, rules, only_domain=None, workers=WORKERS, progress=True, includes=None):
+def scan(container, rules, only_domain=None, workers=WORKERS, progress=True, includes=None, depth=DEFAULT_DEPTH):
     includes = includes or {}
     names = [b.name for b in container.list_blobs(name_starts_with="documents/") if b.name.endswith(".json")]
     chunks = defaultdict(Counter)        # domain -> section -> chunks
@@ -112,7 +154,7 @@ def scan(container, rules, only_domain=None, workers=WORKERS, progress=True, inc
                     no_url += 1
                     chunks[domain]["(no url)"] += 1
                     continue
-                section = first_segment(url)
+                section = path_section(url, depth)
                 chunks[domain][section] += 1
                 pages[domain][section].add(url)
                 rule = matching_rule(url, rules.get(domain, ()), includes.get(domain, ()))
@@ -133,7 +175,7 @@ def status(total, bad):
     return "OUT OF SCOPE" if bad == total else "PARTIAL"
 
 
-def report(version, rules, includes, ontology_domains, result, top, csv_path):
+def report(version, rules, includes, ontology_domains, result, top, csv_path, depth=DEFAULT_DEPTH, collapse=DEFAULT_COLLAPSE):
     chunks, flagged, pages = result["chunks"], result["flagged"], result["pages"]
     print(f"\nOntology {version}: exclusion rules for "
           + (", ".join(f"{d} {list(r)}" for d, r in sorted(rules.items())) or "no domains"))
@@ -152,20 +194,25 @@ def report(version, rules, includes, ontology_domains, result, top, csv_path):
         print(f"WARN  domains in storage but not in the ontology: {', '.join(unknown)}")
 
     rows = []
+    levels = "first path segment" if depth <= 1 else f"first {depth} path segments"
     for domain, counter in sorted(chunks.items(), key=lambda kv: -sum(kv[1].values())):
-        print(f"\n{domain}  (first path segment, by chunks)")
-        print(f"  {'Segment':<34}{'Chunks':>9}{'Pages':>8}{'Out':>10}  Flag")
-        shown = counter.most_common()
-        for i, (section, count) in enumerate(shown):
-            bad = flagged[domain][section]
-            flag = status(count, bad)
-            rows.append([domain, section, count, len(pages[domain][section]), bad, flag])
-            # Always show flagged sections; cap the rest at --top.
-            if i < top or bad:
-                print(f"  {section:<34}{count:>9,}{len(pages[domain][section]):>8,}{bad:>10,}  {flag}")
-        hidden = [s for i, (s, c) in enumerate(shown) if i >= top and not flagged[domain][s]]
+        print(f"\n{domain}  ({levels}, by chunks)")
+        for section, count in counter.most_common():  # the CSV keeps every section, uncollapsed
+            rows.append([domain, section, count, len(pages[domain][section]), flagged[domain][section],
+                         status(count, flagged[domain][section])])
+        g_chunks, g_flagged, g_pages = group_sections(counter, flagged[domain], pages[domain], depth, collapse)
+        shown = g_chunks.most_common()
+        width = min(60, max(34, max((len(section) for section, _ in shown), default=0) + 2))
+        print(f"  {'Segment':<{width}}{'Chunks':>9}{'Pages':>8}{'Out':>10}  Flag")
+        for section, count in shown[:top]:
+            bad = g_flagged[section]
+            print(f"  {section:<{width}}{count:>9,}{len(g_pages[section]):>8,}{bad:>10,}  {status(count, bad)}")
+        hidden = shown[top:]
         if hidden:
-            print(f"  ... {len(hidden):,} more segments with {sum(counter[s] for s in hidden):,} chunks (use --top to show more, or --csv for all)")
+            hidden_bad = sum(g_flagged[section] for section, _ in hidden)
+            note = f", {hidden_bad:,} of them out of scope" if hidden_bad else ""
+            print(f"  ... {len(hidden):,} more sections with {sum(count for _, count in hidden):,} chunks{note} "
+                  "(use --top to show more, or --csv for all)")
 
     total_bad = sum(sum(c.values()) for c in result["violations"].values())
     print(f"\nOUT-OF-SCOPE BLOBS: {total_bad:,}   {'PASS' if not total_bad else 'FAIL'}")
@@ -178,18 +225,23 @@ def report(version, rules, includes, ontology_domains, result, top, csv_path):
     if csv_path:
         with open(csv_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["domain", "first_segment", "chunks", "pages", "chunks_out_of_scope", "flag"])
+            writer.writerow(["domain", "section", "chunks", "pages", "chunks_out_of_scope", "flag"])
             writer.writerows(rows)
         print(f"\nFull table written to {csv_path}")
     return 1 if total_bad else 0
 
 
 def main(argv=None, container=None):
-    parser = argparse.ArgumentParser(description="Chunk blobs by domain and first path segment, flagging excluded paths and pages outside an allow-list.")
+    parser = argparse.ArgumentParser(description="Chunk blobs by domain and path section, flagging excluded paths and pages outside an allow-list.")
     parser.add_argument("--ontology", required=True, help="Path to ontology.json (the same version the app uses)")
     parser.add_argument("--domain", help="Only report this domain")
-    parser.add_argument("--top", type=int, default=15, help="Segments to show per domain (flagged ones always show). Default 15")
-    parser.add_argument("--csv", help="Also write the full domain x segment table to this file")
+    parser.add_argument("--top", type=int, default=DEFAULT_TOP, help=f"Sections to show per domain, largest first; the rest are summarized on one line. Default {DEFAULT_TOP}")
+    parser.add_argument("--csv", help="Also write the full domain x section table to this file (never collapsed)")
+    parser.add_argument("--depth", type=int, default=DEFAULT_DEPTH, choices=[1, 2, 3, 4],
+                        help=f"Path segments to group by: 1 = /post, 2 = /post/some-article. Default {DEFAULT_DEPTH}")
+    parser.add_argument("--collapse", type=int, default=DEFAULT_COLLAPSE,
+                        help="With --depth above 1, show a segment with more than this many children as one row "
+                             f"(for example career-paths/*). 0 lists every section. Default {DEFAULT_COLLAPSE}")
     args = parser.parse_args(argv)
     version, rules, includes, ontology_domains = load_rules(args.ontology)
     if container is None:
@@ -200,8 +252,10 @@ def main(argv=None, container=None):
         name = os.getenv("BLOB_CONTAINER", "web-content")
         print(f"Container: {name}", file=sys.stderr)
         container = BlobServiceClient.from_connection_string(conn).get_container_client(name)
-    result = scan(container, rules, only_domain=args.domain.lower() if args.domain else None, includes=includes)
-    return report(version, rules, includes, ontology_domains, result, args.top, args.csv)
+    result = scan(container, rules, only_domain=args.domain.lower() if args.domain else None,
+                  includes=includes, depth=args.depth)
+    return report(version, rules, includes, ontology_domains, result, args.top, args.csv,
+                  depth=args.depth, collapse=args.collapse)
 
 
 if __name__ == "__main__":
