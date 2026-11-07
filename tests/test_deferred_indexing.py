@@ -183,6 +183,9 @@ def test_purge_waits_for_a_busy_index_and_removes_nothing_meanwhile():
         def all_rules(self):
             return {"tealhq.com": ("/job",)}
 
+        def all_includes(self):
+            return {}
+
     class BusySearch:
         vector_key = staticmethod(ss.SearchService.vector_key)
 

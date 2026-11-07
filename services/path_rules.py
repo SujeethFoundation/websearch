@@ -1,6 +1,10 @@
-"""Path exclusion rules for crawling.
+"""Path rules for crawling: an optional allow-list and an optional block-list per domain.
 
-A domain in the ontology may list crawl_policy.exclude_paths, for example ["/job", "/jobs"].
+A domain in the ontology may set either or both under crawl_policy:
+
+    "include_paths": ["/career-advice"]     only these sections are crawled (allow-list)
+    "exclude_paths": ["/job", "/jobs"]      these sections are never crawled (block-list)
+
 A rule matches that path and everything beneath it, compared on whole path segments: "/job"
 matches /job and /job/anything, but not /jobs or /jobsite. Matching ignores letter case, a
 trailing slash, and percent-encoding.
@@ -8,6 +12,16 @@ trailing slash, and percent-encoding.
 A "*" inside a rule matches any characters within one path segment (never a "/"). For example
 "/career-paths/*-certifications" matches /career-paths/snowflake-developer-certifications and
 anything beneath it, but not /career-paths/certifications-guide.
+
+How the two lists combine:
+  - With no include_paths, every path is allowed except those matching exclude_paths (the old behaviour).
+  - With include_paths, only paths matching one of them are allowed.
+  - exclude_paths always wins: a path matching both lists is not crawled. That lets you allow
+    "/career-advice" and still block "/career-advice/news".
+  - The bare homepage (the domain root with no query string) is always allowed, even with
+    include_paths, because the crawl starts there to find sitemaps and links. Its query-string
+    variants (for example /?from=nav) are not.
+  - A bare "/" is never a rule, in either list: it would mean "the whole site", so it is ignored.
 """
 import functools
 import logging
@@ -21,7 +35,7 @@ log = logging.getLogger("sujeeth-web-search.path-rules")
 
 def normalize_rule(rule):
     text = "/" + str(rule or "").strip().lower().strip("/")
-    # A bare "/" would exclude the whole site, so it is treated as no rule at all.
+    # A bare "/" would exclude (or include) the whole site, so it is treated as no rule at all.
     return None if text == "/" else text
 
 
@@ -42,6 +56,7 @@ def _wildcard_pattern(rule):
 
 
 def is_excluded_path(path, rules):
+    """True if the path matches any rule. (Used for both lists: it simply means 'matches'.)"""
     if not rules:
         return False
     trimmed = unquote(path or "/").lower().strip("/")
@@ -59,8 +74,23 @@ def is_excluded_url(url, rules):
     return is_excluded_path(urlparse(str(url or "")).path, rules)
 
 
+def is_outside_includes(url, includes):
+    """True if an allow-list exists and the URL is not inside it. With no allow-list, never."""
+    if not includes:
+        return False
+    parsed = urlparse(str(url or ""))
+    if not unquote(parsed.path or "/").strip("/") and not parsed.query:
+        return False  # the bare homepage: the crawl starts here
+    return not is_excluded_path(parsed.path, includes)
+
+
+def is_blocked_url(url, includes=(), excludes=()):
+    """The combined decision: blocked by the block-list, or outside the allow-list."""
+    return is_excluded_url(url, excludes) or is_outside_includes(url, includes)
+
+
 class PathPolicy:
-    """Reads each domain's exclude_paths from the ontology crawl manifest.
+    """Reads each domain's include_paths and exclude_paths from the ontology crawl manifest.
 
     The rules are cached for a few minutes. If the ontology cannot be read, the previous rules
     stay in force and the read is retried after a minute.
@@ -70,6 +100,7 @@ class PathPolicy:
         self.ontology = ontology
         self.ttl = ttl_seconds
         self._rules = {}
+        self._includes = {}
         self._loaded_at = None
         self._lock = threading.Lock()
 
@@ -83,27 +114,45 @@ class PathPolicy:
                 return
             try:
                 manifest = self.ontology.crawl_manifest()
-                rules = {}
+                rules, includes = {}, {}
                 for row in manifest.get("crawl_domains", []):
                     if not isinstance(row, dict):
                         continue
                     policy = row.get("crawl_policy") if isinstance(row.get("crawl_policy"), dict) else {}
+                    domain = str(row.get("domain") or "").lower()
                     found = normalize_rules(policy.get("exclude_paths"))
                     if found:
-                        rules[str(row.get("domain") or "").lower()] = found
+                        rules[domain] = found
+                    allowed = normalize_rules(policy.get("include_paths"))
+                    if allowed:
+                        includes[domain] = allowed
                 self._rules = rules
+                self._includes = includes
                 self._loaded_at = now
             except Exception:
-                log.exception("Could not read exclude_paths from the ontology; keeping the previous rules")
+                log.exception("Could not read crawl path rules from the ontology; keeping the previous rules")
                 self._loaded_at = now - self.ttl + 60
 
     def rules_for(self, domain):
+        """The block-list (exclude_paths) for a domain."""
         self._refresh()
         return self._rules.get(str(domain or "").lower(), ())
+
+    def includes_for(self, domain):
+        """The allow-list (include_paths) for a domain; empty means no allow-list."""
+        self._refresh()
+        return self._includes.get(str(domain or "").lower(), ())
 
     def all_rules(self):
         self._refresh()
         return dict(self._rules)
 
+    def all_includes(self):
+        self._refresh()
+        return dict(self._includes)
+
     def is_excluded(self, domain, url):
-        return is_excluded_url(url, self.rules_for(domain))
+        """True if the crawler must not fetch this URL: blocked, or outside the allow-list."""
+        key = str(domain or "").lower()
+        self._refresh()
+        return is_blocked_url(url, self._includes.get(key, ()), self._rules.get(key, ()))

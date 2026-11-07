@@ -7,7 +7,7 @@ from azure.storage.queue import QueueClient, TextBase64EncodePolicy
 from services.config import settings
 from services.crawl_state import CrawlState
 from services.page_worker import PageWorker
-from services.path_rules import is_excluded_url
+from services.path_rules import is_blocked_url
 from services.search_service import IndexBusyError
 
 log = logging.getLogger("sujeeth-web-search.crawl-worker")
@@ -108,9 +108,12 @@ class QueueProcessor:
         return delay
 
     def _purge_matches(self, names, domains=None):
-        """Find stored chunks whose page is under an excluded path for its domain."""
+        """Find stored chunks the crawl rules would no longer allow: a page under an excluded path
+        (exclude_paths) or outside the domain's allow-list (include_paths)."""
         only = {str(x).lower() for x in (domains or []) if str(x).strip()}
-        rules_by_domain = self.worker.path_policy.all_rules()
+        policy = self.worker.path_policy
+        rules_by_domain = policy.all_rules()
+        includes_by_domain = policy.all_includes()
         matches = []
         stats = {"read": 0}
         for name in names:
@@ -121,13 +124,14 @@ class QueueProcessor:
             domain = str(doc.get("domain") or "").lower()
             if only and domain not in only:
                 continue
-            rules = rules_by_domain.get(domain)
-            if rules and is_excluded_url(doc.get("url"), rules):
+            rules = rules_by_domain.get(domain, ())
+            includes = includes_by_domain.get(domain, ())
+            if (rules or includes) and is_blocked_url(doc.get("url"), includes, rules):
                 matches.append((name, doc))
         return matches, stats
 
     def purge_blobs(self, names, domains=None):
-        """Delete stored chunks under excluded paths: index entries, blobs, and manifest rows."""
+        """Delete stored chunks under excluded paths or outside an allow-list: index entries, blobs, and manifest rows."""
         matches, stats = self._purge_matches(names, domains)
         ids = [doc["id"] for _, doc in matches]
         # Index first. If that fails the blobs are still there and the retry finds them again.
@@ -153,6 +157,7 @@ class QueueProcessor:
             "would_remove": len(matches), "by_section": by_section,
             "examples": [doc.get("url") for _, doc in matches[:examples]],
             "rules": {d: list(r) for d, r in self.worker.path_policy.all_rules().items()},
+            "includes": {d: list(r) for d, r in self.worker.path_policy.all_includes().items()},
         }
 
     def process(self, message):

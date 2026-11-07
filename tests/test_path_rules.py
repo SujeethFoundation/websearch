@@ -3,8 +3,10 @@ import pytest
 
 from services.path_rules import (
     PathPolicy,
+    is_blocked_url,
     is_excluded_path,
     is_excluded_url,
+    is_outside_includes,
     normalize_rule,
     normalize_rules,
 )
@@ -111,3 +113,102 @@ def test_wildcard_rules_mix_with_plain_rules():
     assert is_excluded_path("/career-paths/sales-engineer-interview-questions", rules)
     assert not is_excluded_path("/career-paths/sales-engineer", rules)
     assert is_excluded_url("https://www.tealhq.com/CAREER-PATHS/Sales-Interview-Questions?x=1", rules)
+
+
+# ---- allow-list (include_paths) ----
+
+INCLUDES = normalize_rules(["/career-advice"])
+
+
+def test_allow_list_blocks_everything_outside_it():
+    assert not is_outside_includes("https://www.indeed.com/career-advice", INCLUDES)
+    assert not is_outside_includes("https://www.indeed.com/career-advice/resumes-cover-letters/x", INCLUDES)
+    assert not is_outside_includes("https://www.indeed.com/Career-Advice/", INCLUDES)
+    assert is_outside_includes("https://www.indeed.com/jobs?q=nurse", INCLUDES)
+    assert is_outside_includes("https://www.indeed.com/career/salaries", INCLUDES)
+    assert is_outside_includes("https://www.indeed.com/cmp/Indeed/about", INCLUDES)
+
+
+def test_allow_list_compares_whole_segments():
+    assert is_outside_includes("https://www.indeed.com/career-advice-extra/x", INCLUDES)
+    assert is_outside_includes("https://www.indeed.com/x/career-advice", INCLUDES)
+
+
+def test_no_allow_list_means_nothing_is_outside_it():
+    assert not is_outside_includes("https://www.indeed.com/jobs", ())
+    assert not is_outside_includes("https://www.indeed.com/jobs", normalize_rules(["/"]))
+
+
+def test_bare_homepage_is_allowed_but_its_query_variants_are_not():
+    assert not is_outside_includes("https://www.indeed.com/", INCLUDES)
+    assert not is_outside_includes("https://www.indeed.com", INCLUDES)
+    assert not is_outside_includes("https://www.indeed.com/#top", INCLUDES)
+    assert is_outside_includes("https://www.indeed.com/?from=gnav-career-guide", INCLUDES)
+
+
+def test_allow_list_supports_wildcards_and_several_paths():
+    includes = normalize_rules(["/career-advice", "/guides/*-tips"])
+    assert not is_outside_includes("https://x.com/guides/resume-tips/more", includes)
+    assert is_outside_includes("https://x.com/guides/resume-ideas", includes)
+    assert not is_outside_includes("https://x.com/career-advice/a", includes)
+
+
+def test_block_list_wins_over_allow_list():
+    includes = normalize_rules(["/career-advice"])
+    excludes = normalize_rules(["/career-advice/news"])
+    assert not is_blocked_url("https://www.indeed.com/career-advice/interviewing", includes, excludes)
+    assert is_blocked_url("https://www.indeed.com/career-advice/news/x", includes, excludes)
+    assert is_blocked_url("https://www.indeed.com/jobs", includes, excludes)
+
+
+def test_each_list_works_alone_and_together():
+    assert is_blocked_url("https://x.com/job/1", (), normalize_rules(["/job"]))
+    assert not is_blocked_url("https://x.com/other", (), normalize_rules(["/job"]))
+    assert is_blocked_url("https://x.com/other", INCLUDES, ())
+    assert not is_blocked_url("https://x.com/career-advice", INCLUDES, ())
+    assert not is_blocked_url("https://x.com/anything", (), ())
+
+
+INDEED = {
+    "domain": "indeed.com",
+    "crawl_policy": {
+        "include_paths": ["/career-advice"],
+        "exclude_paths": ["/career-advice/news"],
+    },
+}
+
+
+def test_policy_applies_allow_and_block_lists_per_domain():
+    policy = PathPolicy(FakeOntology(ROWS + [INDEED]))
+    assert not policy.is_excluded("indeed.com", "https://www.indeed.com/career-advice/finding-a-job/x")
+    assert policy.is_excluded("indeed.com", "https://www.indeed.com/career-advice/news/x")
+    assert policy.is_excluded("indeed.com", "https://www.indeed.com/jobs?q=x")
+    assert policy.is_excluded("INDEED.com", "https://www.indeed.com/cmp/x")
+    assert not policy.is_excluded("indeed.com", "https://www.indeed.com/")
+    # other domains are untouched by indeed's allow-list
+    assert not policy.is_excluded("sujeeth.org", "https://www.sujeeth.org/jobs")
+    assert policy.is_excluded("tealhq.com", "https://www.tealhq.com/job/x")
+    assert not policy.is_excluded("tealhq.com", "https://www.tealhq.com/anything-else")
+
+
+def test_policy_exposes_both_lists():
+    policy = PathPolicy(FakeOntology(ROWS + [INDEED]))
+    assert policy.includes_for("indeed.com") == ("/career-advice",)
+    assert policy.rules_for("indeed.com") == ("/career-advice/news",)
+    assert policy.includes_for("tealhq.com") == ()
+    assert policy.all_includes() == {"indeed.com": ("/career-advice",)}
+    assert "tealhq.com" in policy.all_rules()
+
+
+def test_policy_ignores_a_bare_slash_include():
+    rows = [{"domain": "a.com", "crawl_policy": {"include_paths": ["/"]}}]
+    policy = PathPolicy(FakeOntology(rows))
+    assert not policy.is_excluded("a.com", "https://a.com/anything")
+
+
+def test_policy_keeps_old_allow_list_when_the_ontology_cannot_be_read():
+    ontology = FakeOntology(ROWS + [INDEED])
+    policy = PathPolicy(ontology, ttl_seconds=0)
+    assert policy.is_excluded("indeed.com", "https://www.indeed.com/jobs")
+    ontology.fail = True
+    assert policy.is_excluded("indeed.com", "https://www.indeed.com/jobs")
