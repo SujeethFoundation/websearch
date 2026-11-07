@@ -81,7 +81,8 @@ def main():
     ap.add_argument("domain")
     ap.add_argument("--include", action="append", default=[], help="allow-list path rule, repeatable (e.g. /advice)")
     ap.add_argument("--max-urls", type=int, default=None,
-                    help="sitemap URL limit; default: this domain's entry in the SITEMAP_URL_LIMITS environment variable, else 5000")
+                    help="page limit for the domain, which caps the crawl's total pages and the page URLs collected from sitemaps; "
+                         "default: its MAX_PAGES_BY_DOMAIN entry, else MAX_PAGES_PER_DOMAIN, else 10000 (read from your shell environment)")
     ap.add_argument("--max-sitemaps", type=int, default=100)
     ap.add_argument("--max-bytes", type=int, default=10_000_000, help="crawler MAX_SITEMAP_BYTES (default 10,000,000)")
     ap.add_argument("--time-budget", type=int, default=300, help="stop fetching after this many seconds and report what was found")
@@ -89,6 +90,8 @@ def main():
                     help="print every child sitemap of the top-level index with its position, then stop (fast)")
     ap.add_argument("--only", action="append", default=[],
                     help="only open child sitemaps whose URL contains this text (repeatable), e.g. --only advice")
+    ap.add_argument("--show", type=int, default=0, metavar="N",
+                    help="print the first N and last N URLs the patched crawler would keep, to judge the sitemap's order")
     ap.add_argument("--base", help="override https://<host> (for testing against a local server)")
     args = ap.parse_args()
 
@@ -97,15 +100,16 @@ def main():
     apex = host[4:] if host.startswith("www.") else host
     hosts = sorted({apex, "www." + apex})
 
-    # Same rule as the crawler (services/config.py sitemap_limit_for): a per-domain SITEMAP_URL_LIMITS entry, else the global limit.
-    source = "--max-urls" if args.max_urls else "default MAX_SITEMAP_URLS"
+    # Same rule as the crawler (services/config.py page_limit_for): the domain's MAX_PAGES_BY_DOMAIN entry, else MAX_PAGES_PER_DOMAIN.
+    source = "--max-urls" if args.max_urls else "default"
     if not args.max_urls:
-        args.max_urls = 5000
-        for part in os.environ.get("SITEMAP_URL_LIMITS", "").split(","):
+        args.max_urls = int(os.environ.get("MAX_PAGES_PER_DOMAIN", "10000") or 10000)
+        source = "MAX_PAGES_PER_DOMAIN environment variable" if os.environ.get("MAX_PAGES_PER_DOMAIN") else "default 10000 (your deployed MAX_PAGES_PER_DOMAIN)"
+        for part in os.environ.get("MAX_PAGES_BY_DOMAIN", "").split(","):
             name, _, value = part.partition("=")
             if name.strip().lower() in hosts and value.strip().isdigit() and int(value) > 0:
-                args.max_urls, source = int(value), "SITEMAP_URL_LIMITS environment variable"
-    print(f"Sitemap URL limit used: {args.max_urls} ({source})")
+                args.max_urls, source = int(value), "MAX_PAGES_BY_DOMAIN environment variable"
+    print(f"Page limit used: {args.max_urls} ({source})")
     base = (lambda h: args.base.rstrip("/")) if args.base else (lambda h: f"https://{h}")
 
     s = requests.Session()
@@ -215,6 +219,13 @@ def main():
         kept_new = [u for u, _ in ordered if matches(urlparse(u).path, rules)][: args.max_urls]
         print(f"\nPATCHED behavior (filter while collecting)\n  URLs matching {rules}: {len(kept_new)}"
               + (f"  (limit of {args.max_urls} reached; the sitemap lists more)" if len(kept_new) >= args.max_urls else ""))
+        if args.show and kept_new:
+            print(f"\n  first {min(args.show, len(kept_new))} kept:")
+            for u in kept_new[: args.show]:
+                print("   ", u)
+            print(f"  last {min(args.show, len(kept_new))} kept (URL number {len(kept_new)} and earlier):")
+            for u in kept_new[-args.show:]:
+                print("   ", u)
         by_file = Counter(f for u, f in ordered if matches(urlparse(u).path, rules))
         for f, n in by_file.most_common(5):
             print(f"    {n:>6}  {f}")

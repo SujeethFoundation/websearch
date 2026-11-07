@@ -67,9 +67,8 @@ class Settings:
     max_pages = int(os.getenv("MAX_PAGES_PER_DOMAIN", "1000"))
     max_crawl_depth = int(os.getenv("MAX_CRAWL_DEPTH", "5"))
     crawl_delay = float(os.getenv("CRAWL_DELAY_SECONDS", "0.5"))
-    max_sitemap_urls = int(os.getenv("MAX_SITEMAP_URLS", "5000"))
-    # Lower the sitemap URL limit for particular domains, e.g. SITEMAP_URL_LIMITS="www.themuse.com=500".
-    sitemap_url_limits = parse_limits(os.getenv("SITEMAP_URL_LIMITS", ""))
+    # Per-domain overrides of MAX_PAGES_PER_DOMAIN, e.g. MAX_PAGES_BY_DOMAIN="www.themuse.com=500" (host=limit, comma separated).
+    page_limits = parse_limits(os.getenv("MAX_PAGES_BY_DOMAIN", ""))
     max_sitemaps = int(os.getenv("MAX_SITEMAPS_PER_DOMAIN", "100"))
     # Memory guards (see services/limits.py). HTML takes about 35x its size in memory to parse, so it has
     # the lowest cap. MAX_PAGE_BYTES stays the ceiling for every kind. MAX_CHUNKS_PER_PAGE of 0 means no limit.
@@ -81,12 +80,18 @@ class Settings:
     timeout = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
     max_query_concepts = int(os.getenv("MAX_QUERY_CONCEPTS", "5"))
 
-    def sitemap_limit_for(self, hosts):
-        """The sitemap URL limit for a domain: its SITEMAP_URL_LIMITS entry (any of its host names), else MAX_SITEMAP_URLS."""
-        for host in hosts:
-            if str(host).lower() in self.sitemap_url_limits:
-                return self.sitemap_url_limits[str(host).lower()]
-        return self.max_sitemap_urls
+    def page_limit_for(self, domain):
+        """Pages per domain: the domain's MAX_PAGES_BY_DOMAIN entry (apex or www), else MAX_PAGES_PER_DOMAIN.
+
+        This one number caps the crawl job's total pages and also the page URLs collected from sitemaps.
+        """
+        host = str(domain or "").lower().strip().strip(".")
+        host = host.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+        apex = host[4:] if host.startswith("www.") else host
+        for name in (host, apex, "www." + apex):
+            if name in self.page_limits:
+                return self.page_limits[name]
+        return max(1, self.max_pages)
 
     embedding_configured = bool(embedding_endpoint and embedding_key and embedding_deployment)
     search_configured = bool(search_endpoint and search_api_key and search_index_name)

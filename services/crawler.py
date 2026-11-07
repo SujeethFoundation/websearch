@@ -80,7 +80,7 @@ class Crawler:
         results = []
         for item in domains:
             domain = item.get("domain") if isinstance(item, dict) else str(item)
-            cap = max(1, settings.max_pages)
+            cap = settings.page_limit_for(domain)
             depth = max(0, settings.max_crawl_depth)
             results.append(self.crawl_domain(domain, cap, depth))
         return {"status": "completed", "crawler_version": "0.5.0", "domains": results}
@@ -127,7 +127,7 @@ class Crawler:
         """Collect page URLs from the domain's sitemaps.
 
         keep, if given, is called with each page URL and must return True to keep it. It runs before a
-        URL counts toward the sitemap URL limit (MAX_SITEMAP_URLS, or the domain's SITEMAP_URL_LIMITS entry), so a domain with an allow-list (include_paths) spends the
+        URL counts toward the sitemap URL limit (the domain's page limit, MAX_PAGES_PER_DOMAIN or its MAX_PAGES_BY_DOMAIN entry), so a domain with an allow-list (include_paths) spends the
         cap on the sections it wants, not on whatever its sitemaps happen to list first.
 
         sitemap_filter, if given, is called with each nested sitemap file (.xml) a sitemap lists and must
@@ -145,7 +145,7 @@ class Crawler:
         found = []
         metadata = {}
         failures = []
-        limit = settings.sitemap_limit_for(self._host_variants(domain))
+        limit = settings.page_limit_for(domain)
         while candidates and len(found) < limit and len(visited_sitemaps) < settings.max_sitemaps:
             sitemap_url = self._normalize_url(candidates.pop(0))
             if sitemap_url in visited_sitemaps:

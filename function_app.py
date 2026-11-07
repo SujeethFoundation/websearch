@@ -596,10 +596,12 @@ def _crawl_limits(item=None):
     """Page cap and depth for a crawl job.
 
     Crawl size is an operational setting of this app, not ontology content. The limits come
-    from MAX_PAGES_PER_DOMAIN and MAX_CRAWL_DEPTH in the app settings, and the ontology
-    only decides which domains may be crawled.
+    from MAX_PAGES_PER_DOMAIN (or the domain's entry in MAX_PAGES_BY_DOMAIN) and MAX_CRAWL_DEPTH
+    in the app settings, and the ontology only decides which domains may be crawled. The page cap
+    also limits how many page URLs are collected from sitemaps.
     """
-    return max(1, settings.max_pages), max(0, settings.max_crawl_depth)
+    domain = item.get("domain") if isinstance(item, dict) else item
+    return settings.page_limit_for(domain), max(0, settings.max_crawl_depth)
 
 
 @app.route(route="crawl", methods=["POST"])

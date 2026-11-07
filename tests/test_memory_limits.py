@@ -226,7 +226,7 @@ def test_an_oversized_sitemap_is_reported_and_not_parsed(monkeypatch):
 
 
 def test_sitemap_collection_stops_at_the_url_limit(monkeypatch):
-    monkeypatch.setattr(settings, "max_sitemap_urls", 1)
+    monkeypatch.setattr(settings, "max_pages", 1)
     pages = {"https://example.org/sitemap.xml": FakeResponse(body=URLSET)}
     found, _, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
     assert found == ["https://example.org/a"]
@@ -238,7 +238,7 @@ def test_keep_filter_runs_before_the_url_cap(monkeypatch):
             + "".join(f"<url><loc>https://example.org/jobs/{i}</loc></url>" for i in range(5))
             + "<url><loc>https://example.org/advice/a</loc></url><url><loc>https://example.org/advice/b</loc></url></urlset>").encode()
     pages = {"https://example.org/sitemap.xml": FakeResponse(body=body)}
-    monkeypatch.setattr(settings, "max_sitemap_urls", 3)
+    monkeypatch.setattr(settings, "max_pages", 3)
     crawler = sitemap_crawler(monkeypatch, pages)
     without, _, _, _ = crawler._sitemap_urls("example.org", [])
     assert all("/jobs/" in u for u in without)             # the old behavior: cap spent on /jobs
@@ -280,17 +280,26 @@ def test_sitemap_filter_skips_unwanted_child_sitemaps_without_fetching_them(monk
     assert "https://example.org/sitemaps/advice.xml" in fetched
 
 
-def test_a_domain_specific_sitemap_limit_overrides_the_global_one(monkeypatch):
+def test_a_domain_specific_page_limit_overrides_the_global_one(monkeypatch):
     ns = 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
     body = (f"<urlset {ns}>" + "".join(f"<url><loc>https://example.org/advice/{i}</loc></url>" for i in range(10)) + "</urlset>").encode()
     pages = {"https://example.org/sitemap.xml": FakeResponse(body=body)}
-    monkeypatch.setattr(settings, "max_sitemap_urls", 5000)
-    monkeypatch.setattr(settings, "sitemap_url_limits", {"www.example.org": 3})
+    monkeypatch.setattr(settings, "max_pages", 5000)
+    monkeypatch.setattr(settings, "page_limits", {"www.example.org": 3})
     found, _, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
     assert len(found) == 3                                  # the limit is matched through the www variant
-    monkeypatch.setattr(settings, "sitemap_url_limits", {"other.org": 3})
+    monkeypatch.setattr(settings, "page_limits", {"other.org": 3})
     found, _, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
     assert len(found) == 10                                 # other domains keep the global limit
+
+
+def test_page_limit_for_matches_apex_and_www_and_falls_back_to_the_global_limit(monkeypatch):
+    monkeypatch.setattr(settings, "max_pages", 10000)
+    monkeypatch.setattr(settings, "page_limits", {"www.themuse.com": 500})
+    for name in ("www.themuse.com", "themuse.com", "https://www.themuse.com/", "THEMUSE.com"):
+        assert settings.page_limit_for(name) == 500
+    assert settings.page_limit_for("tealhq.com") == 10000
+    assert settings.page_limit_for(None) == 10000
 
 
 def test_parse_limits_ignores_bad_entries():
