@@ -9,11 +9,14 @@
 #     Show-Crawl muse            only domains containing "muse"
 #     Show-Crawl muse -Watch     refresh every 30 seconds (Ctrl+C to stop; -Every 10 to change)
 #     Show-CrawlPages muse       what happened to the latest job's pages, grouped, plus failed URLs
+#     Show-CrawlPaths tealhq     the latest job's pages grouped by URL section (/post, /job ...) and outcome
+#     Show-CrawlTimeline tealhq -Path /job   when pages under a path were discovered, done and rejected (UTC)
 #     Start-Crawl www.themuse.com   start a crawl and show the page limit it was given
 #     Start-Crawl www.themuse.com -Wait   ...then follow it to the end with a progress bar
 #     Wait-Crawl muse            follow the latest crawl of a domain: progress bar, pages/min, ETA, stall warning
 #     Resume-Crawl muse          re-run the failed tasks of the domain's latest job
 #     Get-CrawlJobId muse        the full job id of the domain's latest job
+#     Stop-Crawl muse            cancel the domain's latest job (asks first; -Force skips the question)
 #     Call GET "/api/health"     any raw call
 
 # Run as a normal script, the commands below would vanish when the script ends. Stop early and say how to load it.
@@ -178,6 +181,94 @@ function Wait-Crawl([string]$Domain, [int]$Every = 15, [int]$StallMinutes = 10) 
         }
         Start-Sleep -Seconds $Every
     }
+}
+
+function Stop-Crawl([string]$Domain, [switch]$Force) {
+    $job = Find-LatestJob $Domain
+    if (-not $job) { return }
+    Write-Host ("{0}  job {1}  {2}: {3} found, {4} done, {5} pending, limit {6}" -f $job.Domain, $job.Job, $job.Status, $job.Found, $job.Done, $job.Pend, $job.Limit)
+    if ($job.Status -in $script:TerminalStatuses) { Write-Host "That job has already finished ($($job.Status)); nothing to cancel."; return }
+    if (-not $Force) {
+        $answer = Read-Host "Cancel this job? Pages already crawled stay in the index; queued pages are dropped. (yes/no)"
+        if ($answer -ne "yes") { Write-Host "Not cancelled."; return }
+    }
+    Call POST "/api/crawl/$($job.JobId)/cancel" | ConvertTo-Json -Depth 3
+}
+
+function Show-CrawlPaths([string]$Domain, [int]$Depth = 1, [int]$Top = 20) {
+    $job = Find-LatestJob $Domain
+    if (-not $job) { return }
+    Write-Host "$($job.Domain)  job $($job.JobId)  status $($job.Status)  - reading page records, this can take a while for big jobs ..."
+    $r = Call GET "/api/crawl/$($job.JobId)/pages"
+    if (-not $r.pages) { Write-Host "No page records."; return }
+    $rows = foreach ($pg in $r.pages) {
+        $path = ""
+        try { $path = ([uri]$pg.url).AbsolutePath.Trim("/") } catch { }
+        $seg = ($path -split "/" | Where-Object { $_ } | Select-Object -First $Depth) -join "/"
+        [pscustomobject]@{ Path = if ($seg) { "/$seg" } else { "(home)" }; Status = $pg.status; Reason = $pg.reason }
+    }
+    $table = $rows | Group-Object Path | ForEach-Object {
+        $g = $_.Group
+        [pscustomobject]@{
+            Path     = $_.Name
+            Total    = $_.Count
+            Done     = @($g | Where-Object { $_.Status -in "processed", "unchanged" }).Count
+            Excluded = @($g | Where-Object { $_.Reason -eq "path_excluded" }).Count
+            Skipped  = @($g | Where-Object { $_.Status -eq "skipped" -and $_.Reason -ne "path_excluded" }).Count
+            Failed   = @($g | Where-Object { $_.Status -in "failed", "publish_failed" }).Count
+            Queued   = @($g | Where-Object { $_.Status -in "queued", "processing" }).Count
+        }
+    } | Sort-Object Total -Descending
+    Write-Host "`n$($r.count) page records. Excluded = skipped because the path rules (include_paths / exclude_paths) did not allow them."
+    $table | Select-Object -First $Top | Format-Table -AutoSize | Out-Host
+    if (@($table).Count -gt $Top) { Write-Host "... and $(@($table).Count - $Top) more sections. Use -Top to show more, -Depth 2 for finer paths." }
+}
+
+function Show-CrawlTimeline([string]$Domain, [string]$Path = "/job", [int]$BucketMinutes = 60) {
+    $job = Find-LatestJob $Domain
+    if (-not $job) { return }
+    Write-Host "$($job.Domain)  job $($job.JobId)  status $($job.Status)  - reading page records ..."
+    $r = Call GET "/api/crawl/$($job.JobId)/pages"
+    if (-not $r.pages) { Write-Host "No page records."; return }
+    $Path = "/" + $Path.Trim("/")
+    $bucket = [long]($BucketMinutes * 600000000)      # ticks per bucket
+    $floor = { param($t) [datetime]::new([long]([Math]::Floor($t.ToUniversalTime().Ticks / $bucket) * $bucket), [DateTimeKind]::Utc) }
+    $pages = foreach ($pg in $r.pages) {
+        $p = ""; try { $p = ([uri]$pg.url).AbsolutePath } catch { }
+        $trim = $p.TrimEnd("/")
+        [pscustomobject]@{
+            Under   = ($trim -eq $Path) -or $trim.StartsWith("$Path/")
+            Status  = $pg.status
+            Reason  = $pg.reason
+            Created = if ($pg.created_utc) { [datetime]$pg.created_utc } else { $null }
+            Updated = if ($pg.updated_utc) { [datetime]$pg.updated_utc } else { $null }
+        }
+    }
+    $keys = @($pages | ForEach-Object { if ($_.Created) { & $floor $_.Created } }) + @($pages | ForEach-Object { if ($_.Updated) { & $floor $_.Updated } }) | Sort-Object -Unique
+    $table = foreach ($k in $keys) {
+        $inB = { param($t) $t -and ((& $floor $t) -eq $k) }
+        [pscustomobject]@{
+            "UTC"            = $k.ToString("MM-dd HH:mm")
+            "Found(all)"     = @($pages | Where-Object { & $inB $_.Created }).Count
+            "Found($Path)"   = @($pages | Where-Object { $_.Under -and (& $inB $_.Created) }).Count
+            "Done($Path)"    = @($pages | Where-Object { $_.Under -and $_.Status -in "processed", "unchanged" -and (& $inB $_.Updated) }).Count
+            "Rejected($Path)" = @($pages | Where-Object { $_.Under -and $_.Reason -eq "path_excluded" -and (& $inB $_.Updated) }).Count
+        }
+    }
+    $table | Format-Table -AutoSize | Out-Host
+    $rejected = @($pages | Where-Object { $_.Reason -eq "path_excluded" -and $_.Updated } | Sort-Object Updated)
+    $underFound = @($pages | Where-Object { $_.Under -and $_.Created } | Sort-Object Created)
+    if ($rejected.Count) {
+        $first = $rejected[0].Updated
+        $after = @($underFound | Where-Object { $_.Created -gt $first }).Count
+        Write-Host ("First page rejected by the path rules: {0:MM-dd HH:mm} UTC" -f $first.ToUniversalTime())
+        Write-Host ("{0} page(s) under {1} were discovered AFTER that moment." -f $after, $Path)
+        if ($after -gt 0) { Write-Host "  -> Links were still being queued after the rules took effect: that points to a gap in link filtering or to instances running older rules." -ForegroundColor Yellow }
+        else { Write-Host "  -> Discovery stopped when the rules took effect; the backlog queued earlier was rejected as it came up." -ForegroundColor Green }
+    } else {
+        Write-Host "No page was rejected by the path rules in this job."
+    }
+    if ($underFound.Count) { Write-Host ("{0} found {1:MM-dd HH:mm} to {2:MM-dd HH:mm} UTC: {3} pages." -f $Path, $underFound[0].Created.ToUniversalTime(), $underFound[-1].Created.ToUniversalTime(), $underFound.Count) }
 }
 
 function Start-Crawl([string]$Domain, [switch]$Wait) {

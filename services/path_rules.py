@@ -41,6 +41,14 @@ from urllib.parse import unquote, urlparse
 log = logging.getLogger("sujeeth-web-search.path-rules")
 
 
+class PathRulesUnavailable(RuntimeError):
+    """The crawl path rules have never been read from the ontology.
+
+    Answering "is this path allowed?" without them would mean crawling with no rules at all, so callers
+    get this error instead. In the page worker it makes the queue message retry until the ontology answers.
+    """
+
+
 def normalize_rule(rule):
     text = "/" + str(rule or "").strip().lower().strip("/")
     # A bare "/" would exclude (or include) the whole site, so it is treated as no rule at all.
@@ -100,8 +108,10 @@ def is_blocked_url(url, includes=(), excludes=()):
 class PathPolicy:
     """Reads each domain's include_paths and exclude_paths from the ontology crawl manifest.
 
-    The rules are cached for a few minutes. If the ontology cannot be read, the previous rules
-    stay in force and the read is retried after a minute.
+    The rules are cached for a few minutes. If the ontology cannot be read, or answers with a manifest that
+    lists no crawl domains, the previous rules stay in force and the read is retried after a minute. If the
+    rules have never been read, every lookup raises PathRulesUnavailable (fail closed) instead of allowing
+    every path.
     """
 
     def __init__(self, ontology, ttl_seconds=600):
@@ -110,6 +120,7 @@ class PathPolicy:
         self._rules = {}
         self._includes = {}
         self._sitemaps = {}
+        self._ever_loaded = False
         self._loaded_at = None
         self._lock = threading.Lock()
 
@@ -123,8 +134,12 @@ class PathPolicy:
                 return
             try:
                 manifest = self.ontology.crawl_manifest()
+                rows = manifest.get("crawl_domains") if isinstance(manifest, dict) else None
+                if not isinstance(rows, list) or not rows:
+                    # An answer with no domains is a broken ontology, not "no rules": do not replace good rules with it.
+                    raise ValueError("the ontology crawl manifest lists no crawl domains")
                 rules, includes, sitemaps = {}, {}, {}
-                for row in manifest.get("crawl_domains", []):
+                for row in rows:
                     if not isinstance(row, dict):
                         continue
                     policy = row.get("crawl_policy") if isinstance(row.get("crawl_policy"), dict) else {}
@@ -141,24 +156,32 @@ class PathPolicy:
                 self._rules = rules
                 self._includes = includes
                 self._sitemaps = sitemaps
+                self._ever_loaded = True
                 self._loaded_at = now
             except Exception:
                 log.exception("Could not read crawl path rules from the ontology; keeping the previous rules")
                 self._loaded_at = now - self.ttl + 60
 
+    def _require(self):
+        """Refresh the rules if due, and refuse to go on if they have never been read."""
+        self._refresh()
+        if not self._ever_loaded:
+            raise PathRulesUnavailable(
+                "Crawl path rules could not be read from the ontology; refusing to crawl without them.")
+
     def rules_for(self, domain):
         """The block-list (exclude_paths) for a domain."""
-        self._refresh()
+        self._require()
         return self._rules.get(str(domain or "").lower(), ())
 
     def includes_for(self, domain):
         """The allow-list (include_paths) for a domain; empty means no allow-list."""
-        self._refresh()
+        self._require()
         return self._includes.get(str(domain or "").lower(), ())
 
     def sitemaps_for(self, domain):
         """The allow-list of child sitemap files (include_sitemaps); empty means open every sitemap."""
-        self._refresh()
+        self._require()
         return self._sitemaps.get(str(domain or "").lower(), ())
 
     def is_sitemap_allowed(self, domain, url):
@@ -169,15 +192,15 @@ class PathPolicy:
         return is_excluded_path(urlparse(str(url or "")).path, rules)
 
     def all_rules(self):
-        self._refresh()
+        self._require()
         return dict(self._rules)
 
     def all_includes(self):
-        self._refresh()
+        self._require()
         return dict(self._includes)
 
     def is_excluded(self, domain, url):
         """True if the crawler must not fetch this URL: blocked, or outside the allow-list."""
         key = str(domain or "").lower()
-        self._refresh()
+        self._require()
         return is_blocked_url(url, self._includes.get(key, ()), self._rules.get(key, ()))
