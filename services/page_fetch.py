@@ -12,8 +12,8 @@ from urllib.robotparser import RobotFileParser
 import requests
 
 from services.config import settings
-from services.crawler import Crawler
 from services.page_extract import extract_html
+from services.urlutil import normalize_url, same_site
 
 BOT_CHECK_MARKERS = ("verify you are human", "access denied", "captcha", "enable javascript and cookies")
 
@@ -50,7 +50,7 @@ def fetch_page(url, session=None, is_public=_public):
 
     current = url
     for _ in range(6):
-        if not Crawler._same_site(current, host) or not is_public(urlparse(current).hostname or ""):
+        if not same_site(current, host) or not is_public(urlparse(current).hostname or ""):
             raise PageFetchError("The page redirects off the site or to a non-public address.")
         resp = session.get(current, timeout=settings.timeout, allow_redirects=False, stream=True)
         if resp.status_code in (301, 302, 303, 307, 308):
@@ -58,7 +58,7 @@ def fetch_page(url, session=None, is_public=_public):
             location = resp.headers.get("Location")
             if not location:
                 raise PageFetchError("The page redirected without a destination.")
-            current = Crawler._normalize_url(urljoin(current, location))
+            current = normalize_url(urljoin(current, location))
             continue
         break
     else:

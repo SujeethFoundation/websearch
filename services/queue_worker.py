@@ -1,6 +1,5 @@
 """Azure Queue adapter for crawl and Azure AI Search indexing tasks."""
 import json
-import os
 from urllib.parse import urlparse
 import logging
 from azure.storage.queue import QueueClient, TextBase64EncodePolicy
@@ -16,7 +15,7 @@ log = logging.getLogger("sujeeth-web-search.crawl-worker")
 # up to INDEX_MAX_DEFERRALS times. After that the task fails normally and POST /api/index/backfill
 # can pick the chunks up again from Blob Storage (their vectors are stored, so nothing is re-embedded).
 DEFERRAL_DELAYS = (120, 300, 600, 1200, 1800, 3600)
-MAX_INDEX_DEFERRALS = int(os.getenv("INDEX_MAX_DEFERRALS", "12") or 12)
+MAX_INDEX_DEFERRALS = settings.index_max_deferrals
 
 
 class QueueProcessor:

@@ -328,28 +328,3 @@ class ConceptResolver:
 
         # Stable order: strongest match first, then canonical ID.
         return [concept_id for _, concept_id in sorted(matches, key=lambda x: (-x[0], x[1]))]
-
-    def enrich_existing_documents(self, storage, searcher):
-        """Backfill ontology tags for previously crawled chunks."""
-        updated = 0
-        unchanged = 0
-        missing_domain_concepts = []
-        for doc in storage.list("documents/"):
-            domain = str(doc.get("domain", "")).lower()
-            allowed = self.ontology.domain_concepts(domain)
-            if not allowed:
-                missing_domain_concepts.append(domain)
-                continue
-            concepts = self.tag_document(doc.get("title", ""), doc.get("content", ""), allowed)
-            if concepts != doc.get("concepts", []):
-                doc["concepts"] = concepts
-                storage.put(doc["_key"], doc)
-                updated += 1
-            else:
-                unchanged += 1
-        return {
-            "status": "completed",
-            "documents_updated": updated,
-            "documents_unchanged": unchanged,
-            "domains_without_concept_scope": sorted(set(missing_domain_concepts)),
-        }

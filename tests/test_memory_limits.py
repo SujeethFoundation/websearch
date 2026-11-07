@@ -1,11 +1,12 @@
 """Memory guards: capped downloads, streamed sitemaps, grouped chunk indexing."""
 import tracemalloc
+import types
 import xml.etree.ElementTree as ET
 
 import pytest
 
 from services.config import settings
-from services.crawler import Crawler
+from services.sitemap import collect_sitemap_urls
 from services.limits import TooLarge, chunk_groups, iter_sitemap_locs, read_capped
 from services.page_worker import PageWorker
 
@@ -199,11 +200,10 @@ def test_streaming_a_large_sitemap_uses_far_less_memory_than_a_full_parse():
 
 
 # ---------------------------------------------------------------- crawler sitemaps
-def sitemap_crawler(monkeypatch, pages):
-    crawler = Crawler(None, None, None, None)
-    monkeypatch.setattr(Crawler, "_public_host", staticmethod(lambda host: True))
-    crawler.session.get = lambda url, **kw: pages.get(url, FakeResponse(status=404, url=url))
-    return crawler
+def collect(pages, domain="example.org", seeds=(), **kwargs):
+    """collect_sitemap_urls over a fake session that serves the given pages and 404s everything else."""
+    session = types.SimpleNamespace(get=lambda url, **kw: pages.get(url, FakeResponse(status=404, url=url)))
+    return collect_sitemap_urls(session, domain, list(seeds), is_public=lambda host: True, **kwargs)
 
 
 def test_sitemap_index_is_followed_and_urls_are_collected(monkeypatch):
@@ -211,16 +211,15 @@ def test_sitemap_index_is_followed_and_urls_are_collected(monkeypatch):
         "https://example.org/sitemap.xml": FakeResponse(body=INDEX),
         "https://example.org/s1.xml": FakeResponse(body=URLSET),
     }
-    found, visited, metadata, failures = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
+    found, visited, failures = collect(pages)
     assert found == ["https://example.org/a", "https://example.org/b"]
-    assert metadata["https://example.org/a"] == {"sitemap": "https://example.org/s1.xml"}
     assert visited >= 2
 
 
 def test_an_oversized_sitemap_is_reported_and_not_parsed(monkeypatch):
     monkeypatch.setattr(settings, "max_sitemap_bytes", 100)
     pages = {"https://example.org/sitemap.xml": FakeResponse(body=URLSET + b" " * 500)}
-    found, _, _, failures = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
+    found, _, failures = collect(pages)
     assert found == []
     assert {"url": "https://example.org/sitemap.xml", "error": "sitemap_too_large"} in failures
 
@@ -228,7 +227,7 @@ def test_an_oversized_sitemap_is_reported_and_not_parsed(monkeypatch):
 def test_sitemap_collection_stops_at_the_url_limit(monkeypatch):
     monkeypatch.setattr(settings, "max_pages", 1)
     pages = {"https://example.org/sitemap.xml": FakeResponse(body=URLSET)}
-    found, _, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
+    found, _, _ = collect(pages)
     assert found == ["https://example.org/a"]
 
 
@@ -239,10 +238,9 @@ def test_keep_filter_runs_before_the_url_cap(monkeypatch):
             + "<url><loc>https://example.org/advice/a</loc></url><url><loc>https://example.org/advice/b</loc></url></urlset>").encode()
     pages = {"https://example.org/sitemap.xml": FakeResponse(body=body)}
     monkeypatch.setattr(settings, "max_pages", 3)
-    crawler = sitemap_crawler(monkeypatch, pages)
-    without, _, _, _ = crawler._sitemap_urls("example.org", [])
+    without, _, _ = collect(pages)
     assert all("/jobs/" in u for u in without)             # the old behavior: cap spent on /jobs
-    kept, _, _, _ = crawler._sitemap_urls("example.org", [], keep=lambda u: "/advice/" in u)
+    kept, _, _ = collect(pages, keep=lambda u: "/advice/" in u)
     assert kept == ["https://example.org/advice/a", "https://example.org/advice/b"]
 
 
@@ -251,7 +249,7 @@ def test_keep_filter_does_not_stop_nested_sitemaps_being_followed(monkeypatch):
         "https://example.org/sitemap.xml": FakeResponse(body=INDEX),
         "https://example.org/s1.xml": FakeResponse(body=URLSET),
     }
-    found, visited, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [], keep=lambda u: u.endswith("/b"))
+    found, visited, _ = collect(pages, keep=lambda u: u.endswith("/b"))
     assert found == ["https://example.org/b"]
     assert visited >= 2
 
@@ -268,12 +266,15 @@ def test_sitemap_filter_skips_unwanted_child_sitemaps_without_fetching_them(monk
         "https://example.org/sitemaps/jobs-1.xml": FakeResponse(body=urlset("jobs")),
         "https://example.org/sitemaps/advice.xml": FakeResponse(body=urlset("advice")),
     }
-    crawler = sitemap_crawler(monkeypatch, pages)
     fetched = []
-    original = crawler.session.get
-    crawler.session.get = lambda url, **kw: (fetched.append(url), original(url, **kw))[1]
-    found, visited, _, _ = crawler._sitemap_urls(
-        "example.org", [], sitemap_filter=lambda u: u.endswith("/sitemaps/advice.xml"))
+
+    def get(url, **kw):
+        fetched.append(url)
+        return pages.get(url, FakeResponse(status=404, url=url))
+
+    found, visited, _ = collect_sitemap_urls(
+        types.SimpleNamespace(get=get), "example.org", [], is_public=lambda host: True,
+        sitemap_filter=lambda u: u.endswith("/sitemaps/advice.xml"))
     assert found == ["https://example.org/advice/1"]
     assert "https://example.org/sitemaps/jobs-0.xml" not in fetched
     assert "https://example.org/sitemaps/jobs-1.xml" not in fetched
@@ -286,10 +287,10 @@ def test_a_domain_specific_page_limit_overrides_the_global_one(monkeypatch):
     pages = {"https://example.org/sitemap.xml": FakeResponse(body=body)}
     monkeypatch.setattr(settings, "max_pages", 5000)
     monkeypatch.setattr(settings, "page_limits", {"www.example.org": 3})
-    found, _, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
+    found, _, _ = collect(pages)
     assert len(found) == 3                                  # the limit is matched through the www variant
     monkeypatch.setattr(settings, "page_limits", {"other.org": 3})
-    found, _, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
+    found, _, _ = collect(pages)
     assert len(found) == 10                                 # other domains keep the global limit
 
 

@@ -3,7 +3,7 @@
     python check_sitemap.py www.themuse.com --include /advice
     python check_sitemap.py www.themuse.com --include /advice --max-urls 5000 --max-sitemaps 100
 
-It copies the crawler's collection order (services/crawler.py _sitemap_urls): robots.txt "Sitemap:" lines first,
+It copies the crawler's collection order (services/sitemap.py collect_sitemap_urls): robots.txt "Sitemap:" lines first,
 then /sitemap.xml and /sitemap_index.xml on the apex and www hosts, child sitemaps in first-in-first-out order,
 stopping at max-urls page URLs or max-sitemaps sitemap files. It uses the crawler's user agent.
 Read-only: it only fetches robots.txt and sitemap files. Needs `requests` (already in requirements.txt).

@@ -2,7 +2,6 @@
 import base64
 import hashlib
 import logging
-import os
 import struct
 import threading
 import time
@@ -16,17 +15,17 @@ log = logging.getLogger("sujeeth-web-search.ai-search")
 # busy. SEARCH_MIN_INTERVAL_SECONDS spaces index writes at least this far apart on each running
 # instance (0 = off). SEARCH_WRITE_ATTEMPTS is how many times one write is tried; the waits grow
 # from 2 seconds to 60, so 8 attempts is about 3 minutes, well inside the queue's 15-minute lease.
-SEARCH_MIN_INTERVAL = float(os.getenv("SEARCH_MIN_INTERVAL_SECONDS", "0") or 0)
-SEARCH_WRITE_ATTEMPTS = max(1, int(os.getenv("SEARCH_WRITE_ATTEMPTS", "8") or 8))
+SEARCH_MIN_INTERVAL = settings.search_min_interval
+SEARCH_WRITE_ATTEMPTS = settings.search_write_attempts
 _pace_lock = threading.Lock()
 _next_write_slot = 0.0
 
 # Chunks are embedded once. The vector is stored next to the chunk (vectors/<id>.json) so a busy or
 # failed index never causes a second embedding call. EMBED_BATCH_SIZE caps texts per embedding request.
-EMBED_BATCH_SIZE = max(1, int(os.getenv("EMBED_BATCH_SIZE", "16") or 16))
+EMBED_BATCH_SIZE = settings.embed_batch_size
 # After the index stays busy through every retry, other writes on this instance skip straight to
 # deferral for this many seconds, so workers keep crawling instead of each waiting out the retries.
-SEARCH_BREAKER_SECONDS = float(os.getenv("SEARCH_BREAKER_SECONDS", "120") or 120)
+SEARCH_BREAKER_SECONDS = settings.search_breaker_seconds
 _breaker_until = 0.0
 
 
@@ -352,9 +351,6 @@ class SearchService:
             raise IndexBusyError(f"Azure AI Search is busy; {len(deferred)} chunk(s) are stored but not indexed.")
         return count
 
-    def upsert(self, doc):
-        return self.upsert_many([doc], persist_blobs=True)
-
     def _existing_ids(self, ids):
         """Which of these chunk ids are already in the index."""
         ids = [str(x) for x in ids]
@@ -500,9 +496,6 @@ class SearchService:
             self.storage.delete("documents/" + str(doc_id) + ".json")
             self.storage.delete(self.vector_key(doc_id))
         return len(ids)
-
-    def rebuild_vectors(self):
-        raise RuntimeError("Use POST /api/index/backfill to queue a resumable Azure AI Search backfill.")
 
     def status(self):
         if not self.configured:

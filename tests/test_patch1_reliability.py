@@ -251,17 +251,11 @@ def test_robots_5xx_raises_so_the_queue_retries_and_is_not_cached():
 def test_sitemap_seeds_still_come_from_the_cached_robots_text(monkeypatch):
     seen = {}
 
-    from services.crawler import Crawler as RealCrawler
+    def fake_collect(session, domain, seeds, **kwargs):
+        seen["seeds"] = seeds
+        return [], 0, []
 
-    class FakeCrawler(RealCrawler):
-        def __init__(self, *a, **k):
-            pass
-
-        def _sitemap_urls(self, domain, seeds, keep=None, sitemap_filter=None):
-            seen["seeds"] = seeds
-            return [], 0, {}, []
-
-    monkeypatch.setattr("services.crawler.Crawler", FakeCrawler)
+    monkeypatch.setattr("services.page_worker.collect_sitemap_urls", fake_collect)
     worker, state, _ = make_worker(404, robots=lambda: FakeResponse(200, "Sitemap: https://example.org/s.xml\n"))
     run(worker, url="https://example.org/", depth=0)
     assert seen["seeds"] == ["https://example.org/s.xml"]

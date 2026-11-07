@@ -1,17 +1,15 @@
 import json
 import logging
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import azure.functions as func
 from urllib.parse import urlparse
-from azure.storage.queue import QueueClient, TextBase64EncodePolicy
 
-from services.config import settings
+from services.config import settings, VERSION
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
 from services.search_service import SearchService, assemble_document, chunk_index
-from services.crawler import Crawler
+from services.urlutil import normalize_url
 from services.crawl_state import CrawlState
 from services.manual_page import build_page_documents
 from services.page_fetch import fetch_page, PageFetchError
@@ -31,7 +29,6 @@ storage = StorageService()
 ontology = OntologyClient()
 concept_resolver = ConceptResolver(ontology)
 searcher = SearchService(storage)
-crawler = Crawler(ontology, storage, searcher, concept_resolver)
 crawl_state = None
 queue_processor = None
 try:
@@ -48,6 +45,16 @@ def response(data, status=200):
         status_code=status,
         mimetype="application/json",
     )
+
+
+def _domains(body):
+    """The lower-cased, non-empty domains in a request body's "domains" list."""
+    return [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+
+
+def _enqueue(task):
+    """Put one task on the crawl queue, using the queue client the queue processor already holds."""
+    queue_processor.queue.send_message(json.dumps(task))
 
 
 def read_body(req):
@@ -112,7 +119,7 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5):
     return result
 
 
-SPOTLIGHT_SLOTS = max(0, min(int(os.getenv("SPOTLIGHT_SLOTS", "2")), 3))
+SPOTLIGHT_SLOTS = settings.spotlight_slots
 
 
 def add_spotlights(result, query, resolution, selected_domains):
@@ -132,7 +139,6 @@ def add_spotlights(result, query, resolution, selected_domains):
         if not domains:
             return
         found = searcher.search(query, concepts=["spotlight"], domains=domains, limit=SPOTLIGHT_SLOTS * 3)
-        existing = {str(x.get("url") or "").strip().lower(): x for x in result.get("results", [])}
         picked, seen = [], set()
         for item in found.get("results", []):
             key = str(item.get("url") or "").strip().lower()
@@ -151,7 +157,7 @@ def add_spotlights(result, query, resolution, selected_domains):
         result["spotlights"] = {"status": "unavailable", "count": 0, "max": SPOTLIGHT_SLOTS}
 
 
-BEST_BETS_MAX = max(0, min(int(os.getenv("BEST_BETS_MAX", "3")), 3))
+BEST_BETS_MAX = settings.best_bets_max
 
 
 def add_best_bets(result, query, concepts, selected_domains):
@@ -177,14 +183,14 @@ def health(req):
     return response({
         "status": "healthy",
         "service": "Sujeeth Foundation Web Search",
-        "version": "0.7.0",
+        "version": VERSION,
         "storage_mode": storage.mode,
         "embedding_configured": settings.embedding_configured,
         "ai_search_configured": settings.search_configured,
         "ai_search_index": settings.search_index_name,
         "ontology_configured": bool(settings.ontology_api_url),
         "concept_resolution_required": True,
-        "crawler_version": "0.7.0",
+        "crawler_version": VERSION,
         "persistent_crawl_jobs": bool(crawl_state),
         "crawl_queue": settings.crawl_queue,
         "max_pages_per_domain": settings.max_pages,
@@ -263,47 +269,11 @@ def sources(req):
 @app.route(route="index-status", methods=["GET"])
 def index_status(req):
     try:
-        return response({"blob_storage": storage.status(), "ai_search": searcher.status()})
+        count_blobs = str(req.params.get("count_blobs") or "").lower() in ("1", "true", "yes")
+        return response({"blob_storage": storage.status(count_blobs=count_blobs), "ai_search": searcher.status()})
     except Exception as exc:
         log.exception("Index status failed")
         return response({"error": str(exc)}, 502)
-
-
-@app.route(route="refresh", methods=["POST"])
-def refresh(req):
-    body = read_body(req)
-    requested = {str(x).lower() for x in (body.get("domains") or [])}
-    try:
-        manifest = ontology.crawl_manifest()
-        entries = manifest.get("crawl_domains", [])
-        allowed = {
-            (x.get("domain") if isinstance(x, dict) else str(x)).lower()
-            for x in entries
-        }
-        rejected = sorted(requested - allowed)
-        if rejected:
-            return response({
-                "error": "Domains are not crawl-enabled in ontology",
-                "rejected_domains": rejected,
-            }, 403)
-        targets = sorted(requested) if requested else entries
-        if not targets:
-            return response({
-                "status": "nothing_to_crawl",
-                "message": "No crawl-enabled domains in ontology.",
-            })
-        return response(crawler.refresh(targets), 202)
-    except Exception as exc:
-        log.exception("Refresh failed")
-        return response({"error": str(exc)}, 502)
-
-
-@app.route(route="reindex", methods=["POST"])
-def reindex(req):
-    return response({
-        "error": "Use POST /api/index/backfill to queue a resumable Azure AI Search backfill.",
-        "backfill_endpoint": "/api/index/backfill"
-    }, 409)
 
 
 @app.route(route="index/backfill", methods=["POST"])
@@ -315,7 +285,7 @@ def index_backfill(req):
     {"domains": ["sujeeth.org"]} limits the pass to chunks from those domains.
     """
     body = read_body(req)
-    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    domains = _domains(body)
     mode = str(body.get("mode") or "missing").strip().lower()
     if mode not in ("missing", "all"):
         return response({"error": "mode must be 'missing' or 'all'"}, 400)
@@ -324,17 +294,12 @@ def index_backfill(req):
     if not settings.search_configured or not settings.embedding_configured:
         return response({"error": "Configure Azure AI Search and Foundry embeddings before backfill."}, 503)
     try:
-        queue = QueueClient.from_connection_string(
-            settings.azure_storage_connection,
-            settings.crawl_queue,
-            message_encode_policy=TextBase64EncodePolicy(),
-        )
-        queue.send_message(json.dumps({
+        _enqueue({
             "task_type": "index_backfill_page",
             "continuation_token": None,
             "mode": mode,
             "domains": domains,
-        }))
+        })
         return response({
             "status": "queued",
             "task_type": "index_backfill_page",
@@ -370,7 +335,7 @@ def index_page(req):
     if not settings.search_configured or not settings.embedding_configured:
         return response({"error": "Configure Azure AI Search and Foundry embeddings before adding pages."}, 503)
     try:
-        url = Crawler._normalize_url(str(body.get("url") or "").strip())
+        url = normalize_url(str(body.get("url") or "").strip())
         host = (urlparse(url).hostname or "").lower()
         validation = ontology.validate_domains([host], "search")
         approved = validation.get("approved") or []
@@ -431,7 +396,7 @@ def index_page_delete(req):
     if not url:
         return response({"error": "JSON body requires url"}, 400)
     try:
-        removed = searcher.delete_url(Crawler._normalize_url(url))
+        removed = searcher.delete_url(normalize_url(url))
         return response({"status": "deleted" if removed else "not_found", "chunks_removed": removed})
     except Exception as exc:
         log.exception("Manual page delete failed")
@@ -450,18 +415,13 @@ def index_retag(req):
     if not settings.search_configured:
         return response({"error": "Configure Azure AI Search before re-tagging."}, 503)
     body = read_body(req)
-    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    domains = _domains(body)
     try:
-        queue = QueueClient.from_connection_string(
-            settings.azure_storage_connection,
-            settings.crawl_queue,
-            message_encode_policy=TextBase64EncodePolicy(),
-        )
-        queue.send_message(json.dumps({
+        _enqueue({
             "task_type": "index_retag_page",
             "continuation_token": None,
             "domains": domains,
-        }))
+        })
         return response({
             "status": "queued",
             "task_type": "index_retag_page",
@@ -479,7 +439,7 @@ def index_retag_preview(req):
     if not storage.container or not queue_processor:
         return response({"error": "Azure Blob Storage must be configured."}, 503)
     body = read_body(req)
-    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    domains = _domains(body)
     try:
         return response(queue_processor.retag_preview(domains, scan_limit=int(body.get("scan_limit", 1000))))
     except Exception as exc:
@@ -493,7 +453,7 @@ def index_purge_preview(req):
     if not storage.container or not queue_processor:
         return response({"error": "Azure Blob Storage must be configured."}, 503)
     body = read_body(req)
-    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    domains = _domains(body)
     try:
         return response(queue_processor.purge_preview(domains, scan_limit=int(body.get("scan_limit", 1000))))
     except Exception as exc:
@@ -511,18 +471,13 @@ def index_purge(req):
     if not settings.azure_storage_connection or not storage.container or not queue_processor:
         return response({"error": "Azure Blob Storage and AzureWebJobsStorage must be configured."}, 503)
     body = read_body(req)
-    domains = [str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()]
+    domains = _domains(body)
     try:
-        queue = QueueClient.from_connection_string(
-            settings.azure_storage_connection,
-            settings.crawl_queue,
-            message_encode_policy=TextBase64EncodePolicy(),
-        )
-        queue.send_message(json.dumps({
+        _enqueue({
             "task_type": "index_purge_page",
             "continuation_token": None,
             "domains": domains,
-        }))
+        })
         return response({
             "status": "queued",
             "task_type": "index_purge_page",
@@ -559,13 +514,8 @@ def document(req):
         validation = ontology.validate_domains(domains, "search")
         if not validation.get("approved") or validation.get("rejected"):
             return response({"error": "This domain is not approved for search."}, 403)
-        full_text_domains = {
-            x.strip().lower()
-            for x in os.getenv("FULL_TEXT_DOMAINS", "sujeeth.org,topics.sujeeth.org").split(",")
-            if x.strip()
-        }
-        excerpt_only = any(d not in full_text_domains for d in domains)
-        limit = min(max_chars, int(os.getenv("EXCERPT_MAX_CHARS", "3000"))) if excerpt_only else max_chars
+        excerpt_only = any(d not in settings.full_text_domains for d in domains)
+        limit = min(max_chars, settings.excerpt_max_chars) if excerpt_only else max_chars
         chosen, truncated = assemble_document(rows, focus, limit)
         return response({
             "status": "ok",
@@ -696,97 +646,57 @@ def crawl_dashboard(req):
     for item in entries:
         domain=str(item.get("domain") if isinstance(item,dict) else item)
         domain_rows.append({"domain":domain,"crawl_enabled":True,"latest_job":by_domain.get(domain)})
-    return response({"domains":domain_rows,"recent_jobs":jobs,"index":storage.status(),"generated_utc":__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()})
+    # The search index count is one request. Counting stored blobs lists all of them, so it is not done here.
+    try:
+        index={"storage_mode":storage.mode,**searcher.status()}
+    except Exception as exc:
+        log.exception("Dashboard could not read the search index status")
+        index={"storage_mode":storage.mode,"error":str(exc)}
+    return response({"domains":domain_rows,"recent_jobs":jobs,"index":index,
+                     "generated_utc":datetime.now(timezone.utc).isoformat()})
+
+
+_JOB_COUNTERS = ("pages_discovered", "pages_processed", "pages_skipped", "pages_failed", "pending",
+                 "chunks_indexed", "chunks_tagged", "chunks_untagged")
+
 
 @app.route(route="crawl/domain-stats", methods=["GET"])
 def crawl_domain_stats(req):
+    """Per-domain totals from the job rows alone. Reading every page row of every job is not needed:
+    each job already carries its page and chunk counters. For one job's pages by state, use
+    GET /crawl/{job_id}/pages?summary=true."""
     if not crawl_state:
         return response({"error": "Crawl state is not configured"}, 503)
-
     try:
-        # Retrieve crawl history across domains.
-        jobs = crawl_state.list_jobs(10000)
-
+        jobs = crawl_state.list_jobs(10000)  # newest first
         stats = {}
-
         for job in jobs:
             domain = str(job.get("domain", "unknown")).lower()
-
-            if domain not in stats:
-                stats[domain] = {
-                    "domain": domain,
-                    "jobs": 0,
-                    "job_statuses": {},
-                    "pages_discovered": 0,
-                    "processed": 0,
-                    "unchanged": 0,
-                    "skipped": 0,
-                    "failed": 0,
-                    "queued": 0,
-                    "processing": 0,
-                    "publish_failed": 0,
-                    "chunks_indexed": 0,
-                    "chunks_tagged": 0,
-                    "chunks_untagged": 0,
-                    "pending": 0,
-                    "latest_job": None,
-                    "latest_created_utc": None,
-                    "latest_updated_utc": None
-                }
-
-            row = stats[domain]
+            row = stats.setdefault(domain, {
+                "domain": domain, "jobs": 0, "job_statuses": {}, **{field: 0 for field in _JOB_COUNTERS},
+                "latest_job": None, "latest_status": None, "latest_created_utc": None,
+                "latest_updated_utc": None, "latest_job_counters": None,
+            })
             row["jobs"] += 1
-
             status = job.get("status", "unknown")
-            row["job_statuses"][status] = (
-                row["job_statuses"].get(status, 0) + 1
-            )
-
-            # Aggregate counters stored on each crawl job.
-            for field in (
-                "pages_discovered",
-                "chunks_indexed",
-                "chunks_tagged",
-                "chunks_untagged",
-                "pending"
-            ):
-                row[field] += int(job.get(field, 0) or 0)
-
-            # The job list is newest first.
+            row["job_statuses"][status] = row["job_statuses"].get(status, 0) + 1
+            counters = {field: int(job.get(field, 0) or 0) for field in _JOB_COUNTERS}
+            for field, value in counters.items():
+                row[field] += value
             if row["latest_job"] is None:
-                row["latest_job"] = job.get("RowKey")
-                row["latest_status"] = status
-                row["latest_created_utc"] = job.get("created_utc")
-                row["latest_updated_utc"] = job.get("updated_utc")
-
-            # Count actual page states from the page table.
-            for page in crawl_state.page_records(job["RowKey"]):
-                page_status = page.get("status", "queued")
-
-                if page_status in (
-                    "processed",
-                    "unchanged",
-                    "skipped",
-                    "failed",
-                    "queued",
-                    "processing",
-                    "publish_failed"
-                ):
-                    row[page_status] += 1
-
+                row.update(latest_job=job.get("job_id"), latest_status=status,
+                           latest_created_utc=job.get("created_utc"), latest_updated_utc=job.get("updated_utc"),
+                           latest_job_counters=counters)
         return response({
             "domain_count": len(stats),
             "job_count": len(jobs),
-            "aggregation": "all retained crawl jobs; page counts are per-job records",
-            "domains": sorted(
-                stats.values(),
-                key=lambda x: x["domain"]
-            )
+            "aggregation": "Sums of the job counters over the retained crawl jobs; latest_job_counters is the newest job alone.",
+            "domains": sorted(stats.values(), key=lambda x: x["domain"]),
         })
-
     except Exception as exc:
         log.exception("Domain crawl statistics failed")
         return response({"error": str(exc)}, 500)
+
 
 @app.route(route="crawl/{job_id}", methods=["GET"])
 def crawl_get(req):
@@ -809,17 +719,39 @@ def crawl_resume(req):
     except Exception as exc:
         log.exception("Could not resume crawl job"); return response({"error":str(exc)},500)
 
+_PAGE_STATES = ("queued", "processing", "processed", "unchanged", "skipped", "failed", "publish_failed")
+_PAGE_COLUMNS = ["url", "depth", "status", "reason", "attempts", "error", "last_error", "final_url",
+                 "created_utc", "updated_utc"]
+
+
 @app.route(route="crawl/{job_id}/pages", methods=["GET"])
 def crawl_pages(req):
+    """A job's pages. Optional: ?status=failed, ?limit=N (up to 10000), ?summary=true for counts by status and reason."""
     if not crawl_state:
         return response({"error": "Crawl state is not configured"}, 503)
     job_id = req.route_params.get("job_id")
     job = crawl_state.get_job(job_id)
     if not job:
         return response({"error": "Crawl job not found"}, 404)
-    pages = crawl_state.page_records(job_id)
+    status = str(req.params.get("status") or "").strip().lower()
+    if status and status not in _PAGE_STATES:
+        return response({"error": "status must be one of: " + ", ".join(_PAGE_STATES)}, 400)
+    where = f"status eq '{status}'" if status else None
+    if str(req.params.get("summary") or "").lower() in ("1", "true", "yes"):
+        groups, total = {}, 0
+        for page in crawl_state.iter_page_records(job_id, select=["status", "reason"], where=where):
+            total += 1
+            key = (page.get("status", "queued"), page.get("reason") or "")
+            groups[key] = groups.get(key, 0) + 1
+        return response({"job_id": job_id, "count": total, "groups": [
+            {"status": k[0], "reason": k[1], "count": v} for k, v in sorted(groups.items(), key=lambda kv: -kv[1])]})
+    try:
+        limit = min(max(int(req.params.get("limit") or 0), 0), 10000)
+    except ValueError:
+        return response({"error": "limit must be a whole number"}, 400)
+    pages = crawl_state.page_records(job_id, select=_PAGE_COLUMNS, where=where, limit=limit or None)
     pages.sort(key=lambda item: item.get("created_utc", ""))
-    return response({"job_id": job_id, "count": len(pages), "pages": pages})
+    return response({"job_id": job_id, "count": len(pages), "limit": limit or None, "pages": pages})
 
 
 @app.route(route="crawl/{job_id}/reconcile", methods=["POST"])
@@ -859,18 +791,6 @@ def crawl_page_worker(msg: func.QueueMessage):
     except Exception:
         log.exception("Crawl page task failed; Azure Queue retry will handle it")
         raise
-
-
-@app.route(route="enrich", methods=["POST"])
-def enrich(req):
-    """Backfill ontology concept tags on content already stored by the crawler."""
-    try:
-        result = concept_resolver.enrich_existing_documents(storage, searcher)
-        result["ontology_version"] = ontology.summary().get("ontology_version")
-        return response(result)
-    except Exception as exc:
-        log.exception("Document concept enrichment failed")
-        return response({"error": str(exc), "stage": "document_enrichment"}, 502)
 
 
 @app.queue_trigger(arg_name="msg", queue_name="%CRAWL_POISON_QUEUE_NAME%", connection="AzureWebJobsStorage")
@@ -933,15 +853,31 @@ def scheduled_crawl_recovery(timer: func.TimerRequest) -> None:
     log.info("Daily crawl recovery finished; jobs examined: %d", examined)
 
 
+@app.timer_trigger(schedule="0 30 11 * * *", arg_name="timer", run_on_startup=False)
+def scheduled_job_cleanup(timer: func.TimerRequest) -> None:
+    """Daily 11:30 UTC: delete crawl jobs, and their page rows, that nothing has touched for JOB_RETENTION_DAYS.
+
+    The newest job of every domain is kept. At most 20 jobs go per run, so a backlog clears over a few days.
+    Turn it off with JOB_CLEANUP_ENABLED=false.
+    """
+    if not settings.job_cleanup_enabled:
+        log.info("Job cleanup is turned off (JOB_CLEANUP_ENABLED)")
+        return
+    if not crawl_state:
+        log.error("Job cleanup skipped: crawl state is not configured")
+        return
+    try:
+        result = crawl_state.purge_old_jobs()
+        log.info("Job cleanup finished: %s", result)
+    except Exception:
+        log.exception("Job cleanup failed")
+
+
 # Domains that get a crawl every week. Every other crawl-enabled ontology domain is crawled monthly.
 # Override with the WEEKLY_CRAWL_DOMAINS app setting (comma-separated). "*" or "all" puts every domain
 # on the weekly schedule and leaves the monthly crawl with nothing to do.
-WEEKLY_CRAWL_DEFAULT = "sujeeth.org,topics.sujeeth.org"
-
-
 def _weekly_allowlist():
-    configured = os.getenv("WEEKLY_CRAWL_DOMAINS", WEEKLY_CRAWL_DEFAULT)
-    return {x.strip().lower() for x in configured.split(",") if x.strip()}
+    return settings.weekly_crawl_domains
 
 
 def _is_weekly_domain(domain, allowlist):
@@ -981,7 +917,7 @@ def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
       - the queue already holds more than INDEX_RECONCILE_MAX_QUEUE messages (default 500). That keeps
         one nightly run from starting on top of an unfinished one, and from piling onto a busy index.
     """
-    if os.getenv("INDEX_RECONCILE_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+    if not settings.index_reconcile_enabled:
         log.info("Nightly index reconcile is turned off (INDEX_RECONCILE_ENABLED)")
         return
     if (not settings.azure_storage_connection or not storage.container or not queue_processor
@@ -989,12 +925,8 @@ def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
         log.warning("Nightly index reconcile skipped: storage, search, or embeddings are not configured")
         return
     try:
-        queue = QueueClient.from_connection_string(
-            settings.azure_storage_connection,
-            settings.crawl_queue,
-            message_encode_policy=TextBase64EncodePolicy(),
-        )
-        limit = int(os.getenv("INDEX_RECONCILE_MAX_QUEUE", "500") or 500)
+        queue = queue_processor.queue
+        limit = settings.index_reconcile_max_queue
         waiting = int(queue.get_queue_properties().approximate_message_count or 0)
         if waiting > limit:
             log.warning("Nightly index reconcile skipped: the queue holds %d messages (limit %d)", waiting, limit)

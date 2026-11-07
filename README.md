@@ -30,7 +30,7 @@ All routes require a Function key and are under `/api`.
 | `POST /domain-resolution` | Show how a query resolves to concepts and domains |
 | `POST /document` | Read an indexed page. Body: `url` or `chunk_id`, optional `neighbors` (0–3, default 1), `max_chars` (500–20000, default 6000) |
 | `GET /sources` | Approved search sources |
-| `GET /index-status` | Blob document count and AI Search document count (lists all blobs; do not poll it every minute) |
+| `GET /index-status` | AI Search document count and the storage mode. Add `?count_blobs=true` to also count stored chunks, which lists every blob (slow; do not poll it) |
 
 `POST /document` returns the full page for domains in `FULL_TEXT_DOMAINS`. All other domains return an excerpt only (`EXCERPT_MAX_CHARS`) with `excerpt_only: true`. The domain must be approved by the ontology for search (403 otherwise). A page that is not in the index returns 404.
 
@@ -41,10 +41,10 @@ All routes require a Function key and are under `/api`.
 | `POST /crawl` | Start jobs. Optional body `{"domains": ["sujeeth.org"]}` |
 | `POST /crawl/all` | Start a job for every crawl-enabled domain without an active job |
 | `GET /crawl-status` | Recent jobs |
-| `GET /crawl-dashboard` | Every crawl-enabled domain with its latest job |
-| `GET /crawl/domain-stats` | Per-domain statistics |
+| `GET /crawl-dashboard` | Every crawl-enabled domain with its latest job, and the search index count |
+| `GET /crawl/domain-stats` | Per-domain totals, summed from the job counters of the jobs that are still kept. Does not read page rows |
 | `GET /crawl/{job_id}` | One job |
-| `GET /crawl/{job_id}/pages` | Page records for a job |
+| `GET /crawl/{job_id}/pages` | Page records for a job. Optional `?status=failed`, `?limit=N` (up to 10000), or `?summary=true` for counts by status and reason |
 | `POST /crawl/{job_id}/cancel` | Stop a job. Queued messages for it finish immediately |
 | `POST /crawl/{job_id}/resume` | Resume failed tasks |
 | `POST /crawl/{job_id}/reconcile` | Rebuild job counters from page records |
@@ -61,14 +61,14 @@ Note: the status and dashboard routes use a hyphen (`crawl-status`, `crawl-dashb
 | `POST /index/retag` | Queue a re-tag of stored documents with the current ontology. Updates Blob Storage and merges tags into the index. Uses no embedding quota. Body: optional `domains` |
 | `POST /index/purge-preview` | Read-only sample of how many stored chunks fall under the ontology's `exclude_paths` or outside its `include_paths`. Body: optional `domains`, `scan_limit` (max 1000) |
 | `POST /index/purge` | Queue a purge of stored chunks under excluded paths or outside an allow-list: removes them from the index and Blob Storage and clears their manifest rows. Body: optional `domains` |
-| `POST /refresh`, `POST /enrich`, `POST /reindex` | Legacy. `reindex` returns 409 and points to backfill |
 
 ## Scheduled jobs (UTC)
 
 | Function | Schedule | What it does |
 |---|---|---|
 | `scheduled_crawl_recovery` | Daily 10:00 | Reconciles and recovers unfinished jobs (up to 30 days old). Jobs that finished with errors are retried for 3 days only |
-| `scheduled_weekly_crawl` | Sundays 08:00 | Starts an incremental crawl for each domain in `WEEKLY_CRAWL_DOMAINS` (default `*`, every crawl-enabled domain). Skips domains that already have an open job |
+| `scheduled_job_cleanup` | Daily 11:30 | Deletes crawl jobs, and their page rows, that nothing has touched for `JOB_RETENTION_DAYS` (default 30). The newest job of each domain is always kept. At most 20 jobs per run |
+| `scheduled_weekly_crawl` | Sundays 08:00 | Starts an incremental crawl for each domain in `WEEKLY_CRAWL_DOMAINS` (default `sujeeth.org,topics.sujeeth.org`; `*` means every crawl-enabled domain). Skips domains that already have an open job. A job nobody has touched for `OPEN_JOB_STALE_DAYS` no longer counts as open |
 | `scheduled_index_reconcile` | Daily 11:00 | Queues a `missing`-mode backfill so any chunk that is stored but absent from the index gets indexed. Skipped when the queue already holds more than `INDEX_RECONCILE_MAX_QUEUE` messages or `INDEX_RECONCILE_ENABLED` is false |
 
 Incremental crawls use ETag and Last-Modified conditional requests and content hashes. Unchanged pages are not re-embedded or re-written, but every crawl still creates new job rows and queue messages for every page it visits.
@@ -101,7 +101,11 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `AZURE_SEARCH_BLOB_BACKED` | `false` | Set to `true` for an index created from `sf-knowledge-v2.index.json` (content not retrievable, vectors not stored). The index then keeps no retrievable text and no stored vector copy: every write replaces the whole document, search snippets and `/document` text are read from Blob Storage, and the retag re-uploads whole documents. Never use it with an index that has a stored vector copy turned on or that you did not create this way |
 | `INDEX_RECONCILE_ENABLED` | `true` | Set to `false` to turn the nightly reconcile off without redeploying |
 | `INDEX_RECONCILE_MAX_QUEUE` | `500` | The nightly reconcile is skipped when the queue holds more messages than this |
-| `WEEKLY_CRAWL_DOMAINS` | `*` | Comma-separated domains for the weekly crawl, or `*` for all. If this setting exists with a list, that list wins |
+| `WEEKLY_CRAWL_DOMAINS` | `sujeeth.org,topics.sujeeth.org` | Comma-separated domains for the weekly crawl, or `*` for all. Every other crawl-enabled domain is crawled monthly |
+| `JOB_RETENTION_DAYS` | `30` | Crawl jobs and their page rows untouched for this long are deleted by `scheduled_job_cleanup` (minimum 7). The newest job of each domain stays |
+| `JOB_CLEANUP_ENABLED` | `true` | Set to `false` to turn the job cleanup off |
+| `OPEN_JOB_STALE_DAYS` | `3` | A job with no update for this many days stops blocking a new crawl of its domain |
+| `ONTOLOGY_CACHE_SECONDS` | `120` | How long a successful ontology manifest or domain-concept answer is reused. `0` turns the cache off. A failed answer is never cached |
 | `FULL_TEXT_DOMAINS` | `sujeeth.org,topics.sujeeth.org` | Domains `/document` may return in full |
 | `EXCERPT_MAX_CHARS` | `3000` | Cap for every other domain |
 
@@ -167,7 +171,7 @@ python -m pytest -q tests
 - Tagging is deterministic (names and aliases), so untagged chunks are not searchable by concept.
 - Job counters are best-effort under heavy concurrency; use `reconcile` after partial failures.
 - The public-IP check is defense in depth, not a replacement for network egress controls.
-- `GET /api/index-status` and re-tag runs read every blob; avoid calling them in a loop.
+- Re-tag runs read every blob, and so does `GET /api/index-status?count_blobs=true`; avoid calling either in a loop.
 
 ## Version history (short)
 

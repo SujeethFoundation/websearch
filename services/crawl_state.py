@@ -1,5 +1,5 @@
 """Persistent crawl job and page state backed by Azure Table Storage + Queue Storage."""
-import hashlib, json, uuid, json
+import hashlib, itertools, json, uuid
 from datetime import datetime, timedelta, timezone
 from azure.data.tables import TableServiceClient, UpdateMode
 from azure.core import MatchConditions
@@ -69,9 +69,13 @@ class CrawlState:
         return rows
 
     def open_domains(self):
-        """Domains that have a job that is not finished. The table filters and returns two columns."""
+        """Domains with a job that is not finished and has moved recently. The table filters and returns two columns.
+
+        A job nobody has touched for OPEN_JOB_STALE_DAYS is treated as dead, so it cannot block its domain forever.
+        """
+        cutoff=(datetime.now(timezone.utc)-timedelta(days=settings.open_job_stale_days)).isoformat()
         flt=("PartitionKey eq 'jobs' and status ne 'completed' and status ne 'completed_with_errors' "
-             "and status ne 'failed' and status ne 'cancelled'")
+             f"and status ne 'failed' and status ne 'cancelled' and updated_utc ge '{cutoff}'")
         return {str(r.get('domain','')).lower() for r in self.jobs.query_entities(flt, select=['domain','status'])}
 
     def fail_job(self, job_id, error):
@@ -256,19 +260,66 @@ class CrawlState:
         except Exception: return None
 
     def manifest_put(self, domain, url, **values):
-        e={'PartitionKey':digest(domain),'RowKey':digest(url),'domain':domain,'url':url,'updated_utc':utcnow()}
+        e={'PartitionKey':digest(domain),'RowKey':digest(url),'domain':domain,'url':url,'updated_utc':utcnow(),
+           'status':'current'}  # a page that is seen again is current again
         e.update(values)
         self.manifest.upsert_entity(e,mode=UpdateMode.MERGE)
+
+    def manifest_mark_stale(self, record):
+        """Mark one manifest row stale. Only its keys are needed, so a record read with select works."""
+        self.manifest.upsert_entity({'PartitionKey':record['PartitionKey'],'RowKey':record['RowKey'],
+                                     'status':'stale','stale_detected_utc':utcnow()},mode=UpdateMode.MERGE)
 
     def manifest_delete(self, domain, url):
         try: self.manifest.delete_entity(digest(domain),digest(url))
         except Exception: pass
 
-    def manifest_for_domain(self, domain):
-        return list(self.manifest.query_entities(f"PartitionKey eq '{digest(domain)}'"))
+    def manifest_for_domain(self, domain, select=None):
+        """The domain's manifest rows, read a page at a time. Pass select to read only some columns."""
+        return self.manifest.query_entities(f"PartitionKey eq '{digest(domain)}'", select=select, results_per_page=500)
 
-    def page_records(self, job_id):
-        return list(self.pages.query_entities(f"PartitionKey eq '{job_id}'"))
+    def iter_page_records(self, job_id, select=None, where=None):
+        """A job's page rows, read a page at a time (a crawl can have 10,000). where is an extra table filter."""
+        query=f"PartitionKey eq '{job_id}'"+(f" and ({where})" if where else "")
+        return self.pages.query_entities(query, select=select, results_per_page=500)
+
+    def page_records(self, job_id, select=None, where=None, limit=None):
+        rows=self.iter_page_records(job_id, select=select, where=where)
+        return list(itertools.islice(rows, limit)) if limit else list(rows)
+
+    def purge_old_jobs(self, days=None, max_jobs=20):
+        """Delete crawl jobs, and their page rows, that nothing has touched for `days` days.
+
+        The newest job of every domain is always kept, so the dashboard still shows each domain's last crawl.
+        At most max_jobs jobs go per call; a daily timer catches up on a backlog.
+        """
+        days=days or settings.job_retention_days
+        cutoff=(datetime.now(timezone.utc)-timedelta(days=days)).isoformat()
+        newest={}; old=[]; total=0
+        for r in self.jobs.query_entities("PartitionKey eq 'jobs'", select=['RowKey','domain','created_utc','updated_utc']):
+            total+=1
+            domain=str(r.get('domain','')).lower(); created=r.get('created_utc','')
+            if domain not in newest or created>newest[domain][0]: newest[domain]=(created,r['RowKey'])
+            if (r.get('updated_utc') or created)<cutoff: old.append((created,r['RowKey']))
+        keep={job_id for _,job_id in newest.values()}
+        eligible=sorted(x for x in old if x[1] not in keep)
+        victims=eligible[:max_jobs]
+        pages_deleted=0
+        for _,job_id in victims:
+            pages_deleted+=self._delete_pages(job_id)
+            self.jobs.delete_entity('jobs',job_id)
+        return {"jobs_seen":total,"jobs_deleted":len(victims),"page_rows_deleted":pages_deleted,
+                "eligible_remaining":len(eligible)-len(victims),"cutoff_utc":cutoff}
+
+    def _delete_pages(self, job_id):
+        batch=[]; deleted=0
+        for row in self.iter_page_records(job_id, select=['PartitionKey','RowKey']):
+            batch.append(("delete",{'PartitionKey':job_id,'RowKey':row['RowKey']}))
+            if len(batch)==100:
+                self.pages.submit_transaction(batch); deleted+=len(batch); batch=[]
+        if batch:
+            self.pages.submit_transaction(batch); deleted+=len(batch)
+        return deleted
 
     def cancel_job(self, job_id):
         job=self.get_job(job_id)
@@ -283,20 +334,21 @@ class CrawlState:
         job = self.get_job(job_id)
         if not job:
             return None
-        pages = self.page_records(job_id)
         counts = {"queued": 0, "processing": 0, "processed": 0, "unchanged": 0, "skipped": 0, "failed": 0, "publish_failed": 0}
-        for page in pages:
+        total = 0
+        for page in self.iter_page_records(job_id, select=["status"]):
+            total += 1
             status = page.get("status", "queued")
             counts[status] = counts.get(status, 0) + 1
         pending = counts.get("queued", 0) + counts.get("processing", 0) + counts.get("publish_failed", 0)
         processed = counts.get("processed", 0) + counts.get("unchanged", 0)
         # Repair aggregate counters from the authoritative page table.
-        self._change(job_id, pending=pending, pages_discovered=len(pages), pages_processed=processed,
+        self._change(job_id, pending=pending, pages_discovered=total, pages_processed=processed,
                      pages_skipped=counts.get("skipped", 0), pages_failed=counts.get("failed", 0))
         if pending == 0 and job.get("status") not in ("cancelled", "failed"):
             final_status = "completed_with_errors" if counts.get("failed", 0) else "completed"
             self._change(job_id, status=final_status, completed_utc=utcnow())
-        return {"job_id": job_id, "page_count": len(pages), "page_states": counts,
+        return {"job_id": job_id, "page_count": total, "page_states": counts,
                 "expected_pending": pending, "previous_pending": int(job.get("pending", 0))}
 
     def _requeue_if_stale(self, job_id, page, now, stale_before):
@@ -352,12 +404,16 @@ class CrawlState:
         stale_before = now - timedelta(minutes=max(1, int(stale_minutes)))
         requeued = []
         publish_errors = []
-        for page in self.page_records(job_id):
-            url = page.get("url")
-            if not url or not self._requeue_if_stale(job_id, page, now, stale_before):
+        # Only pages that could need recovery are read, and only the two columns used. A finished page never does.
+        recoverable = "status eq 'queued' or status eq 'processing' or status eq 'publish_failed' or status eq 'failed'"
+        candidates = [(p["url"], int(p.get("depth", 0) or 0))
+                      for p in self.iter_page_records(job_id, select=["url", "depth", "status"], where=recoverable)
+                      if p.get("url")]
+        for url, depth in candidates:
+            if not self._requeue_if_stale(job_id, {"url": url}, now, stale_before):
                 continue
             try:
-                self._publish(job_id, job["domain"], url, int(page.get("depth", 0)))
+                self._publish(job_id, job["domain"], url, depth)
                 requeued.append(url)
             except Exception as exc:
                 self.mark_page(job_id, url, "publish_failed", error=str(exc)[:500])

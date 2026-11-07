@@ -86,11 +86,15 @@ class StorageService:
         names = [blob.name for blob in page]
         return names, pager.continuation_token
 
-    def status(self):
-        if self.container:
-            count = sum(1 for _ in self.container.list_blobs(name_starts_with="documents/"))
-        else:
-            count = sum(1 for _ in self.list("documents/"))
+    def status(self, count_blobs=False):
+        """Storage mode, and the number of stored chunks only if asked: counting lists every blob, which at
+        hundreds of thousands of chunks takes minutes and a lot of storage transactions."""
+        count = None
+        if count_blobs:
+            if self.container:
+                count = sum(1 for _ in self.container.list_blobs(name_starts_with="documents/"))
+            else:
+                count = sum(1 for _ in self.list("documents/"))
         return {
             "storage_mode": self.mode,
             "document_count": count,

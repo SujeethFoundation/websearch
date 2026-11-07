@@ -1,5 +1,5 @@
 """One-URL-at-a-time crawler worker. Queue retries make page work resumable."""
-import gc, hashlib, re, ipaddress, socket, time, json
+import gc, hashlib, logging, re, time, json
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
@@ -9,6 +9,10 @@ from services.config import settings
 from services.path_rules import PathPolicy
 from services.search_service import IndexBusyError
 from services.limits import TooLarge, chunk_groups, read_capped
+from services.sitemap import collect_sitemap_urls
+from services.urlutil import is_public_host, normalize_url, same_site
+
+log = logging.getLogger("sujeeth-web-search.page-worker")
 
 # HTTP statuses that retrying will not fix. 408/429/5xx are not listed and stay retryable.
 PERMANENT_HTTP_STATUSES = {400, 401, 403, 404, 405, 406, 410, 451}
@@ -31,21 +35,14 @@ class PageWorker:
 
     @staticmethod
     def normalize(url):
-        from services.crawler import Crawler
-        return Crawler._normalize_url(url)
+        return normalize_url(url)
 
     @staticmethod
     def same_site(url, domain):
-        from services.crawler import Crawler
-        return Crawler._same_site(url,domain)
+        return same_site(url,domain)
 
     def safe_public_host(self, host):
-        try:
-            for info in socket.getaddrinfo(host,None):
-                ip=ipaddress.ip_address(info[4][0])
-                if not ip.is_global: return False
-            return True
-        except Exception: return False
+        return is_public_host(host)
 
     def safe_get(self, url, domain, headers=None, stream=False):
         current=url
@@ -114,6 +111,20 @@ class PageWorker:
             # a large object tree, so collect after every page.
             gc.collect()
 
+    @staticmethod
+    def _join_capped(parts):
+        """Join text parts with spaces, and stop reading once there is well past what the chunk cap will keep.
+
+        The text is cut at MAX_CHUNKS_PER_PAGE * CHUNK_CHARS after whitespace is collapsed, so the raw text is read
+        to twice that to leave room for the whitespace. A 5 MB PDF is then not extracted in full for 700 KB of text.
+        """
+        cap=settings.max_chunks_per_page*settings.chunk_chars*2 if settings.max_chunks_per_page else 0
+        out=[]; used=0
+        for part in parts:
+            out.append(part); used+=len(part)+1
+            if cap and used>cap: break
+        return ' '.join(out)
+
     def _complete(self, job_id, url, claim_token, status='processed', page_fields=None, **increments):
         completed = self.state.complete_page(
             job_id, url, status=status, page_fields=page_fields,
@@ -141,15 +152,14 @@ class PageWorker:
                 self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'robots_disallowed'},pages_skipped=1); return {'status': 'completed'}
             if depth == 0:
                 # Discover sitemap URLs in the background worker, not the HTTP start request.
-                from services.crawler import Crawler
-                sitemap_crawler=Crawler(self.ontology,self.storage,self.search,self.resolver)
                 sitemap_seeds=[line.split(":",1)[1].strip() for line in robots_text.splitlines()
                                if line.strip().lower().startswith("sitemap:")]
                 # Apply the domain's path rules while collecting, so the sitemap URL cap is not spent on excluded sections.
-                sitemap_urls, _, _, _ = sitemap_crawler._sitemap_urls(
-                    domain, sitemap_seeds,
+                sitemap_urls, _, _ = collect_sitemap_urls(
+                    self.session, domain, sitemap_seeds,
                     keep=lambda u: not self.path_policy.is_excluded(domain, u),
-                    sitemap_filter=lambda u: self.path_policy.is_sitemap_allowed(domain, u))
+                    sitemap_filter=lambda u: self.path_policy.is_sitemap_allowed(domain, u),
+                    is_public=self.safe_public_host)
                 for sitemap_url in sitemap_urls:
                     if self.path_policy.is_excluded(domain,sitemap_url): continue
                     self.state.enqueue_page(job_id,domain,sitemap_url,1)
@@ -220,13 +230,13 @@ class PageWorker:
         elif kind=='pdf':
             from pypdf import PdfReader
             import io
-            page_type='pdf'; reader=PdfReader(io.BytesIO(raw)); text=' '.join((p.extract_text() or '') for p in reader.pages)
+            page_type='pdf'; reader=PdfReader(io.BytesIO(raw)); text=self._join_capped(pg.extract_text() or '' for pg in reader.pages)
             title=urlparse(final_url).path.rsplit('/',1)[-1]
             del reader, raw
         else:
             from docx import Document
             import io
-            page_type='docx'; doc=Document(io.BytesIO(raw)); text=' '.join(p.text for p in doc.paragraphs)
+            page_type='docx'; doc=Document(io.BytesIO(raw)); text=self._join_capped(p.text for p in doc.paragraphs)
             title=urlparse(final_url).path.rsplit('/',1)[-1]
             del doc, raw
         text=re.sub(r'\s+',' ',text).strip()
@@ -285,16 +295,15 @@ class PageWorker:
         if int(job.get('pages_failed',0)) or int(job.get('pages_skipped',0)) or int(job.get('pages_processed',0)) >= int(job.get('page_limit',0)):
             return
         removed_pages=0; removed_chunks=0
-        for record in self.state.manifest_for_domain(domain):
-            if record.get('last_seen_job') == job_id: continue
+        for record in self.state.manifest_for_domain(domain, select=['PartitionKey','RowKey','url','last_seen_job','status']):
+            if record.get('last_seen_job') == job_id or record.get('status') == 'stale': continue
             url=record.get('url')
             if not url: continue
             removed_chunks += self.search.delete_url(url)
-            record['status']='stale'; record['stale_detected_utc']=datetime.now(timezone.utc).isoformat()
             try:
-                from azure.data.tables import UpdateMode
-                self.state.manifest.upsert_entity(record, mode=UpdateMode.MERGE)
-            except Exception: pass
+                self.state.manifest_mark_stale(record)
+            except Exception:
+                log.warning("Could not mark manifest row stale for %s", url, exc_info=True)
             removed_pages += 1
         if removed_pages:
             self.state._change(job_id, stale_pages_removed=removed_pages, stale_chunks_removed=removed_chunks)

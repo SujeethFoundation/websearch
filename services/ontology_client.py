@@ -1,4 +1,8 @@
 
+import threading
+import time
+from urllib.parse import quote
+
 import requests
 from services.config import settings
 
@@ -10,6 +14,23 @@ class OntologyClient:
         self.session.headers.update({"Accept": "application/json"})
         if settings.ontology_function_key:
             self.session.headers["x-functions-key"] = settings.ontology_function_key
+        self._cache = {}  # key -> (expires, value); only successful answers are kept
+        self._cache_lock = threading.Lock()
+
+    def _cached(self, key, fetch):
+        """A successful answer, reused for ONTOLOGY_CACHE_SECONDS. A failure is raised and never cached."""
+        ttl = settings.ontology_cache_seconds
+        now = time.monotonic()
+        if ttl > 0:
+            with self._cache_lock:
+                hit = self._cache.get(key)
+            if hit and hit[0] > now:
+                return hit[1]
+        value = fetch()
+        if ttl > 0:
+            with self._cache_lock:
+                self._cache[key] = (now + ttl, value)
+        return value
 
     def _url(self, path):
         if not self.base:
@@ -42,10 +63,10 @@ class OntologyClient:
         return self.get("/api/ontology/relationships")
 
     def search_manifest(self):
-        return self.get("/api/ontology/search-manifest")
+        return self._cached("search-manifest", lambda: self.get("/api/ontology/search-manifest"))
 
     def crawl_manifest(self):
-        return self.get("/api/ontology/crawl-manifest")
+        return self._cached("crawl-manifest", lambda: self.get("/api/ontology/crawl-manifest"))
 
     def resolve_domains(self, concepts, purpose="search"):
         return self.post("/api/ontology/domain-resolution", {
@@ -62,8 +83,8 @@ class OntologyClient:
 
     def domain_concepts(self, domain):
         """Return the ontology-approved concept IDs associated with a crawl domain."""
-        from urllib.parse import quote
-        payload = self.get("/api/ontology/domains/" + quote(domain, safe="") + "/concepts")
+        payload = self._cached("domain-concepts:" + str(domain).lower(),
+                               lambda: self.get("/api/ontology/domains/" + quote(domain, safe="") + "/concepts"))
         if isinstance(payload, dict):
             values = payload.get("associated_concepts") or payload.get("concepts") or payload.get("domain_concepts") or []
             if isinstance(values, list):

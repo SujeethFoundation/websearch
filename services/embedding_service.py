@@ -1,6 +1,5 @@
 """Embedding client for the Azure OpenAI-compatible Microsoft Foundry endpoint."""
 import logging
-import os
 import threading
 import time
 
@@ -17,7 +16,7 @@ MAX_WAIT_SECONDS = 60
 # Indexing throttle. Spaces embedding calls at least this many seconds apart on each
 # running instance, so indexing leaves quota for search (the index vectorizer shares
 # this deployment). 0 disables it. Set EMBED_MIN_INTERVAL_SECONDS in app settings.
-MIN_INTERVAL_SECONDS = float(os.getenv("EMBED_MIN_INTERVAL_SECONDS", "0") or 0)
+MIN_INTERVAL_SECONDS = settings.embed_min_interval
 _throttle_lock = threading.Lock()
 _next_slot = 0.0
 
