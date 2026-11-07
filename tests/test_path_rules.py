@@ -3,6 +3,7 @@ import pytest
 
 from services.path_rules import (
     PathPolicy,
+    PathRulesUnavailable,
     is_blocked_url,
     is_excluded_path,
     is_excluded_url,
@@ -92,9 +93,10 @@ def test_policy_keeps_old_rules_when_the_ontology_cannot_be_read():
     assert policy.is_excluded("tealhq.com", "https://www.tealhq.com/job/x")
 
 
-def test_policy_allows_everything_if_the_ontology_never_answered():
+def test_policy_refuses_to_answer_if_the_ontology_never_answered():
     policy = PathPolicy(FakeOntology(fail=True))
-    assert not policy.is_excluded("tealhq.com", "https://www.tealhq.com/job/x")
+    with pytest.raises(PathRulesUnavailable):
+        policy.is_excluded("tealhq.com", "https://www.tealhq.com/job/x")
 
 
 

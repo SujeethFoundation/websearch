@@ -1,6 +1,6 @@
 """Persistent crawl job and page state backed by Azure Table Storage + Queue Storage."""
 import hashlib, json, uuid, json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from azure.data.tables import TableServiceClient, UpdateMode
 from azure.core import MatchConditions
 from azure.storage.queue import (
@@ -46,7 +46,7 @@ class CrawlState:
 
     def get_job(self, job_id):
         try:
-            e=self.jobs.get_entity('jobs',job_id); e.pop('odata.etag',None)
+            e=self.jobs.get_entity('jobs',job_id); e.pop('odata.etag',None); e['job_id']=job_id
             for k in ('allowed_concepts_json',):
                 if k in e:
                     try: e[k.replace('_json','')]=json.loads(e[k])
@@ -56,8 +56,26 @@ class CrawlState:
 
     def list_jobs(self, limit=100):
         rows=list(self.jobs.query_entities("PartitionKey eq 'jobs'"))
+        for r in rows: r['job_id']=r['RowKey']
         rows.sort(key=lambda x:x.get('created_utc',''), reverse=True)
         return rows[:limit]
+
+    def list_jobs_since(self, days):
+        """Jobs created in the last `days` days, newest first. The table filters, not the app."""
+        cutoff=(datetime.now(timezone.utc)-timedelta(days=days)).isoformat()
+        rows=list(self.jobs.query_entities(f"PartitionKey eq 'jobs' and created_utc ge '{cutoff}'"))
+        for r in rows: r['job_id']=r['RowKey']
+        rows.sort(key=lambda x:x.get('created_utc',''), reverse=True)
+        return rows
+
+    def open_domains(self):
+        """Domains that have a job that is not finished. The table filters and returns two columns."""
+        flt=("PartitionKey eq 'jobs' and status ne 'completed' and status ne 'completed_with_errors' "
+             "and status ne 'failed' and status ne 'cancelled'")
+        return {str(r.get('domain','')).lower() for r in self.jobs.query_entities(flt, select=['domain','status'])}
+
+    def fail_job(self, job_id, error):
+        return self._change(job_id, status='failed', error=str(error)[:500])
 
     def _change(self, job_id, **changes):
         # Table ETag retries protect counters from concurrent page workers.
@@ -167,7 +185,7 @@ class CrawlState:
             entity["status"] = "processing"
             entity["attempts"] = int(entity.get("attempts", 0)) + 1
             entity["lease_token"] = token
-            entity["lease_until_utc"] = (now + __import__('datetime').timedelta(minutes=lease_minutes)).isoformat()
+            entity["lease_until_utc"] = (now + timedelta(minutes=lease_minutes)).isoformat()
             entity["updated_utc"] = now.isoformat()
             try:
                 self.pages.update_entity(entity, mode=UpdateMode.REPLACE,
@@ -331,7 +349,6 @@ class CrawlState:
         if job.get("status") in ("cancelled", "failed"):
             return {"job_id": job_id, "status": job.get("status"), "requeued": 0, "message": "Job is not recoverable."}
         now = datetime.now(timezone.utc)
-        from datetime import timedelta
         stale_before = now - timedelta(minutes=max(1, int(stale_minutes)))
         requeued = []
         publish_errors = []

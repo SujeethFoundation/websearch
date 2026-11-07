@@ -392,10 +392,16 @@ class SearchService:
         return found
 
     def index_blobs(self, blob_names, only_missing=False, domains=None):
-        """Index stored chunks. With only_missing, chunks already in the index are left alone.
-        With domains, only chunks from those domains are considered.
+        """Index stored chunks. With only_missing, chunks already in the index are left alone and are never downloaded
+        (the chunk id is in the blob name). With domains, only chunks from those domains are considered.
         Stored vectors are reused, so a chunk is never embedded twice."""
         only = {str(x).lower() for x in (domains or []) if str(x).strip()}
+        already = 0
+        if only_missing and not only:
+            ids = {name: name.rsplit("/", 1)[-1].removesuffix(".json") for name in blob_names}
+            present = self._existing_ids(list(ids.values()))
+            already = len(present)
+            blob_names = [name for name, doc_id in ids.items() if doc_id not in present]
         docs = []
         for name in blob_names:
             doc = self.storage.get(name)
@@ -403,8 +409,7 @@ class SearchService:
                 if only and str(doc.get("domain") or "").lower() not in only:
                     continue
                 docs.append(doc)
-        already = 0
-        if only_missing and docs:
+        if only_missing and only and docs:
             present = self._existing_ids([d["id"] for d in docs])
             already = len(present)
             docs = [d for d in docs if str(d["id"]) not in present]

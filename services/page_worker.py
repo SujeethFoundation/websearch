@@ -2,6 +2,7 @@
 import gc, hashlib, re, ipaddress, socket, time, json
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
+from urllib.robotparser import RobotFileParser
 import requests
 from bs4 import BeautifulSoup
 from services.config import settings
@@ -25,6 +26,7 @@ class PageWorker:
         self.ontology,self.storage,self.search,self.resolver,self.state=ontology,storage,search,resolver,state
         self.path_policy=PathPolicy(ontology)
         self.defer_indexing=None  # set by the queue processor: queues a delayed indexing task
+        self._robots_cache={}  # scheme://host -> (expires, parser, text)
         self.session=requests.Session(); self.session.headers.update({'User-Agent':settings.crawler_user_agent})
 
     @staticmethod
@@ -63,6 +65,31 @@ class PageWorker:
                 continue
             return response
         raise PermanentPageError('redirect_limit','Redirect limit exceeded')
+
+    ROBOTS_TTL_SECONDS = 3600
+
+    def _robots(self, url, domain):
+        """(parser, text) for the URL's host, cached. parser is None when robots.txt denies access (401/403)."""
+        parts=urlparse(url)
+        key=f"{parts.scheme}://{parts.netloc}"
+        hit=self._robots_cache.get(key)
+        if hit and hit[0]>time.monotonic():
+            return hit[1], hit[2]
+        rr=self.safe_get(f"{key}/robots.txt",domain)
+        try:
+            if rr.status_code in (401,403):
+                parser,text=None,''
+            elif rr.status_code in (200,404):
+                text=rr.text if rr.status_code==200 else ''
+                parser=RobotFileParser(); parser.parse(text.splitlines())
+            elif rr.status_code>=500:
+                raise RuntimeError('robots.txt unavailable')
+            else:
+                raise RuntimeError(f'robots.txt returned HTTP {rr.status_code}')
+        finally:
+            rr.close()
+        self._robots_cache[key]=(time.monotonic()+self.ROBOTS_TTL_SECONDS,parser,text)
+        return parser,text
 
     def process(self, task):
         job_id, domain, url, depth = task['job_id'], task['domain'], self.normalize(task['url']), int(task.get('depth', 0))
@@ -105,23 +132,18 @@ class PageWorker:
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'path_excluded'}); return {'status': 'completed'}
         if not self.same_site(url,domain) or not self.safe_public_host(urlparse(url).hostname or ''):
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'off_site_or_non_public'},pages_skipped=1); return {'status': 'completed'}
-        # Require an explicit robots policy response for the actual host.
-        robots_url=f"{urlparse(url).scheme}://{urlparse(url).netloc}/robots.txt"
+        # Robots policy comes from a per-host cache; an unreachable robots.txt still retries the page.
         try:
-            rr=self.safe_get(robots_url,domain)
-            if rr.status_code in (401,403):
+            rp,robots_text=self._robots(url,domain)
+            if rp is None:
                 self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'robots_denied'},pages_skipped=1); return {'status': 'completed'}
-            if rr.status_code>=500: raise RuntimeError('robots.txt unavailable')
-            if rr.status_code not in (200,404): raise RuntimeError(f'robots.txt returned HTTP {rr.status_code}')
-            from urllib.robotparser import RobotFileParser
-            rp=RobotFileParser(); rp.parse(rr.text.splitlines() if rr.status_code==200 else [])
             if not rp.can_fetch(settings.crawler_user_agent,url):
                 self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'robots_disallowed'},pages_skipped=1); return {'status': 'completed'}
             if depth == 0:
                 # Discover sitemap URLs in the background worker, not the HTTP start request.
                 from services.crawler import Crawler
                 sitemap_crawler=Crawler(self.ontology,self.storage,self.search,self.resolver)
-                sitemap_seeds=[line.split(":",1)[1].strip() for line in rr.text.splitlines()
+                sitemap_seeds=[line.split(":",1)[1].strip() for line in robots_text.splitlines()
                                if line.strip().lower().startswith("sitemap:")]
                 # Apply the domain's path rules while collecting, so the sitemap URL cap is not spent on excluded sections.
                 sitemap_urls, _, _, _ = sitemap_crawler._sitemap_urls(
@@ -150,7 +172,14 @@ class PageWorker:
             self._complete(job_id,url,claim_token,'unchanged',pages_processed=1); self._finalize_if_safe(job_id,domain); return {'status': 'completed'}
         if response.status_code in PERMANENT_HTTP_STATUSES:
             response.close()
-            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':f'http_{response.status_code}'},pages_skipped=1); return {'status': 'completed'}
+            # A page we had indexed that is now gone (404/410) is removed from the index and is not counted
+            # as skipped, so it cannot block stale-page cleanup. A first-time 404 still counts as skipped.
+            gone = response.status_code in (404, 410) and bool(previous)
+            if gone:
+                self.search.delete_url(url)
+                self.state.manifest_delete(domain, url)
+            self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':f'http_{response.status_code}'},
+                           **({} if gone else {'pages_skipped':1})); return {'status': 'completed'}
         response.raise_for_status()
         final_url=self.normalize(response.url)
         if not self.same_site(final_url,domain):

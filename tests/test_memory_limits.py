@@ -69,7 +69,7 @@ class FakeState:
 
 class FakeOntology:
     def crawl_manifest(self):
-        return {"crawl_domains": []}
+        return {"crawl_domains": [{"domain": "example.org"}]}
 
 
 class FakeResolver:

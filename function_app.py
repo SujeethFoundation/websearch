@@ -605,131 +605,76 @@ def _crawl_limits(item=None):
     return settings.page_limit_for(domain), max(0, settings.max_crawl_depth)
 
 
+def _entry_domain(item):
+    return str(item.get("domain") if isinstance(item, dict) else item).lower().strip()
+
+
+def _start_crawls(label, wanted, entries=None):
+    """Start one job per crawl-enabled domain that wanted(domain) accepts and that has no open job.
+
+    Returns (created, skipped). Used by POST /crawl, POST /crawl/all and the scheduled crawls.
+    """
+    if not crawl_state:
+        raise RuntimeError("Persistent crawl infrastructure is not configured.")
+    if entries is None:
+        entries = ontology.crawl_manifest().get("crawl_domains", [])
+    open_domains = crawl_state.open_domains()
+    created, skipped = [], []
+    for item in entries:
+        domain = _entry_domain(item)
+        if not domain or not wanted(domain):
+            continue
+        if domain in open_domains:
+            skipped.append({"domain": domain, "reason": "An active crawl already exists."})
+            continue
+        cap, depth = _crawl_limits(item)
+        concepts = ontology.domain_concepts(domain)
+        job_id = crawl_state.create_job(domain, cap, depth, concepts)
+        # Only the homepage is queued here. The worker finds the sitemap URLs.
+        if crawl_state.enqueue_pages(job_id, domain, [(f"https://{domain}/", 0)]):
+            open_domains.add(domain)
+            created.append({"job_id": job_id, "domain": domain, "status": "queued",
+                            "page_limit": cap, "max_depth": depth, "allowed_concepts": concepts})
+            log.info("%s crawl started domain=%s job=%s", label, domain, job_id)
+        else:
+            crawl_state.fail_job(job_id, "Could not enqueue homepage.")
+            skipped.append({"domain": domain, "job_id": job_id, "reason": "Homepage could not be queued."})
+            log.error("%s crawl could not enqueue homepage for %s", label, domain)
+    return created, skipped
+
+
 @app.route(route="crawl", methods=["POST"])
 def crawl_start(req):
-    """Create persistent page-level crawl jobs. Work is executed by the Storage Queue trigger."""
+    """Create page-level crawl jobs. Work is executed by the Storage Queue trigger."""
     if not crawl_state:
-        return response({"error":"Persistent crawl infrastructure is not configured. Set AzureWebJobsStorage and deploy the required storage dependencies."},503)
-    body=read_body(req)
-    requested={str(x).lower().strip() for x in (body.get("domains") or []) if str(x).strip()}
+        return response({"error": "Persistent crawl infrastructure is not configured."}, 503)
+    requested = {str(x).lower().strip() for x in (read_body(req).get("domains") or []) if str(x).strip()}
     try:
-        manifest=ontology.crawl_manifest(); entries=manifest.get("crawl_domains",[])
-        allowed={str(x.get("domain") if isinstance(x,dict) else x).lower() for x in entries}
-        rejected=sorted(requested-allowed)
-        if rejected: return response({"error":"Domains are not crawl-enabled in ontology","rejected_domains":rejected},403)
-        targets=[x for x in entries if (not requested or str(x.get("domain") if isinstance(x,dict) else x).lower() in requested)]
-        created=[]
-        for item in targets:
-            domain=str(item.get("domain") if isinstance(item,dict) else item).lower()
-            cap,depth=_crawl_limits(item)
-            concepts=ontology.domain_concepts(domain)
-            job_id=crawl_state.create_job(domain,cap,depth,concepts)
-            # Enqueue only the homepage here. The queue worker discovers and registers
-            # sitemap URLs before it marks the homepage task complete.
-            seeds=[(f"https://{domain}/",0)]
-            queued=crawl_state.enqueue_pages(job_id,domain,seeds)
-            if not queued:
-                crawl_state._change(job_id,status="failed",error="Could not enqueue any seed URLs")
-            created.append({"job_id":job_id,"domain":domain,"status":"queued","page_limit":cap,"max_depth":depth,"allowed_concepts":concepts})
-        return response({"status":"queued","job_count":len(created),"jobs":created,"message":"Page-level crawl tasks are running in Azure Storage Queue workers."},202)
+        entries = ontology.crawl_manifest().get("crawl_domains", [])
+        rejected = sorted(requested - {_entry_domain(x) for x in entries})
+        if rejected:
+            return response({"error": "Domains are not crawl-enabled in ontology", "rejected_domains": rejected}, 403)
+        created, skipped = _start_crawls("Manual", lambda d: not requested or d in requested, entries)
+        return response({"status": "queued" if created else "nothing_started", "job_count": len(created),
+                         "skipped_count": len(skipped), "jobs": created, "skipped": skipped}, 202)
     except Exception as exc:
-        log.exception("Could not create crawl jobs"); return response({"error":str(exc)},502)
+        log.exception("Could not create crawl jobs")
+        return response({"error": str(exc)}, 502)
+
 
 @app.route(route="crawl/all", methods=["POST"])
 def crawl_all(req):
-    """Start persistent crawl jobs for all ontology-approved domains."""
-    if not crawl_state:
-        return response({
-            "error": "Persistent crawl infrastructure is not configured."
-        }, 503)
-
+    """Start crawl jobs for every crawl-enabled domain that has no open job."""
     try:
-        manifest = ontology.crawl_manifest()
-        entries = manifest.get("crawl_domains", [])
-
-        if not entries:
-            return response({
-                "status": "nothing_to_crawl",
-                "job_count": 0,
-                "message": "No crawl-enabled domains found."
-            })
-
-        existing_jobs = crawl_state.list_jobs(1000)
-
-        # Do not start a second job for a domain with an active crawl.
-        active_statuses = {"queued", "running", "processing"}
-        active_domains = {
-            str(job.get("domain", "")).lower()
-            for job in existing_jobs
-            if job.get("status") in active_statuses
-        }
-
-        created = []
-        skipped = []
-
-        for item in entries:
-            domain = str(
-                item.get("domain") if isinstance(item, dict) else item
-            ).lower().strip()
-
-            if not domain:
-                continue
-
-            if domain in active_domains:
-                skipped.append({
-                    "domain": domain,
-                    "reason": "An active crawl already exists."
-                })
-                continue
-
-            cap, depth = _crawl_limits(item)
-
-            concepts = ontology.domain_concepts(domain)
-
-            job_id = crawl_state.create_job(
-                domain, cap, depth, concepts
-            )
-
-            queued = crawl_state.enqueue_pages(
-                job_id,
-                domain,
-                [(f"https://{domain}/", 0)]
-            )
-
-            if not queued:
-                crawl_state._change(
-                    job_id,
-                    status="failed",
-                    error="Could not enqueue homepage."
-                )
-                skipped.append({
-                    "domain": domain,
-                    "job_id": job_id,
-                    "reason": "Homepage could not be queued."
-                })
-                continue
-
-            created.append({
-                "job_id": job_id,
-                "domain": domain,
-                "status": "queued",
-                "page_limit": cap,
-                "max_depth": depth,
-                "allowed_concepts": concepts
-            })
-
-        return response({
-            "status": "queued",
-            "job_count": len(created),
-            "skipped_count": len(skipped),
-            "jobs": created,
-            "skipped": skipped,
-            "message": "Bulk crawl jobs submitted to Azure Storage Queue."
-        }, 202)
-
+        created, skipped = _start_crawls("Manual", lambda d: True)
+        return response({"status": "queued" if created else "nothing_started", "job_count": len(created),
+                         "skipped_count": len(skipped), "jobs": created, "skipped": skipped}, 202)
+    except RuntimeError as exc:
+        return response({"error": str(exc)}, 503)
     except Exception as exc:
         log.exception("Bulk crawl failed")
         return response({"error": str(exc)}, 502)
+
 
 @app.route(route="crawl-status", methods=["GET"])
 def crawl_status(req):
@@ -965,7 +910,7 @@ def scheduled_crawl_recovery(timer: func.TimerRequest) -> None:
         log.error("Scheduled recovery skipped: crawl state is not configured")
         return
     examined = 0
-    for job in crawl_state.list_jobs(100):
+    for job in crawl_state.list_jobs_since(30):
         status = job.get("status")
         age = _job_age_days(job)
         # Unfinished jobs are recovered for up to 30 days. Jobs that finished with
@@ -1003,60 +948,26 @@ def _is_weekly_domain(domain, allowlist):
     return bool(allowlist & {"*", "all"}) or domain in allowlist
 
 
-def _start_scheduled_crawls(label, wanted):
-    """Start an incremental crawl for each crawl-enabled ontology domain that wanted(domain) accepts.
-
-    ETag/Last-Modified checks and content hashes skip unchanged pages, so every run walks the whole
-    domain but only re-embeds and re-indexes what changed. Each domain is limited to MAX_PAGES_PER_DOMAIN
-    pages. A domain with a job still open is skipped.
-    """
-    if not crawl_state:
-        log.error("%s crawl skipped: crawl state is not configured", label)
-        return
-    open_domains = {
-        str(j.get("domain", "")).lower()
-        for j in crawl_state.list_jobs(1000)
-        if j.get("status") not in _TERMINAL_JOB_STATUSES
-    }
-    try:
-        entries = ontology.crawl_manifest().get("crawl_domains", [])
-    except Exception:
-        log.exception("%s crawl: could not read ontology crawl manifest", label)
-        return
-    started = 0
-    for item in entries:
-        domain = str(item.get("domain") if isinstance(item, dict) else item).lower().strip()
-        if not domain or not wanted(domain):
-            continue
-        if domain in open_domains:
-            log.warning("%s crawl: skipping %s, a job is still open", label, domain)
-            continue
-        try:
-            cap, depth = _crawl_limits(item)
-            job_id = crawl_state.create_job(domain, cap, depth, ontology.domain_concepts(domain))
-            if crawl_state.enqueue_pages(job_id, domain, [(f"https://{domain}/", 0)]):
-                started += 1
-                log.info("%s crawl started domain=%s job=%s", label, domain, job_id)
-            else:
-                crawl_state._change(job_id, status="failed", error="Could not enqueue homepage.")
-                log.error("%s crawl could not enqueue homepage for %s", label, domain)
-        except Exception:
-            log.exception("%s crawl failed to start for %s", label, domain)
-    log.info("%s crawl finished starting jobs; domains started: %d", label, started)
-
-
 @app.timer_trigger(schedule="0 0 8 * * 0", arg_name="timer", run_on_startup=False)
 def scheduled_weekly_crawl(timer: func.TimerRequest) -> None:
     """Sundays 08:00 UTC: incremental crawl of the domains in WEEKLY_CRAWL_DOMAINS."""
     allowlist = _weekly_allowlist()
-    _start_scheduled_crawls("Weekly", lambda domain: _is_weekly_domain(domain, allowlist))
+    try:
+        created, skipped = _start_crawls("Weekly", lambda d: _is_weekly_domain(d, allowlist))
+        log.info("Weekly crawl: started=%d skipped=%d", len(created), len(skipped))
+    except Exception:
+        log.exception("Weekly crawl could not start")
 
 
 @app.timer_trigger(schedule="0 0 9 1 * *", arg_name="timer", run_on_startup=False)
 def scheduled_monthly_crawl(timer: func.TimerRequest) -> None:
     """1st of each month, 09:00 UTC: incremental crawl of every crawl-enabled domain that is not weekly."""
     allowlist = _weekly_allowlist()
-    _start_scheduled_crawls("Monthly", lambda domain: not _is_weekly_domain(domain, allowlist))
+    try:
+        created, skipped = _start_crawls("Monthly", lambda d: not _is_weekly_domain(d, allowlist))
+        log.info("Monthly crawl: started=%d skipped=%d", len(created), len(skipped))
+    except Exception:
+        log.exception("Monthly crawl could not start")
 
 
 @app.timer_trigger(schedule="0 0 11 * * *", arg_name="timer", run_on_startup=False)
