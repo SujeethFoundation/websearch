@@ -35,21 +35,6 @@ def _csv(name, default):
     return tuple(x.strip().lower() for x in os.getenv(name, default).split(",") if x.strip())
 
 
-def parse_limits(raw):
-    """Parse "host=500,other.org=200" into {"host": 500, "other.org": 200}. Bad or non-positive entries are ignored."""
-    limits = {}
-    for part in str(raw or "").split(","):
-        host, _, value = part.partition("=")
-        host = host.strip().lower()
-        try:
-            number = int(value.strip())
-        except ValueError:
-            continue
-        if host and number > 0:
-            limits[host] = number
-    return limits
-
-
 class Settings:
     ontology_api_url = os.getenv("ONTOLOGY_API_URL", "").rstrip("/")
     ontology_function_key = os.getenv("ONTOLOGY_FUNCTION_KEY", "")
@@ -100,8 +85,6 @@ class Settings:
     max_pages = int(os.getenv("MAX_PAGES_PER_DOMAIN", "10000"))
     max_crawl_depth = int(os.getenv("MAX_CRAWL_DEPTH", "5"))
     crawl_delay = float(os.getenv("CRAWL_DELAY_SECONDS", "0.5"))
-    # Per-domain overrides of MAX_PAGES_PER_DOMAIN, e.g. MAX_PAGES_BY_DOMAIN="www.themuse.com=500" (host=limit, comma separated).
-    page_limits = parse_limits(os.getenv("MAX_PAGES_BY_DOMAIN", ""))
     max_sitemaps = int(os.getenv("MAX_SITEMAPS_PER_DOMAIN", "100"))
     # Memory guards (see services/limits.py). HTML takes about 35x its size in memory to parse, so it has
     # the lowest cap. MAX_PAGE_BYTES stays the ceiling for every kind. MAX_CHUNKS_PER_PAGE of 0 means no limit.
@@ -140,17 +123,12 @@ class Settings:
     # How long the ontology client keeps a successful manifest or domain-concept answer.
     ontology_cache_seconds = _int("ONTOLOGY_CACHE_SECONDS", 120, 0)
 
-    def page_limit_for(self, domain):
-        """Pages per domain: the domain's MAX_PAGES_BY_DOMAIN entry (apex or www), else MAX_PAGES_PER_DOMAIN.
+    def page_limit_for(self, domain=None):
+        """Pages per domain: MAX_PAGES_PER_DOMAIN, the same for every domain.
 
-        This one number caps the crawl job's total pages and also the page URLs collected from sitemaps.
+        This one number caps a crawl job's total pages and also the page URLs collected from sitemaps.
+        The domain is accepted so callers need not change; it does not affect the answer.
         """
-        host = str(domain or "").lower().strip().strip(".")
-        host = host.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
-        apex = host[4:] if host.startswith("www.") else host
-        for name in (host, apex, "www." + apex):
-            if name in self.page_limits:
-                return self.page_limits[name]
         return max(1, self.max_pages)
 
     embedding_configured = bool(embedding_endpoint and embedding_key and embedding_deployment)

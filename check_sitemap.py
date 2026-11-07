@@ -83,7 +83,7 @@ def main():
     ap.add_argument("--include", action="append", default=[], help="allow-list path rule, repeatable (e.g. /advice)")
     ap.add_argument("--max-urls", type=int, default=None,
                     help="page limit for the domain, which caps the crawl's total pages and the page URLs collected from sitemaps; "
-                         "default: its MAX_PAGES_BY_DOMAIN entry, else MAX_PAGES_PER_DOMAIN, else 10000 (read from your shell environment)")
+                         "default: MAX_PAGES_PER_DOMAIN, else 10000 (read from your shell environment)")
     ap.add_argument("--max-sitemaps", type=int, default=100)
     ap.add_argument("--max-bytes", type=int, default=10_000_000, help="crawler MAX_SITEMAP_BYTES (default 10,000,000)")
     ap.add_argument("--time-budget", type=int, default=300, help="stop fetching after this many seconds and report what was found")
@@ -101,15 +101,11 @@ def main():
     apex = host[4:] if host.startswith("www.") else host
     hosts = sorted({apex, "www." + apex})
 
-    # Same rule as the crawler (services/config.py page_limit_for): the domain's MAX_PAGES_BY_DOMAIN entry, else MAX_PAGES_PER_DOMAIN.
+    # Same rule as the crawler (services/config.py page_limit_for): MAX_PAGES_PER_DOMAIN, the same for every domain.
     source = "--max-urls" if args.max_urls else "default"
     if not args.max_urls:
         args.max_urls = int(os.environ.get("MAX_PAGES_PER_DOMAIN", "10000") or 10000)
         source = "MAX_PAGES_PER_DOMAIN environment variable" if os.environ.get("MAX_PAGES_PER_DOMAIN") else "default 10000 (your deployed MAX_PAGES_PER_DOMAIN)"
-        for part in os.environ.get("MAX_PAGES_BY_DOMAIN", "").split(","):
-            name, _, value = part.partition("=")
-            if name.strip().lower() in hosts and value.strip().isdigit() and int(value) > 0:
-                args.max_urls, source = int(value), "MAX_PAGES_BY_DOMAIN environment variable"
     print(f"Page limit used: {args.max_urls} ({source})")
     base = (lambda h: args.base.rstrip("/")) if args.base else (lambda h: f"https://{h}")
 

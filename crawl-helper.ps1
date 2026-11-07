@@ -310,7 +310,7 @@ function Start-Crawl([string]$Domain, [switch]$Wait) {
     $r.jobs | ForEach-Object {
         [pscustomobject]@{ Domain = $_.domain; Status = $_.status; PageLimit = $_.page_limit; MaxDepth = $_.max_depth; JobId = $_.job_id }
     } | Format-Table -AutoSize -Wrap | Out-Host
-    Write-Host "Check PageLimit: it should be MAX_PAGES_PER_DOMAIN, or this domain's MAX_PAGES_BY_DOMAIN entry if it has one."
+    Write-Host "Check PageLimit: it should be MAX_PAGES_PER_DOMAIN. A job keeps the limit it started with, so after changing that setting, start a new crawl."
     if ($Wait) { Start-Sleep -Seconds 3; Wait-Crawl $Domain }
 }
 

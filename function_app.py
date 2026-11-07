@@ -194,7 +194,6 @@ def health(req):
         "persistent_crawl_jobs": bool(crawl_state),
         "crawl_queue": settings.crawl_queue,
         "max_pages_per_domain": settings.max_pages,
-        "max_pages_by_domain": settings.page_limits,
         "max_crawl_depth": settings.max_crawl_depth,
         "search_mode": "azure_ai_search_hybrid" if settings.search_configured and settings.embedding_configured else "not_configured",
     })
@@ -547,7 +546,7 @@ def _crawl_limits(item=None):
     """Page cap and depth for a crawl job.
 
     Crawl size is an operational setting of this app, not ontology content. The limits come
-    from MAX_PAGES_PER_DOMAIN (or the domain's entry in MAX_PAGES_BY_DOMAIN) and MAX_CRAWL_DEPTH
+    from MAX_PAGES_PER_DOMAIN (the same for every domain) and MAX_CRAWL_DEPTH
     in the app settings, and the ontology only decides which domains may be crawled. The page cap
     also limits how many page URLs are collected from sitemaps.
     """

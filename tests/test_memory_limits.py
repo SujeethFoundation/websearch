@@ -281,32 +281,25 @@ def test_sitemap_filter_skips_unwanted_child_sitemaps_without_fetching_them(monk
     assert "https://example.org/sitemaps/advice.xml" in fetched
 
 
-def test_a_domain_specific_page_limit_overrides_the_global_one(monkeypatch):
-    ns = 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
-    body = (f"<urlset {ns}>" + "".join(f"<url><loc>https://example.org/advice/{i}</loc></url>" for i in range(10)) + "</urlset>").encode()
-    pages = {"https://example.org/sitemap.xml": FakeResponse(body=body)}
-    monkeypatch.setattr(settings, "max_pages", 5000)
-    monkeypatch.setattr(settings, "page_limits", {"www.example.org": 3})
-    found, _, _ = collect(pages)
-    assert len(found) == 3                                  # the limit is matched through the www variant
-    monkeypatch.setattr(settings, "page_limits", {"other.org": 3})
-    found, _, _ = collect(pages)
-    assert len(found) == 10                                 # other domains keep the global limit
+def test_every_domain_gets_the_same_page_limit(monkeypatch):
+    monkeypatch.setattr(settings, "max_pages", 1234)
+    for name in ("www.themuse.com", "themuse.com", "https://www.themuse.com/", "tealhq.com", "", None):
+        assert settings.page_limit_for(name) == 1234
+    monkeypatch.setattr(settings, "max_pages", 0)
+    assert settings.page_limit_for("tealhq.com") == 1                      # never below one page
 
 
-def test_page_limit_for_matches_apex_and_www_and_falls_back_to_the_global_limit(monkeypatch):
-    monkeypatch.setattr(settings, "max_pages", 10000)
-    monkeypatch.setattr(settings, "page_limits", {"www.themuse.com": 500})
-    for name in ("www.themuse.com", "themuse.com", "https://www.themuse.com/", "THEMUSE.com"):
-        assert settings.page_limit_for(name) == 500
-    assert settings.page_limit_for("tealhq.com") == 10000
-    assert settings.page_limit_for(None) == 10000
-
-
-def test_parse_limits_ignores_bad_entries():
-    from services.config import parse_limits
-    assert parse_limits("www.themuse.com=500, Other.ORG = 200, bad, x=0, y=abc, =5") == {"www.themuse.com": 500, "other.org": 200}
-    assert parse_limits("") == {}
+def test_the_limit_is_read_from_MAX_PAGES_PER_DOMAIN_and_a_leftover_MAX_PAGES_BY_DOMAIN_is_ignored():
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    code = ("from services.config import settings as s; "
+            "print(s.page_limit_for('www.themuse.com'), s.page_limit_for('tealhq.com'), hasattr(s, 'page_limits'))")
+    env = {**os.environ, "MAX_PAGES_PER_DOMAIN": "1234", "MAX_PAGES_BY_DOMAIN": "www.themuse.com=500"}
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                         cwd=Path(__file__).resolve().parent.parent)
+    assert out.stdout.split() == ["1234", "1234", "False"], out.stderr
 
 
 # ---------------------------------------------------------------- job page limit
