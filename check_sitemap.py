@@ -10,7 +10,8 @@ Read-only: it only fetches robots.txt and sitemap files. Needs `requests` (alrea
 
 Reading the result:
   - "OLD behavior" is what the crawler does today: the cap fills in sitemap order, then the path filter runs.
-  - "PATCHED behavior" applies the include rule while collecting (the sitemap_cap_fix.patch).
+  - "PATCHED behavior" applies the include rule while collecting. This is what the crawler does now. A URL listed
+    more than once counts once toward the limit.
   - If OLD finds few or no matching URLs and PATCHED finds many, the sitemap cap was the problem.
 """
 import argparse
@@ -217,7 +218,9 @@ def main():
         print(f"  NOTE: {len(candidates)} sitemap files were never opened because the sitemap-file limit was reached.")
 
     total = len(ordered)
-    print(f"\nPage URLs found in the visited sitemaps: {total}")
+    unique = list(dict.fromkeys(u for u, _ in ordered))
+    print(f"\nPage URLs found in the visited sitemaps: {total}"
+          + (f" ({total - len(unique)} listed more than once; the crawler counts each once)" if total != len(unique) else ""))
     first_cap = ordered[: args.max_urls]
     print(f"\nOLD behavior (cap {args.max_urls} in sitemap order, filter afterward)")
     seg = Counter((urlparse(u).path.strip("/").split("/")[0] or "(home)") for u, _ in first_cap)
@@ -227,7 +230,7 @@ def main():
         print(f"  URLs matching {rules} inside the cap: {len(kept_old)}")
         pos = next((i for i, (u, _) in enumerate(ordered) if matches(urlparse(u).path, rules)), None)
         print("  first matching URL appears at position:", "never" if pos is None else f"{pos + 1} of {total}")
-        kept_new = [u for u, _ in ordered if matches(urlparse(u).path, rules)][: args.max_urls]
+        kept_new = list(dict.fromkeys(u for u, _ in ordered if matches(urlparse(u).path, rules)))[: args.max_urls]
         print(f"\nPATCHED behavior (filter while collecting)\n  URLs matching {rules}: {len(kept_new)}"
               + (f"  (limit of {args.max_urls} reached; the sitemap lists more)" if len(kept_new) >= args.max_urls else ""))
         if args.show and kept_new:

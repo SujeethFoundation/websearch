@@ -2,8 +2,6 @@
 
 Azure Functions app (Python v2) that crawls ontology-approved websites, stores the text in Blob Storage, indexes it in Azure AI Search, and serves ontology-gated search to the MCP server and other clients.
 
-For the AI Search index contract and first-time setup, see [README-AI-SEARCH.md](README-AI-SEARCH.md).
-
 ## How it fits together
 
 | Piece | Role |
@@ -12,7 +10,7 @@ For the AI Search index contract and first-time setup, see [README-AI-SEARCH.md]
 | Blob Storage (`documents/`) | Durable copy of every chunk (JSON). The index can be rebuilt from it. |
 | Table Storage | Crawl jobs, page state, and the cross-crawl URL manifest. |
 | Queue Storage | One message per page to crawl, plus backfill and re-tag tasks. Failed tasks go to the poison queue. |
-| Azure AI Search (`sf-knowledge`) | Hybrid keyword + vector retrieval. The **index's vectorizer** turns query text into a vector, using the same Azure OpenAI embedding deployment that indexing uses. |
+| Azure AI Search (`sf-knowledge-v2`) | Hybrid keyword + vector retrieval. The **index's vectorizer** turns query text into a vector, using the same Azure OpenAI embedding deployment that indexing uses. |
 | Azure OpenAI / Foundry (`sf-embeddings`) | Embeds chunks at indexing time. |
 
 Every search must resolve to ontology concepts and approved domains first. If no concept matches, nothing is searched.
@@ -83,7 +81,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `BLOB_STORAGE_CONNECTION_STRING`, `BLOB_CONTAINER` | none, `web-content` | Chunk storage |
 | `CRAWL_QUEUE_NAME`, `CRAWL_POISON_QUEUE_NAME` | `web-crawl-pages`, `web-crawl-pages-poison` | Queues |
 | `ONTOLOGY_API_URL`, `ONTOLOGY_FUNCTION_KEY` | none | Ontology app |
-| `AZURE_SEARCH_ENDPOINT`, `AZURE_SEARCH_API_KEY`, `AZURE_SEARCH_INDEX_NAME`, `AZURE_SEARCH_API_VERSION` | see README-AI-SEARCH | AI Search (admin key) |
+| `AZURE_SEARCH_ENDPOINT`, `AZURE_SEARCH_API_KEY`, `AZURE_SEARCH_INDEX_NAME`, `AZURE_SEARCH_API_VERSION` | the endpoint, `sf-knowledge-v2` (the live index) and `2025-09-01`; no key | AI Search (admin key) |
 | `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`, `AZURE_OPENAI_EMBEDDING_DIMENSIONS` | `sf-embeddings`, `v1`, `1536` | Embeddings |
 | `MAX_PAGES_PER_DOMAIN` | `10000` | Page cap per domain, for every domain |
 | `MAX_CRAWL_DEPTH` | `5` | Link depth |
@@ -98,7 +96,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `INDEX_MAX_DEFERRALS` | `12` | How many times a deferred indexing task is re-queued before it fails normally |
 | `AZURE_SEARCH_VECTOR_FIELD` | `contentVector` | The vector field that receives chunk vectors and is searched |
 | `AZURE_SEARCH_NULL_VECTOR_FIELDS` | none | Comma-separated old vector fields that are set to null on every chunk write, so a migrated chunk stops using the old field's quota |
-| `AZURE_SEARCH_BLOB_BACKED` | `false` | Set to `true` for an index created from `sf-knowledge-v2.index.json` (content not retrievable, vectors not stored). The index then keeps no retrievable text and no stored vector copy: every write replaces the whole document, search snippets and `/document` text are read from Blob Storage, and the retag re-uploads whole documents. Never use it with an index that has a stored vector copy turned on or that you did not create this way |
+| `AZURE_SEARCH_BLOB_BACKED` | `true` | On for the live index, `sf-knowledge-v2` (binary quantization, content not retrievable, vectors not stored). With it on, the index keeps no retrievable text and no stored vector copy: every write replaces the whole document, search snippets and `/document` text are read from Blob Storage, and the retag re-uploads whole documents. Set it to `false` only for an index that keeps retrievable content and a stored vector copy, and never leave it on for one |
 | `INDEX_RECONCILE_ENABLED` | `true` | Set to `false` to turn the nightly reconcile off without redeploying |
 | `INDEX_RECONCILE_MAX_QUEUE` | `500` | The nightly reconcile is skipped when the queue holds more messages than this |
 | `WEEKLY_CRAWL_DOMAINS` | `sujeeth.org,topics.sujeeth.org` | Comma-separated domains for the weekly crawl, or `*` for all. Every other crawl-enabled domain is crawled monthly |
@@ -121,7 +119,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 - **Allowed paths.** A domain's `crawl_policy.include_paths` (for example `["/career-advice"]`) limits the crawl to those sections. It uses the same rule format as `exclude_paths`, and the two combine: with an allow-list, only matching paths are crawled, and `exclude_paths` still wins (allow `/career-advice`, block `/career-advice/news`). The bare homepage (no query string) is always allowed, because the crawl starts there to find sitemaps and links; its query variants such as `/?from=nav` are not. A bare `/` is ignored in either list. Without `include_paths`, nothing is limited. Deploy this code before adding `include_paths` to the ontology: older code ignores the key and would crawl the whole site. `index/purge-preview` and `index/purge` also remove stored chunks outside an allow-list, and `blob_paths_report.py` flags them.
 - **Vectors are stored and a busy index never fails a crawl.** Each chunk is embedded once, and its vector is saved as `vectors/<id>.json` next to the chunk. If the search service stays busy (429 or 503) through every retry, the page is still marked processed (`index_deferred`), and a delayed `index_blob_batch` task indexes the stored chunks later: after 2, 5, 10, 20, and 30 minutes, then hourly, up to `INDEX_MAX_DEFERRALS` times. Nothing is fetched or embedded again. A page whose indexing is deferred is missing from search until that task succeeds, and `POST /api/index/backfill` indexes anything still stored but missing.
 - **Backfill** compares Blob Storage with the index and, in the default `missing` mode, indexes only the chunks that are absent. It is safe to run again whenever you suspect a gap, such as after a long index outage. Use `mode: all` only to rebuild the whole index. Chunks that already have a stored vector are not embedded again, so only old chunks without one pay for embeddings the first time. Watch `index-status`, the `Index batch mode=… already_indexed=… indexed=…` log lines, and the poison queue.
-- **Index capacity.** The search index has hard quotas (on the Serverless tier, 300 MB of vector index and 1 GB of storage per index). At 1,536 dimensions with no compression, each chunk used about 18 KB of vector quota and 40 KB of storage, so about 17,000 chunks filled it, and once a quota is full, writes fail. Quantization can only be set on a new vector field, so the compressed index is a new one: create `sf-knowledge-v2` from `sf-knowledge-v2.index.json` (portal: Indexes, Add index, JSON), set `AZURE_SEARCH_INDEX_NAME` to it, and load it in stages. That definition is blob-backed: binary quantization, no stored vector copy, and `content` searchable but not retrievable, because Blob Storage holds every chunk's text and vector. Run the app with `AZURE_SEARCH_BLOB_BACKED=true` against such an index and never against one with stored copies turned on. To measure capacity, divide an index's vector index size and total storage size (portal: Indexes) by its document count, then divide each quota by that per-chunk cost. Judge it at 1,000 chunks or more, because the first few hundred overstate the cost.
+- **Index capacity.** The search index has hard quotas (on the Serverless tier, 300 MB of vector index and 1 GB of storage per index). At 1,536 dimensions with no compression, each chunk used about 18 KB of vector quota and 40 KB of storage, so about 17,000 chunks filled it, and once a quota is full, writes fail. Quantization can only be set on a new vector field, so the compressed index is a new one: `sf-knowledge-v2`, now the live index (`AZURE_SEARCH_INDEX_NAME`). It was created in the portal (Indexes, Add index, JSON) from a definition file that was not saved in this repo. To keep a copy, read the definition back with `GET {endpoint}/indexes/sf-knowledge-v2?api-version=2025-09-01` (admin key in the `api-key` header), and drop its `@odata.context` and `@odata.etag` keys before using it to create an index. The definition is blob-backed: binary quantization, no stored vector copy, and `content` searchable but not retrievable, because Blob Storage holds every chunk's text and vector. Run the app with `AZURE_SEARCH_BLOB_BACKED=true` against such an index and never against one with stored copies turned on. To measure capacity, divide an index's vector index size and total storage size (portal: Indexes) by its document count, then divide each quota by that per-chunk cost. Judge it at 1,000 chunks or more, because the first few hundred overstate the cost.
 - **Logging.** The Azure SDKs are set to log warnings and errors only. At INFO they write two multi-line records for every storage or table call (each blob read shows up as an HTTP 206 range request), which floods the logs and inflates the Log Analytics bill. The app's own messages (`Purge batch …`, `Index batch …`, `Search index busy …`) are still logged.
 - **Queue messages are at-least-once.** Writes use deterministic IDs.
 
@@ -140,6 +138,8 @@ function Call($method, $path, $body = $null) {
 }
 ```
 
+For day-to-day crawl work, load `crawl-helper.ps1` instead (see Helper scripts). It does this setup for you.
+
 Common calls:
 
 ```powershell
@@ -150,6 +150,25 @@ Call POST "/api/search" @{ query = "how can I donate"; concepts = @("donation");
 Call POST "/api/document" @{ url = "https://www.sujeeth.org/"; max_chars = 3000 }
 Call POST "/api/index/retag-preview" @{ domains = @("sujeeth.org") }
 ```
+
+## Helper scripts
+
+These scripts sit next to the app and call it, or read the same storage and rules. They are part of the project:
+change them in the same commit as the thing they depend on.
+
+| Helper | What it does | Depends on |
+|---|---|---|
+| `crawl-helper.ps1` | Table views and shortcuts for the crawl API: `Show-Crawl` (one row per domain, with a TOTAL row), `Show-CrawlPages`, `Show-CrawlPaths` (with a TOTAL row), `Show-CrawlTimeline`, `Start-Crawl`, `Wait-Crawl`, `Resume-Crawl`, `Stop-Crawl`, `Get-CrawlJobId`, and `Call` for any raw request. Load it with `. .\crawl-helper.ps1` | `GET /health`, `GET /crawl-dashboard` (the `latest_job` row of each domain), `POST /crawl` (its `jobs` and `skipped` lists), `GET /crawl/{job_id}/pages` (`?summary=true`, `?status=`, `?limit=`; fields `url`, `status`, `reason`, `attempts`, `error`, `created_utc`, `updated_utc`), `POST /crawl/{job_id}/cancel` and `/resume` |
+| `Add-ManualPage.ps1` | Adds, replaces or removes one page by URL (`-Preview`, `-FromClipboard`, `-Delete`) | `POST /index/page`, `POST /index/page/delete`; the domain must be `search_enabled` and `manual_only` in the ontology |
+| `check_sitemap.py` | Shows what the crawler would collect from a domain's sitemaps and where the page limit lands. Read-only | Copies `services/sitemap.py` `collect_sitemap_urls` (collection order, `MAX_SITEMAPS_PER_DOMAIN`, `MAX_SITEMAP_BYTES`, each URL counted once, the crawler user agent) and reads `MAX_PAGES_PER_DOMAIN` and `MAX_PAGES_BY_DOMAIN` like `services/config.py` |
+| `blob_paths_report.py` | Counts stored chunks by domain and path section and flags any the crawl rules would not allow. Exits 1 if any are out of scope | Blob Storage (`BCONN`); `services/path_rules.py` |
+| `request.json` | A sample body for `POST /search` | The `/search` request fields |
+
+**Keeping helpers in step.** Before you change a route, a response field, a setting, a queue name, a stored
+record, or a module that a helper imports or copies, read this table. For every helper it names: update the
+helper, its comments and its usage text, run it or its tests, and commit it with the change. A route's response
+fields are a contract with `crawl-helper.ps1`. When you add a helper, add a row here; when you delete one, remove
+its row and any mention of it in this file.
 
 ## Deploy
 
@@ -178,4 +197,6 @@ python -m pytest -q tests
 - 0.5.0: persistent page-level crawl jobs on queues and tables.
 - 0.6.x: page claims, leases, reconcile, and recover.
 - 0.7.0: Azure AI Search hybrid retrieval, backfill.
+- 0.7.x reliability patch: job rows carry `job_id` (the daily recovery timer reads it), one job-start path with an open-job check for the manual, bulk and scheduled crawls, a deleted page (404/410) leaves the index, robots.txt is cached per host, and the nightly reconcile checks the index before it reads blobs.
+- 0.7.x memory patch: the old crawler and the `/refresh`, `/enrich` and `/reindex` routes are removed; page, manifest and job rows are read a page at a time; `crawl/domain-stats` sums job counters; `crawl/{job_id}/pages` takes `status`, `limit` and `summary`; `scheduled_job_cleanup` deletes old jobs; ontology answers are cached briefly; every tunable setting is read in `services/config.py`.
 - After 0.7.0: embedding retry and throttle; permanent failures skipped; explicit-domain validation fix; scheduled recovery and weekly crawl; re-tag and document routes; app-wide page limits.

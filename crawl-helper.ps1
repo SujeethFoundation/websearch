@@ -111,7 +111,17 @@ function Show-Crawl([string]$Domain, [switch]$Watch, [int]$Every = 30) {
         $rows = @(Get-DashboardRows $Domain)
         if (-not $rows) { Write-Host "No matching domains."; return }
         # JobId (full) stays on the rows for the other commands but is not shown here; "Job" is its first 8 characters.
-        $rows | Format-Table Domain, Status, Limit, Found, Done, Skip, Fail, Pend, Progress, Chunks, Updated, Job -AutoSize | Out-Host
+        # TOTAL row: sums over the rows shown. Limit and Job belong to one domain each, so they stay blank.
+        $sum = { param($name) [int](($rows | ForEach-Object { [int]$_.$name } | Measure-Object -Sum).Sum) }
+        $foundAll = & $sum "Found"
+        $endedAll = & $sum "Ended"
+        $total = [pscustomobject]@{
+            Domain = "TOTAL ($($rows.Count))"; Status = ""; Limit = ""; Found = $foundAll; Done = (& $sum "Done")
+            Skip = (& $sum "Skip"); Fail = (& $sum "Fail"); Pend = (& $sum "Pend"); Progress = (Format-Bar $endedAll $foundAll)
+            Chunks = (& $sum "Chunks"); Updated = ""; Job = ""
+        }
+        $shown = @($rows) + $total
+        $shown | Format-Table Domain, Status, Limit, Found, Done, Skip, Fail, Pend, Progress, Chunks, Updated, Job -AutoSize | Out-Host
         $running = @($rows | Where-Object { $_.Status -in "queued", "running", "in_progress" }).Count
         $failing = @($rows | Where-Object { [int]$_.Fail -gt 0 }).Count
         $never   = @($rows | Where-Object { $_.Status -eq "never crawled" }).Count
@@ -132,14 +142,25 @@ function Show-CrawlPages([string]$Domain) {
     $job = Find-LatestJob $Domain
     if (-not $job) { return }
     Write-Host "$($job.Domain)  job $($job.JobId)  status $($job.Status)"
-    $r = Call GET "/api/crawl/$($job.JobId)/pages"
-    if (-not $r.pages) { Write-Host "No page records."; return }
+    # The app counts the pages by status and reason, so a 10,000-page job is not downloaded to be counted here.
+    $r = Call GET "/api/crawl/$($job.JobId)/pages?summary=true"
+    $groups = $r.groups
+    if (-not $groups -and $r.pages) {
+        # An app from before the summary route returned every page: group them here instead.
+        $groups = @($r.pages | ForEach-Object { [pscustomobject]@{ status = $_.status; reason = if ($_.reason) { $_.reason } else { "" } } } |
+            Group-Object status, reason | ForEach-Object { [pscustomobject]@{ status = $_.Group[0].status; reason = $_.Group[0].reason; count = $_.Count } })
+    }
+    if (-not $groups) { Write-Host "No page records."; return }
     Write-Host "`nPages by outcome ($($r.count) total):"
-    $r.pages | ForEach-Object {
-        [pscustomobject]@{ Status = $_.status; Reason = if ($_.reason) { $_.reason } else { "" } }
-    } | Group-Object Status, Reason | Sort-Object Count -Descending |
-        Select-Object Count, @{ n = "Outcome (status, reason)"; e = { $_.Name } } | Format-Table -AutoSize | Out-Host
-    $bad = @($r.pages | Where-Object { $_.status -in "failed", "publish_failed" })
+    $groups | Sort-Object count -Descending | ForEach-Object {
+        [pscustomobject]@{ Count = $_.count; "Outcome (status, reason)" = "$($_.status), $($_.reason)" }
+    } | Format-Table -AutoSize | Out-Host
+    # Only the failed pages are fetched, up to ten of each kind.
+    $bad = @()
+    foreach ($state in "failed", "publish_failed") {
+        $more = Call GET "/api/crawl/$($job.JobId)/pages?status=$state&limit=10"
+        if ($more.pages) { $bad += @($more.pages | Where-Object { $_.status -eq $state }) }
+    }
     if ($bad.Count) {
         Write-Host "First failed pages:"
         $bad | Select-Object -First 10 url, attempts, @{ n = "error"; e = { "$($_.error)".Substring(0, [Math]::Min(80, "$($_.error)".Length)) } } | Format-Table -AutoSize -Wrap | Out-Host
@@ -220,7 +241,13 @@ function Show-CrawlPaths([string]$Domain, [int]$Depth = 1, [int]$Top = 20) {
         }
     } | Sort-Object Total -Descending
     Write-Host "`n$($r.count) page records. Excluded = skipped because the path rules (include_paths / exclude_paths) did not allow them."
-    $table | Select-Object -First $Top | Format-Table -AutoSize | Out-Host
+    # TOTAL row: counts every section, including any hidden by -Top.
+    $all = @($table)
+    $sum = { param($name) [int](($all | Measure-Object -Property $name -Sum).Sum) }
+    $totalRow = [pscustomobject]@{ Path = "TOTAL"; Total = (& $sum "Total"); Done = (& $sum "Done"); Excluded = (& $sum "Excluded")
+                                   Skipped = (& $sum "Skipped"); Failed = (& $sum "Failed"); Queued = (& $sum "Queued") }
+    $shown = @($all | Select-Object -First $Top) + $totalRow
+    $shown | Format-Table -AutoSize | Out-Host
     if (@($table).Count -gt $Top) { Write-Host "... and $(@($table).Count - $Top) more sections. Use -Top to show more, -Depth 2 for finer paths." }
 }
 
@@ -274,11 +301,16 @@ function Show-CrawlTimeline([string]$Domain, [string]$Path = "/job", [int]$Bucke
 function Start-Crawl([string]$Domain, [switch]$Wait) {
     if (-not $Domain) { Write-Warning "Give the full domain, e.g. Start-Crawl www.themuse.com"; return }
     $r = Call POST "/api/crawl" @{ domains = @($Domain) }
+    # The app does not start a second job for a domain that already has an open one; it says so in "skipped".
+    foreach ($s in @($r.skipped)) { if ($s) { Write-Warning "Skipped $($s.domain): $($s.reason)" } }
+    if (@($r.skipped | Where-Object { $_.reason -like "*active crawl*" }).Count) {
+        Write-Host "Follow the running crawl with: Wait-Crawl $Domain   (or cancel it first with: Stop-Crawl $Domain)"
+    }
     if (-not $r.jobs) { Write-Warning "No job was created. Response: $($r | ConvertTo-Json -Depth 3 -Compress)"; return }
     $r.jobs | ForEach-Object {
         [pscustomobject]@{ Domain = $_.domain; Status = $_.status; PageLimit = $_.page_limit; MaxDepth = $_.max_depth; JobId = $_.job_id }
     } | Format-Table -AutoSize -Wrap | Out-Host
-    Write-Host "Check PageLimit: it should match MAX_PAGES_BY_DOMAIN for this domain (e.g. 500 for The Muse)."
+    Write-Host "Check PageLimit: it should be MAX_PAGES_PER_DOMAIN, or this domain's MAX_PAGES_BY_DOMAIN entry if it has one."
     if ($Wait) { Start-Sleep -Seconds 3; Wait-Crawl $Domain }
 }
 

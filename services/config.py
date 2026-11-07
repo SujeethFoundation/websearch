@@ -58,7 +58,6 @@ class Settings:
     blob_container = os.getenv("BLOB_CONTAINER", "web-content")
     azure_storage_connection = os.getenv("AzureWebJobsStorage", "")
     crawl_queue = os.getenv("CRAWL_QUEUE_NAME", "web-crawl-pages")
-    crawl_poison_queue = os.getenv("CRAWL_POISON_QUEUE_NAME", "web-crawl-pages-poison")
     crawl_jobs_table = os.getenv("CRAWL_JOBS_TABLE", "WebCrawlJobs")
     crawl_pages_table = os.getenv("CRAWL_PAGES_TABLE", "WebCrawlPages")
     crawl_manifest_table = os.getenv("CRAWL_MANIFEST_TABLE", "WebCrawlManifest")
@@ -83,7 +82,7 @@ class Settings:
         "AZURE_SEARCH_ENDPOINT", "https://sujeeth-aisearch.search.windows.net"
     ).rstrip("/")
     search_api_key = os.getenv("AZURE_SEARCH_API_KEY", "")
-    search_index_name = os.getenv("AZURE_SEARCH_INDEX_NAME", "sf-knowledge")
+    search_index_name = os.getenv("AZURE_SEARCH_INDEX_NAME", "sf-knowledge-v2")
     search_api_version = os.getenv("AZURE_SEARCH_API_VERSION", "2025-09-01")
     search_batch_size = max(1, min(int(os.getenv("AZURE_SEARCH_BATCH_SIZE", "100")), 500))
     # The vector field that receives chunk vectors and is searched. To move to a compressed field in the same
@@ -92,7 +91,7 @@ class Settings:
     search_vector_field = os.getenv("AZURE_SEARCH_VECTOR_FIELD", "contentVector").strip() or "contentVector"
     # When true, Blob Storage is the only copy of chunk text and vectors. The index keeps no retrievable text and no
     # stored vector copy, so every index write replaces the whole document and result text is read from blobs.
-    search_blob_backed = os.getenv("AZURE_SEARCH_BLOB_BACKED", "false").strip().lower() in ("1", "true", "yes", "on")
+    search_blob_backed = os.getenv("AZURE_SEARCH_BLOB_BACKED", "true").strip().lower() in ("1", "true", "yes", "on")
     search_null_vector_fields = tuple(
         x.strip() for x in os.getenv("AZURE_SEARCH_NULL_VECTOR_FIELDS", "").split(",") if x.strip()
     )

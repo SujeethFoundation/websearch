@@ -307,9 +307,9 @@ def index_backfill(req):
             "domains": domains or "all",
             "source_prefix": "documents/",
             "batch_size": settings.index_backfill_batch_size,
-            "message": ("The queue worker will page through Blob Storage and index only the chunks that are not in sf-knowledge yet."
+            "message": (f"The queue worker will page through Blob Storage and index only the chunks that are not in {settings.search_index_name} yet."
                         if mode == "missing" else
-                        "The queue worker will page through Blob Storage and re-send every chunk to sf-knowledge."),
+                        f"The queue worker will page through Blob Storage and re-send every chunk to {settings.search_index_name}."),
         }, 202)
     except Exception as exc:
         log.exception("AI Search backfill enqueue failed")
