@@ -212,3 +212,27 @@ def test_policy_keeps_old_allow_list_when_the_ontology_cannot_be_read():
     assert policy.is_excluded("indeed.com", "https://www.indeed.com/jobs")
     ontology.fail = True
     assert policy.is_excluded("indeed.com", "https://www.indeed.com/jobs")
+
+
+MUSE = {"domain": "www.themuse.com", "crawl_policy": {"include_paths": ["/advice"], "include_sitemaps": ["/sitemaps/advice.xml"]}}
+
+
+def test_include_sitemaps_opens_only_the_listed_child_sitemaps():
+    policy = PathPolicy(FakeOntology(ROWS + [MUSE]))
+    assert policy.sitemaps_for("www.themuse.com") == ("/sitemaps/advice.xml",)
+    assert policy.is_sitemap_allowed("www.themuse.com", "https://www.themuse.com/sitemaps/advice.xml")
+    assert not policy.is_sitemap_allowed("www.themuse.com", "https://www.themuse.com/sitemaps/jobs-0.xml")
+    assert not policy.is_sitemap_allowed("www.themuse.com", "https://www.themuse.com/sitemaps/companies.xml")
+
+
+def test_without_include_sitemaps_every_sitemap_is_allowed():
+    policy = PathPolicy(FakeOntology(ROWS + [MUSE]))
+    assert policy.sitemaps_for("tealhq.com") == ()
+    assert policy.is_sitemap_allowed("tealhq.com", "https://www.tealhq.com/sitemap-0.xml")
+    assert policy.is_sitemap_allowed("unknown.example", "https://unknown.example/s.xml")
+
+
+def test_include_sitemaps_does_not_change_page_rules():
+    policy = PathPolicy(FakeOntology([MUSE]))
+    assert not policy.is_excluded("www.themuse.com", "https://www.themuse.com/advice/a-post")
+    assert policy.is_excluded("www.themuse.com", "https://www.themuse.com/jobs/x")

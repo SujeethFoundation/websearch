@@ -123,7 +123,11 @@ class PageWorker:
                 sitemap_crawler=Crawler(self.ontology,self.storage,self.search,self.resolver)
                 sitemap_seeds=[line.split(":",1)[1].strip() for line in rr.text.splitlines()
                                if line.strip().lower().startswith("sitemap:")]
-                sitemap_urls, _, _, _ = sitemap_crawler._sitemap_urls(domain,sitemap_seeds)
+                # Apply the domain's path rules while collecting, so the sitemap URL cap is not spent on excluded sections.
+                sitemap_urls, _, _, _ = sitemap_crawler._sitemap_urls(
+                    domain, sitemap_seeds,
+                    keep=lambda u: not self.path_policy.is_excluded(domain, u),
+                    sitemap_filter=lambda u: self.path_policy.is_sitemap_allowed(domain, u))
                 for sitemap_url in sitemap_urls:
                     if self.path_policy.is_excluded(domain,sitemap_url): continue
                     self.state.enqueue_page(job_id,domain,sitemap_url,1)

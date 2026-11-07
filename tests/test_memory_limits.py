@@ -232,6 +232,73 @@ def test_sitemap_collection_stops_at_the_url_limit(monkeypatch):
     assert found == ["https://example.org/a"]
 
 
+def test_keep_filter_runs_before_the_url_cap(monkeypatch):
+    # An allow-list domain lists other sections first; the cap must not be used up on them.
+    body = ("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"
+            + "".join(f"<url><loc>https://example.org/jobs/{i}</loc></url>" for i in range(5))
+            + "<url><loc>https://example.org/advice/a</loc></url><url><loc>https://example.org/advice/b</loc></url></urlset>").encode()
+    pages = {"https://example.org/sitemap.xml": FakeResponse(body=body)}
+    monkeypatch.setattr(settings, "max_sitemap_urls", 3)
+    crawler = sitemap_crawler(monkeypatch, pages)
+    without, _, _, _ = crawler._sitemap_urls("example.org", [])
+    assert all("/jobs/" in u for u in without)             # the old behavior: cap spent on /jobs
+    kept, _, _, _ = crawler._sitemap_urls("example.org", [], keep=lambda u: "/advice/" in u)
+    assert kept == ["https://example.org/advice/a", "https://example.org/advice/b"]
+
+
+def test_keep_filter_does_not_stop_nested_sitemaps_being_followed(monkeypatch):
+    pages = {
+        "https://example.org/sitemap.xml": FakeResponse(body=INDEX),
+        "https://example.org/s1.xml": FakeResponse(body=URLSET),
+    }
+    found, visited, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [], keep=lambda u: u.endswith("/b"))
+    assert found == ["https://example.org/b"]
+    assert visited >= 2
+
+
+def test_sitemap_filter_skips_unwanted_child_sitemaps_without_fetching_them(monkeypatch):
+    ns = 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+    index = (f"<sitemapindex {ns}>" + "".join(
+        f"<sitemap><loc>https://example.org/sitemaps/{n}.xml</loc></sitemap>" for n in ("jobs-0", "jobs-1", "advice")
+    ) + "</sitemapindex>").encode()
+    urlset = lambda path: (f"<urlset {ns}><url><loc>https://example.org/{path}/1</loc></url></urlset>").encode()
+    pages = {
+        "https://example.org/sitemap.xml": FakeResponse(body=index),
+        "https://example.org/sitemaps/jobs-0.xml": FakeResponse(body=urlset("jobs")),
+        "https://example.org/sitemaps/jobs-1.xml": FakeResponse(body=urlset("jobs")),
+        "https://example.org/sitemaps/advice.xml": FakeResponse(body=urlset("advice")),
+    }
+    crawler = sitemap_crawler(monkeypatch, pages)
+    fetched = []
+    original = crawler.session.get
+    crawler.session.get = lambda url, **kw: (fetched.append(url), original(url, **kw))[1]
+    found, visited, _, _ = crawler._sitemap_urls(
+        "example.org", [], sitemap_filter=lambda u: u.endswith("/sitemaps/advice.xml"))
+    assert found == ["https://example.org/advice/1"]
+    assert "https://example.org/sitemaps/jobs-0.xml" not in fetched
+    assert "https://example.org/sitemaps/jobs-1.xml" not in fetched
+    assert "https://example.org/sitemaps/advice.xml" in fetched
+
+
+def test_a_domain_specific_sitemap_limit_overrides_the_global_one(monkeypatch):
+    ns = 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+    body = (f"<urlset {ns}>" + "".join(f"<url><loc>https://example.org/advice/{i}</loc></url>" for i in range(10)) + "</urlset>").encode()
+    pages = {"https://example.org/sitemap.xml": FakeResponse(body=body)}
+    monkeypatch.setattr(settings, "max_sitemap_urls", 5000)
+    monkeypatch.setattr(settings, "sitemap_url_limits", {"www.example.org": 3})
+    found, _, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
+    assert len(found) == 3                                  # the limit is matched through the www variant
+    monkeypatch.setattr(settings, "sitemap_url_limits", {"other.org": 3})
+    found, _, _, _ = sitemap_crawler(monkeypatch, pages)._sitemap_urls("example.org", [])
+    assert len(found) == 10                                 # other domains keep the global limit
+
+
+def test_parse_limits_ignores_bad_entries():
+    from services.config import parse_limits
+    assert parse_limits("www.themuse.com=500, Other.ORG = 200, bad, x=0, y=abc, =5") == {"www.themuse.com": 500, "other.org": 200}
+    assert parse_limits("") == {}
+
+
 # ---------------------------------------------------------------- page worker
 def test_a_long_page_is_embedded_and_stored_in_groups():
     worker, state, search = make_worker(html_page(1800 * 120 - 100))

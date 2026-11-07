@@ -13,6 +13,14 @@ A "*" inside a rule matches any characters within one path segment (never a "/")
 "/career-paths/*-certifications" matches /career-paths/snowflake-developer-certifications and
 anything beneath it, but not /career-paths/certifications-guide.
 
+A domain may also set "include_sitemaps", an allow-list of child sitemap files. When a sitemap index lists
+many sitemaps (jobs, companies, articles), only the ones whose URL path matches a rule are opened:
+
+    "include_sitemaps": ["/sitemaps/advice.xml"]
+
+Rules use the same matching as the two lists above. The top-level sitemap (robots.txt "Sitemap:" lines,
+/sitemap.xml) is always opened; only the sitemap files it lists are filtered. Without the key, nothing is filtered.
+
 How the two lists combine:
   - With no include_paths, every path is allowed except those matching exclude_paths (the old behaviour).
   - With include_paths, only paths matching one of them are allowed.
@@ -101,6 +109,7 @@ class PathPolicy:
         self.ttl = ttl_seconds
         self._rules = {}
         self._includes = {}
+        self._sitemaps = {}
         self._loaded_at = None
         self._lock = threading.Lock()
 
@@ -114,7 +123,7 @@ class PathPolicy:
                 return
             try:
                 manifest = self.ontology.crawl_manifest()
-                rules, includes = {}, {}
+                rules, includes, sitemaps = {}, {}, {}
                 for row in manifest.get("crawl_domains", []):
                     if not isinstance(row, dict):
                         continue
@@ -126,8 +135,12 @@ class PathPolicy:
                     allowed = normalize_rules(policy.get("include_paths"))
                     if allowed:
                         includes[domain] = allowed
+                    child_sitemaps = normalize_rules(policy.get("include_sitemaps"))
+                    if child_sitemaps:
+                        sitemaps[domain] = child_sitemaps
                 self._rules = rules
                 self._includes = includes
+                self._sitemaps = sitemaps
                 self._loaded_at = now
             except Exception:
                 log.exception("Could not read crawl path rules from the ontology; keeping the previous rules")
@@ -142,6 +155,18 @@ class PathPolicy:
         """The allow-list (include_paths) for a domain; empty means no allow-list."""
         self._refresh()
         return self._includes.get(str(domain or "").lower(), ())
+
+    def sitemaps_for(self, domain):
+        """The allow-list of child sitemap files (include_sitemaps); empty means open every sitemap."""
+        self._refresh()
+        return self._sitemaps.get(str(domain or "").lower(), ())
+
+    def is_sitemap_allowed(self, domain, url):
+        """True if the crawler may open this child sitemap file. With no include_sitemaps, always True."""
+        rules = self.sitemaps_for(domain)
+        if not rules:
+            return True
+        return is_excluded_path(urlparse(str(url or "")).path, rules)
 
     def all_rules(self):
         self._refresh()

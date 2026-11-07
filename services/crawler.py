@@ -123,7 +123,17 @@ class Crawler:
             return False
         return parser.can_fetch(self.session.headers["User-Agent"], url)
 
-    def _sitemap_urls(self, domain, sitemap_seeds):
+    def _sitemap_urls(self, domain, sitemap_seeds, keep=None, sitemap_filter=None):
+        """Collect page URLs from the domain's sitemaps.
+
+        keep, if given, is called with each page URL and must return True to keep it. It runs before a
+        URL counts toward the sitemap URL limit (MAX_SITEMAP_URLS, or the domain's SITEMAP_URL_LIMITS entry), so a domain with an allow-list (include_paths) spends the
+        cap on the sections it wants, not on whatever its sitemaps happen to list first.
+
+        sitemap_filter, if given, is called with each nested sitemap file (.xml) a sitemap lists and must
+        return True to open it. It lets a domain skip huge sections it does not want, such as thousands of
+        job pages. The top-level sitemaps (robots.txt Sitemap lines, /sitemap.xml) are always opened.
+        """
         canonical = self._canonical_host(domain)
         candidates = list(sitemap_seeds)
         for host in sorted(self._host_variants(domain)):
@@ -135,7 +145,8 @@ class Crawler:
         found = []
         metadata = {}
         failures = []
-        while candidates and len(found) < settings.max_sitemap_urls and len(visited_sitemaps) < settings.max_sitemaps:
+        limit = settings.sitemap_limit_for(self._host_variants(domain))
+        while candidates and len(found) < limit and len(visited_sitemaps) < settings.max_sitemaps:
             sitemap_url = self._normalize_url(candidates.pop(0))
             if sitemap_url in visited_sitemaps:
                 continue
@@ -167,12 +178,16 @@ class Crawler:
                     if not self._same_site(target, domain):
                         continue
                     if root_kind == "sitemapindex" or urlparse(target).path.lower().endswith(".xml"):
+                        if sitemap_filter is not None and not sitemap_filter(target):
+                            continue
                         if target not in visited_sitemaps:
                             candidates.append(target)
                     else:
+                        if keep is not None and not keep(target):
+                            continue
                         found.append(target)
                         metadata[target] = {"sitemap": sitemap_url}
-                        if len(found) >= settings.max_sitemap_urls:
+                        if len(found) >= limit:
                             break
                 del data
             except (requests.RequestException, ET.ParseError, ValueError) as exc:
