@@ -85,7 +85,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `ONTOLOGY_API_URL`, `ONTOLOGY_FUNCTION_KEY` | none | Ontology app |
 | `AZURE_SEARCH_ENDPOINT`, `AZURE_SEARCH_API_KEY`, `AZURE_SEARCH_INDEX_NAME`, `AZURE_SEARCH_API_VERSION` | see README-AI-SEARCH | AI Search (admin key) |
 | `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`, `AZURE_OPENAI_EMBEDDING_DIMENSIONS` | `sf-embeddings`, `v1`, `1536` | Embeddings |
-| `MAX_PAGES_PER_DOMAIN` | `1000` in code (deployed: `10000`) | Page cap per domain, for every domain |
+| `MAX_PAGES_PER_DOMAIN` | `10000` | Page cap per domain, for every domain |
 | `MAX_CRAWL_DEPTH` | `5` | Link depth |
 | `MAX_PAGES_BY_DOMAIN` | none | Lower the page limit for particular domains, as `host=limit` pairs separated by commas, for example `www.themuse.com=500`. A domain not listed uses `MAX_PAGES_PER_DOMAIN`. The limit caps the crawl's total pages and also the page URLs collected from sitemaps |
 | `CHUNK_CHARS`, `MIN_TEXT_CHARS`, `MAX_PAGE_BYTES`, `REQUEST_TIMEOUT_SECONDS`, `CRAWL_DELAY_SECONDS` | `1800`, `80`, `5000000`, `20`, `0.5` | Extraction and politeness |
@@ -108,7 +108,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 ## Operating notes
 
 - **Search 502 with a 429 inside:** the index vectorizer calls the same embedding deployment as indexing. Heavy indexing can throttle query vectorization and break search. Mitigations: set `EMBED_MIN_INTERVAL_SECONDS`, cap the instance count (Flex Consumption: Settings → Scale and concurrency), or give queries their own embedding deployment.
-- **Page limits live here, not in the ontology.** Every domain gets `MAX_PAGES_PER_DOMAIN` (or its `MAX_PAGES_BY_DOMAIN` entry) and `MAX_CRAWL_DEPTH`. The page limit is also the number of page URLs collected from a domain's sitemaps. The ontology only decides which domains are crawl-enabled.
+- **Page limits live here, not in the ontology.** Every domain gets `MAX_PAGES_PER_DOMAIN` (or its `MAX_PAGES_BY_DOMAIN` entry) and `MAX_CRAWL_DEPTH`. The page limit is also the number of page URLs collected from a domain's sitemaps. The limit applies to every page a job queues (the homepage, sitemap URLs and links found on pages); once a job has found that many pages it queues no new ones. The ontology only decides which domains are crawl-enabled.
 - **Permanent failures are skipped, not retried:** off-site redirects, redirect loops, non-public IPs, and HTTP 400/401/403/404/405/406/410/451. Timeouts, 429, and 5xx still retry (up to 5 deliveries).
 - **Stale-page cleanup** only runs after a clean crawl: no skipped or failed pages and below the page cap. Because skipped pages block it, domains with dead links will not purge removed pages.
 - **Re-tagging:** tags are assigned at crawl time, and unchanged pages are not re-tagged on later crawls. After an ontology alias or domain-concept change, run `index/retag-preview`, then `index/retag`. The resolver caches the ontology in memory, so restart the app after an ontology deploy.

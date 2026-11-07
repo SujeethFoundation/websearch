@@ -308,6 +308,59 @@ def test_parse_limits_ignores_bad_entries():
     assert parse_limits("") == {}
 
 
+# ---------------------------------------------------------------- job page limit
+class FakePages:
+    def __init__(self):
+        self.rows = {}
+
+    def create_entity(self, entity):
+        if entity["RowKey"] in self.rows:
+            raise RuntimeError("exists")
+        self.rows[entity["RowKey"]] = dict(entity)
+
+
+def make_crawl_state(job):
+    from services.crawl_state import CrawlState, digest
+    state = CrawlState.__new__(CrawlState)
+    state.pages = FakePages()
+    state.published = []
+    state.get_job = lambda job_id: job
+    state.page = lambda job_id, url: state.pages.rows.get(digest(url))
+
+    def change(job_id, **fields):
+        job["pages_discovered"] = job.get("pages_discovered", 0) + fields.get("inc_pages_discovered", 0)
+
+    state._change = change
+    state._publish = lambda job_id, domain, url, depth: state.published.append(url)
+    return state
+
+
+def test_a_job_stops_queueing_new_pages_at_its_page_limit():
+    job = {"status": "running", "page_limit": 3, "pages_discovered": 0}
+    state = make_crawl_state(job)
+    results = [state.enqueue_page("j", "example.org", f"https://example.org/p/{i}", 1) for i in range(5)]
+    assert results == [True, True, True, False, False]
+    assert len(state.published) == 3
+    assert job["pages_discovered"] == 3
+
+
+def test_a_page_already_on_record_can_be_republished_when_the_job_is_at_its_limit():
+    job = {"status": "running", "page_limit": 1, "pages_discovered": 0}
+    state = make_crawl_state(job)
+    assert state.enqueue_page("j", "example.org", "https://example.org/a", 1) is True
+    assert state.enqueue_page("j", "example.org", "https://example.org/b", 1) is False   # new page: refused
+    assert state.enqueue_page("j", "example.org", "https://example.org/a", 1) is True    # recovery republish: allowed
+    assert state.published == ["https://example.org/a", "https://example.org/a"]
+
+
+def test_a_job_without_a_page_limit_uses_the_global_limit(monkeypatch):
+    monkeypatch.setattr(settings, "max_pages", 2)
+    job = {"status": "running", "pages_discovered": 0}
+    state = make_crawl_state(job)
+    results = [state.enqueue_page("j", "example.org", f"https://example.org/p/{i}", 1) for i in range(4)]
+    assert results == [True, True, False, False]
+
+
 # ---------------------------------------------------------------- page worker
 def test_a_long_page_is_embedded_and_stored_in_groups():
     worker, state, search = make_worker(html_page(1800 * 120 - 100))

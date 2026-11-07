@@ -84,6 +84,10 @@ class CrawlState:
         job = self.get_job(job_id)
         if not job or job.get("status") in ("cancelled", "failed", "completed", "completed_with_errors"):
             return False
+        # The job's page limit holds for every way a page is queued (homepage, sitemap URLs, discovered links).
+        # A page already on record can still be republished during recovery, so only new pages are refused.
+        if int(job.get("pages_discovered", 0)) >= int(job.get("page_limit", settings.max_pages)) and not self.page(job_id, url):
+            return False
         key = digest(url)
         try:
             self.pages.create_entity({"PartitionKey": job_id, "RowKey": key, "url": url,

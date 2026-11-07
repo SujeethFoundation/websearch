@@ -64,7 +64,7 @@ class Settings:
     )
     index_backfill_batch_size = max(1, min(int(os.getenv("INDEX_BACKFILL_BATCH_SIZE", "10")), 25))
 
-    max_pages = int(os.getenv("MAX_PAGES_PER_DOMAIN", "1000"))
+    max_pages = int(os.getenv("MAX_PAGES_PER_DOMAIN", "10000"))
     max_crawl_depth = int(os.getenv("MAX_CRAWL_DEPTH", "5"))
     crawl_delay = float(os.getenv("CRAWL_DELAY_SECONDS", "0.5"))
     # Per-domain overrides of MAX_PAGES_PER_DOMAIN, e.g. MAX_PAGES_BY_DOMAIN="www.themuse.com=500" (host=limit, comma separated).

@@ -115,12 +115,23 @@ def main():
     s = requests.Session()
     s.headers["User-Agent"] = UA
 
-    # ---- robots.txt
+    # ---- robots.txt (follows same-site redirects, like the crawler's own robots check)
     seeds = []
     robots_url = f"{base(host)}/robots.txt"
     try:
-        r, data = fetch(s, robots_url)
-        print(f"robots.txt  HTTP {r.status_code}  {robots_url}")
+        hops, r, data = [], None, b""
+        for _ in range(5):
+            r, data = fetch(s, robots_url)
+            hops.append(f"HTTP {r.status_code}")
+            if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                nxt = requests.compat.urljoin(robots_url, r.headers["Location"])
+                if urlparse(nxt).hostname not in set(hosts) and not args.base:
+                    print(f"robots.txt redirected off-site to {nxt}; the crawler would refuse that")
+                    break
+                robots_url = nxt
+                continue
+            break
+        print(f"robots.txt  {' -> '.join(hops)}  {robots_url}")
         if r.status_code in (401, 403):
             print("  -> the crawler would skip every page as robots_denied and never read the sitemap.")
         elif r.status_code >= 500:
@@ -130,7 +141,7 @@ def main():
                 if line.strip().lower().startswith("sitemap:"):
                     seeds.append(line.split(":", 1)[1].strip())
             print(f"  Sitemap lines in robots.txt: {len(seeds)}")
-            for u in seeds[:10]:
+            for u in seeds[:20]:
                 print("   ", u)
     except requests.RequestException as exc:
         print(f"robots.txt  ERROR {exc}")

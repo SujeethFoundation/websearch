@@ -188,6 +188,7 @@ def health(req):
         "persistent_crawl_jobs": bool(crawl_state),
         "crawl_queue": settings.crawl_queue,
         "max_pages_per_domain": settings.max_pages,
+        "max_pages_by_domain": settings.page_limits,
         "max_crawl_depth": settings.max_crawl_depth,
         "search_mode": "azure_ai_search_hybrid" if settings.search_configured and settings.embedding_configured else "not_configured",
     })
