@@ -75,10 +75,13 @@ class OntologyClient:
         })
 
     def validate_domains(self, domains, purpose="search"):
-        return self.post("/api/ontology/validate-domains", {
+        # Reused for ONTOLOGY_CACHE_SECONDS, like the manifests, so a page read does not wait on
+        # a second app. A change to a domain's approval takes effect after that interval.
+        key = "validate:" + str(purpose) + ":" + ",".join(sorted(str(d).lower() for d in domains))
+        return self._cached(key, lambda: self.post("/api/ontology/validate-domains", {
             "domains": domains,
             "purpose": purpose,
-        })
+        }))
 
 
     def domain_concepts(self, domain):

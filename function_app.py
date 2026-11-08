@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from datetime import datetime, timezone
 import azure.functions as func
 from urllib.parse import urlparse
@@ -505,18 +506,24 @@ def document(req):
     try:
         neighbors = int(body.get("neighbors", 1))
         max_chars = max(500, min(int(body.get("max_chars", 6000)), 20000))
+        began = time.perf_counter()
+        timings = {}
         rows, focus, total = searcher.fetch_chunks(
-            None if chunk_id else url, chunk_id or None, neighbors)
+            None if chunk_id else url, chunk_id or None, neighbors, max_chars, timings)
         if not rows:
             return response({"error": "Document not found in the index."}, 404)
         domains = sorted({str(r.get("domain") or "").lower() for r in rows})
+        mark = time.perf_counter()
         validation = ontology.validate_domains(domains, "search")
+        timings["validate_ms"] = round((time.perf_counter() - mark) * 1000)
         if not validation.get("approved") or validation.get("rejected"):
             return response({"error": "This domain is not approved for search."}, 403)
         excerpt_only = any(d not in settings.full_text_domains for d in domains)
         limit = min(max_chars, settings.excerpt_max_chars) if excerpt_only else max_chars
         chosen, truncated = assemble_document(rows, focus, limit)
-        return response({
+        timings["total_ms"] = round((time.perf_counter() - began) * 1000)
+        log.info("document timings_ms=%s url=%s", json.dumps(timings), url or chunk_id)
+        payload = {
             "status": "ok",
             "title": chosen[0].get("title"),
             "url": chosen[0].get("url"),
@@ -534,7 +541,10 @@ def document(req):
             "text": "\n\n".join(str(r.get("content") or "") for r in chosen),
             "note": ("Excerpt of third-party content. Link to the source URL instead of reproducing it."
                      if excerpt_only else None),
-        })
+        }
+        if body.get("timings"):
+            payload["timings_ms"] = timings
+        return response(payload)
     except ValueError as exc:
         return response({"error": str(exc)}, 400)
     except Exception as exc:

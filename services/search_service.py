@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import logging
+import os
 import struct
 import threading
 import time
@@ -28,6 +29,38 @@ EMBED_BATCH_SIZE = settings.embed_batch_size
 # deferral for this many seconds, so workers keep crawling instead of each waiting out the retries.
 SEARCH_BREAKER_SECONDS = settings.search_breaker_seconds
 _breaker_until = 0.0
+
+# Optional in-memory cache of chunk text, OFF by default because it uses memory (about 2 to 4 KB
+# per chunk at the default chunk size, so 1000 entries is roughly 2 to 4 MB). Set
+# BLOB_CACHE_SECONDS above 0 to turn it on. A chunk is cleared when this instance writes or
+# deletes it; another instance can serve older text for up to BLOB_CACHE_SECONDS.
+BLOB_CACHE_SECONDS = int(os.getenv("BLOB_CACHE_SECONDS", "0") or 0)
+BLOB_CACHE_MAX = max(100, int(os.getenv("BLOB_CACHE_MAX_ENTRIES", "1000") or 1000))
+_blob_cache = {}  # blob name -> (expires, text)
+_blob_cache_lock = threading.Lock()
+
+
+def _blob_cache_get(name):
+    if BLOB_CACHE_SECONDS <= 0:
+        return None
+    with _blob_cache_lock:
+        hit = _blob_cache.get(name)
+    return hit[1] if hit and hit[0] > time.monotonic() else None
+
+
+def _blob_cache_put(name, text):
+    if BLOB_CACHE_SECONDS <= 0:
+        return
+    with _blob_cache_lock:
+        _blob_cache[name] = (time.monotonic() + BLOB_CACHE_SECONDS, text)
+        if len(_blob_cache) > BLOB_CACHE_MAX:
+            for key in list(_blob_cache)[: BLOB_CACHE_MAX // 10]:
+                _blob_cache.pop(key, None)
+
+
+def _blob_cache_forget(name):
+    with _blob_cache_lock:
+        _blob_cache.pop(name, None)
 
 
 class IndexBusyError(RuntimeError):
@@ -158,9 +191,17 @@ class SearchService:
         return outcomes
 
     def _blob_text(self, doc_id):
-        """Text of one chunk from Blob Storage, or None when the blob is missing."""
-        doc = self.storage.get("documents/" + str(doc_id) + ".json")
-        return str(doc.get("content") or "") if doc else None
+        """Text of one chunk from memory or Blob Storage, or None when the blob is missing."""
+        name = "documents/" + str(doc_id) + ".json"
+        cached = _blob_cache_get(name)
+        if cached is not None:
+            return cached
+        doc = self.storage.get(name)
+        if not doc:
+            return None
+        text = str(doc.get("content") or "")
+        _blob_cache_put(name, text)
+        return text
 
     def _blob_content(self, ids, workers=8):
         """Chunk text for these ids, read from Blob Storage several at a time.
@@ -242,7 +283,7 @@ class SearchService:
                     raise RuntimeError(f"Azure AI Search rejected a concept update: {item}")
         return updated, not_indexed
 
-    def fetch_chunks(self, url=None, chunk_id=None, neighbors=1, max_chars=None):
+    def fetch_chunks(self, url=None, chunk_id=None, neighbors=1, max_chars=None, timings=None):
         """Read stored chunks of one page from the index.
 
         With chunk_id, returns that chunk and up to `neighbors` chunks on each side. With
@@ -267,24 +308,39 @@ class SearchService:
         else:
             raise ValueError("Provide url or chunk_id.")
         select = "id,title,url,domain,concepts" if settings.search_blob_backed else "id,title,url,domain,concepts,content"
+        began = time.perf_counter()
         response = self._post("search", {
             "search": "*", "filter": filter_expr, "top": 1000, "select": select,
         }, 45, attempts=3, max_wait=5)
         response.raise_for_status()
         rows = response.json().get("value", [])
+        found = len(rows)
+        distinct = len({r.get("id") for r in rows})
+        if timings is not None:
+            timings["index_query_ms"] = round((time.perf_counter() - began) * 1000)
         if settings.search_blob_backed:
             # A page this long is cut off at 400 chunks. Read them in page order, and for a whole
             # page stop once max_chars of text is loaded.
+            began = time.perf_counter()
             rows = sorted(rows, key=lambda r: chunk_index(r.get("id")))[:400]
             rows = self._load_blob_content(rows, None if chunk_id else max_chars)
+            if timings is not None:
+                timings["blob_ms"] = round((time.perf_counter() - began) * 1000)
         total = None
         if rows:
-            page_url = str(rows[0].get("url") or "").replace("'", "''")
-            counted = self._post("search", {
-                "search": "*", "filter": f"url eq '{page_url}'", "top": 0, "count": True,
-            }, 45, attempts=3, max_wait=5)
-            counted.raise_for_status()
-            total = counted.json().get("@odata.count")
+            if not chunk_id and found < 1000:
+                # The query above already returned every chunk of the page, so no count is needed.
+                total = distinct
+            else:
+                began = time.perf_counter()
+                page_url = str(rows[0].get("url") or "").replace("'", "''")
+                counted = self._post("search", {
+                    "search": "*", "filter": f"url eq '{page_url}'", "top": 0, "count": True,
+                }, 45, attempts=3, max_wait=5)
+                counted.raise_for_status()
+                total = counted.json().get("@odata.count")
+                if timings is not None:
+                    timings["count_ms"] = round((time.perf_counter() - began) * 1000)
         return rows, focus, total
 
     def delete_ids(self, ids):
@@ -364,6 +420,7 @@ class SearchService:
                 stored["_key"] = key
                 stored.pop("embedding", None)
                 self.storage.put(key, stored)
+                _blob_cache_forget(key)
         names = ["documents/" + str(doc["id"]) + ".json" for doc in documents]
         if _breaker_open():
             return 0, names
@@ -525,6 +582,7 @@ class SearchService:
         self._write_batch([{"@search.action": "delete", "id": doc_id} for doc_id in ids])
         for doc_id in ids:
             self.storage.delete("documents/" + str(doc_id) + ".json")
+            _blob_cache_forget("documents/" + str(doc_id) + ".json")
             self.storage.delete(self.vector_key(doc_id))
         return len(ids)
 
