@@ -64,6 +64,7 @@ class PageWorker:
         raise PermanentPageError('redirect_limit','Redirect limit exceeded')
 
     ROBOTS_TTL_SECONDS = 3600
+    ROBOTS_MAX_ATTEMPTS = 3
 
     def _robots(self, url, domain):
         """(parser, text) for the URL's host, cached. parser is None when robots.txt denies access (401/403)."""
@@ -166,6 +167,14 @@ class PageWorker:
         except PermanentPageError as exc:
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':'robots_'+exc.reason},pages_skipped=1); return {'status': 'completed'}
         except Exception as exc:
+            # A host whose robots.txt keeps failing (for example a 503 on a bare-domain alias) would retry
+            # forever and hold the job open. After ROBOTS_MAX_ATTEMPTS tries, skip the page rather than
+            # fetch without a verified policy.
+            page_row=self.state.page(job_id,url) or {}
+            if int(page_row.get('attempts',0))>=self.ROBOTS_MAX_ATTEMPTS:
+                self._complete(job_id,url,claim_token,'skipped',
+                               page_fields={'reason':'robots_unavailable','last_error':str(exc)[:500]},pages_skipped=1)
+                return {'status': 'completed'}
             raise RuntimeError(f'robots policy could not be verified: {exc}')
 
         previous=self.state.manifest_get(domain,url)
