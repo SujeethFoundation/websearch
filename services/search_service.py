@@ -5,6 +5,7 @@ import logging
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from services.config import settings
 from services.embedding_service import EmbeddingService
@@ -156,14 +157,44 @@ class SearchService:
             outcomes.extend(result)
         return outcomes
 
-    def _blob_content(self, ids):
-        """Chunk text for these ids, read from Blob Storage."""
-        found = {}
-        for doc_id in ids:
-            doc = self.storage.get("documents/" + str(doc_id) + ".json")
-            if doc:
-                found[str(doc_id)] = str(doc.get("content") or "")
-        return found
+    def _blob_text(self, doc_id):
+        """Text of one chunk from Blob Storage, or None when the blob is missing."""
+        doc = self.storage.get("documents/" + str(doc_id) + ".json")
+        return str(doc.get("content") or "") if doc else None
+
+    def _blob_content(self, ids, workers=8):
+        """Chunk text for these ids, read from Blob Storage several at a time.
+
+        Reading one chunk at a time cost one storage round trip per chunk, so a long page took
+        many seconds. Missing blobs are left out, as before.
+        """
+        ids = [i for i in ids if i]
+        if not ids:
+            return {}
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(ids)))) as pool:
+            texts = list(pool.map(self._blob_text, ids))
+        return {str(i): t for i, t in zip(ids, texts) if t is not None}
+
+    def _load_blob_content(self, rows, max_chars=None, batch=8):
+        """Fill row["content"] for rows in page order, stopping once max_chars of text is loaded.
+
+        A page read needs only the first max_chars of text, so a long page is not read in full.
+        Rows that are not read keep empty content and sit after the rows that were, which lets
+        assemble_document report the page as truncated.
+        """
+        position, loaded = 0, 0
+        while position < len(rows):
+            if max_chars is not None and loaded >= max_chars:
+                break
+            group = rows[position:position + batch]
+            texts = self._blob_content([r.get("id") for r in group], workers=batch)
+            for row in group:
+                row["content"] = texts.get(str(row.get("id")), "")
+                loaded += len(row["content"])
+            position += batch
+        for row in rows[position:]:
+            row["content"] = ""
+        return rows
 
     def _rewrite_existing(self, updates, docs):
         """Blob-backed retag: re-upload whole documents (with their stored vectors) for chunks already indexed."""
@@ -211,7 +242,7 @@ class SearchService:
                     raise RuntimeError(f"Azure AI Search rejected a concept update: {item}")
         return updated, not_indexed
 
-    def fetch_chunks(self, url=None, chunk_id=None, neighbors=1):
+    def fetch_chunks(self, url=None, chunk_id=None, neighbors=1, max_chars=None):
         """Read stored chunks of one page from the index.
 
         With chunk_id, returns that chunk and up to `neighbors` chunks on each side. With
@@ -242,10 +273,10 @@ class SearchService:
         response.raise_for_status()
         rows = response.json().get("value", [])
         if settings.search_blob_backed:
-            rows = rows[:400]  # a page this long is cut off at 400 chunks
-            texts = self._blob_content([r.get("id") for r in rows])
-            for row in rows:
-                row["content"] = texts.get(str(row.get("id")), "")
+            # A page this long is cut off at 400 chunks. Read them in page order, and for a whole
+            # page stop once max_chars of text is loaded.
+            rows = sorted(rows, key=lambda r: chunk_index(r.get("id")))[:400]
+            rows = self._load_blob_content(rows, None if chunk_id else max_chars)
         total = None
         if rows:
             page_url = str(rows[0].get("url") or "").replace("'", "''")
