@@ -15,8 +15,9 @@
 #     Start-Crawl www.themuse.com -Wait   ...then follow it to the end with a progress bar
 #     Wait-Crawl muse            follow the latest crawl of a domain: progress bar, pages/min, ETA, stall warning
 #     Resume-Crawl muse          re-run the failed tasks of the domain's latest job
+#     Recover-Crawl muse         put the latest job's stuck pages back on the queue (stale for 5+ minutes; -StaleMinutes 25 to change)
 #     Get-CrawlJobId muse        the full job id of the domain's latest job
-#     Stop-Crawl muse            cancel the domain's latest job (asks first; -Force skips the question)
+#     Stop-Crawl muse            cancel every open job of the domain (asks first; -Force skips the question)
 #     Call GET "/api/health"     any raw call
 
 # Run as a normal script, the commands below would vanish when the script ends. Stop early and say how to load it.
@@ -165,6 +166,16 @@ function Show-CrawlPages([string]$Domain) {
         Write-Host "First failed pages:"
         $bad | Select-Object -First 10 url, attempts, @{ n = "error"; e = { "$($_.error)".Substring(0, [Math]::Min(80, "$($_.error)".Length)) } } | Format-Table -AutoSize -Wrap | Out-Host
     }
+    # Pages that are waiting or in progress, with their tries so far and the last error. A stuck crawl shows up here.
+    $waiting = @()
+    foreach ($state in "queued", "processing") {
+        $more = Call GET "/api/crawl/$($job.JobId)/pages?status=$state&limit=10"
+        if ($more.pages) { $waiting += @($more.pages | Where-Object { $_.status -eq $state }) }
+    }
+    if ($waiting.Count) {
+        Write-Host "Pages still waiting or in progress (first 10):"
+        $waiting | Select-Object -First 10 url, status, attempts, @{ n = "last error"; e = { "$($_.last_error)".Substring(0, [Math]::Min(80, "$($_.last_error)".Length)) } }, updated_utc | Format-Table -AutoSize -Wrap | Out-Host
+    }
 }
 
 function Wait-Crawl([string]$Domain, [int]$Every = 15, [int]$StallMinutes = 10) {
@@ -204,16 +215,25 @@ function Wait-Crawl([string]$Domain, [int]$Every = 15, [int]$StallMinutes = 10) 
     }
 }
 
+function Get-OpenJobs([string]$Domain) {
+    # Every job that is not finished, newest first, for domains containing the text. Reads the latest 100 jobs.
+    $r = Call GET "/api/crawl-status"
+    $finished = "completed", "completed_with_errors", "failed", "cancelled"
+    @($r.jobs | Where-Object { $_.domain -like "*$Domain*" -and $_.status -notin $finished })
+}
+
 function Stop-Crawl([string]$Domain, [switch]$Force) {
-    $job = Find-LatestJob $Domain
-    if (-not $job) { return }
-    Write-Host ("{0}  job {1}  {2}: {3} found, {4} done, {5} pending, limit {6}" -f $job.Domain, $job.Job, $job.Status, $job.Found, $job.Done, $job.Pend, $job.Limit)
-    if ($job.Status -in $script:TerminalStatuses) { Write-Host "That job has already finished ($($job.Status)); nothing to cancel."; return }
+    # Cancels every open job of the domain, not only the latest one: an older job that is still open stops a new crawl from starting.
+    $jobs = @(Get-OpenJobs $Domain)
+    if (-not $jobs.Count) { Write-Host "No open crawl job matches '$Domain'; nothing to cancel."; return }
+    $names = @($jobs.domain | Sort-Object -Unique)
+    if ($names.Count -gt 1) { Write-Warning "'$Domain' matches $($names.Count) domains ($($names -join ', ')). Be more specific."; return }
+    $jobs | Format-Table job_id, domain, status, created_utc, updated_utc, pages_discovered, pages_processed, pending -AutoSize | Out-Host
     if (-not $Force) {
-        $answer = Read-Host "Cancel this job? Pages already crawled stay in the index; queued pages are dropped. (yes/no)"
+        $answer = Read-Host "Cancel $($jobs.Count) job(s)? Pages already crawled stay in the index; queued pages are dropped. (yes/no)"
         if ($answer -ne "yes") { Write-Host "Not cancelled."; return }
     }
-    Call POST "/api/crawl/$($job.JobId)/cancel" | ConvertTo-Json -Depth 3
+    foreach ($j in $jobs) { Call POST "/api/crawl/$($j.job_id)/cancel" | Out-Null; Write-Host "Cancelled $($j.job_id)." }
 }
 
 function Show-CrawlPaths([string]$Domain, [int]$Depth = 1, [int]$Top = 20) {
@@ -304,6 +324,11 @@ function Start-Crawl([string]$Domain, [switch]$Wait) {
     # The app does not start a second job for a domain that already has an open one; it says so in "skipped".
     foreach ($s in @($r.skipped)) { if ($s) { Write-Warning "Skipped $($s.domain): $($s.reason)" } }
     if (@($r.skipped | Where-Object { $_.reason -like "*active crawl*" }).Count) {
+        $open = @(Get-OpenJobs $Domain)
+        if ($open.Count) {
+            Write-Host "Open job(s) blocking it:"
+            $open | Format-Table job_id, status, created_utc, updated_utc, pages_discovered, pages_processed, pending -AutoSize | Out-Host
+        }
         Write-Host "Follow the running crawl with: Wait-Crawl $Domain   (or cancel it first with: Stop-Crawl $Domain)"
     }
     if (-not $r.jobs) { Write-Warning "No job was created. Response: $($r | ConvertTo-Json -Depth 3 -Compress)"; return }
@@ -319,6 +344,16 @@ function Resume-Crawl([string]$Domain) {
     if (-not $job) { return }
     Write-Host "Resuming failed tasks for $($job.Domain), job $($job.JobId) ..."
     Call POST "/api/crawl/$($job.JobId)/resume" | ConvertTo-Json -Depth 3
+}
+
+function Recover-Crawl([string]$Domain, [int]$StaleMinutes = 5) {
+    $job = Find-LatestJob $Domain
+    if (-not $job) { return }
+    Write-Host "Putting stuck pages back on the queue for $($job.Domain), job $($job.JobId) ..."
+    $r = Call POST "/api/crawl/$($job.JobId)/recover" @{ stale_minutes = $StaleMinutes }
+    if ($null -ne $r.requeued) { Write-Host "Requeued $($r.requeued) page(s)." }
+    if ($r.publish_errors) { Write-Warning "Some pages could not be queued:"; $r.publish_errors | Format-Table -AutoSize | Out-Host }
+    if ($null -eq $r.requeued) { $r | ConvertTo-Json -Depth 3 }
 }
 
 Write-Host "Loaded. Try: Show-Crawl | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain>"
