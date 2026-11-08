@@ -91,12 +91,14 @@ class ConceptResolver:
         return str(item.get("id") or item.get("name") or "").strip()
 
     def _term_aliases(self, concept_id, class_item):
+        # query_phrases are matched against questions only. tag_document builds its own list and
+        # skips them, so broad intent phrases ("getting into") never tag page content.
         values = [
             class_item.get("name", ""),
             class_item.get("id", ""),
             class_item.get("definition", ""),
         ]
-        for field in ("aliases", "synonyms", "alternative_terms", "alternate_names"):
+        for field in ("aliases", "synonyms", "alternative_terms", "alternate_names", "query_phrases"):
             value = class_item.get(field, [])
             if isinstance(value, str):
                 values.append(value)
