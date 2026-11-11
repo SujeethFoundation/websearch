@@ -9,7 +9,7 @@ from services.config import settings, VERSION
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
-from services.search_service import SearchService, assemble_document, chunk_index
+from services.search_service import SearchService, FacetUnavailable, assemble_document, chunk_index
 from services.urlutil import normalize_url
 from services.crawl_state import CrawlState
 from services.manual_page import build_page_documents
@@ -273,6 +273,46 @@ def index_status(req):
         return response({"blob_storage": storage.status(count_blobs=count_blobs), "ai_search": searcher.status()})
     except Exception as exc:
         log.exception("Index status failed")
+        return response({"error": str(exc)}, 502)
+
+
+@app.route(route="index/tags", methods=["GET"])
+def index_tags(req):
+    """Which ontology tags (concepts) are on the indexed content.
+
+    No parameters: chunks per tag and per domain. When INDEX_CONCEPTS_FACETABLE is true they come from one facet
+    query (two queries in all). Otherwise, as in sf-knowledge-v2 where the concepts field is not facetable, they are
+    estimated from a sample of the stored chunks and scaled to the index size (?scan=3000, at most 5000; one count
+    query), with a margin of error in the answer.
+      ?domain=www.themuse.com    one domain only
+      ?tag=salary_negotiation    the pages that carry that tag (add &limit=50)
+      ?url=https://...           the tags on each chunk of one page
+    """
+    if not settings.search_configured:
+        return response({"error": "Azure AI Search is not configured."}, 503)
+    try:
+        domain = (req.params.get("domain") or "").strip().lower() or None
+        tag = (req.params.get("tag") or "").strip()
+        url = (req.params.get("url") or "").strip()
+        if url:
+            return response(searcher.page_tags(normalize_url(url)))
+        if tag:
+            limit = min(max(int(req.params.get("limit", "50")), 1), 500)
+            return response(searcher.pages_with_tag(tag, domain, limit))
+        if settings.concepts_facetable:
+            try:
+                return response(searcher.tag_counts(domain))
+            except FacetUnavailable:
+                pass  # the setting says facetable but the index disagrees: fall back to the sample
+        scan = int(req.params.get("scan", "3000"))
+        if domain:
+            scan = 5000  # a domain is only part of the sample, so read as much as allowed
+        population = searcher.count_chunks(domain)
+        return response(searcher.sample_tag_counts(domain, scan, population))
+    except ValueError as exc:
+        return response({"error": str(exc)}, 400)
+    except Exception as exc:
+        log.exception("Tag counts failed")
         return response({"error": str(exc)}, 502)
 
 

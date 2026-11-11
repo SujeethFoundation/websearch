@@ -12,6 +12,10 @@
 #     Show-CrawlPaths tealhq     the latest job's pages grouped by URL section (/post, /job ...) and outcome
 #     Show-CrawlTimeline tealhq -Path /job   when pages under a path were discovered, done and rejected (UTC)
 #     Show-CrawlHours            which crawl jobs were running in each UTC hour, to match Azure AI Search query spikes (-Hours 48, -SpikeHours 4,11, -Domain muse)
+#     Show-CrawlTags             chunks per ontology tag, plus untagged chunks and chunks per domain
+#     Show-CrawlTags muse        the same for one domain
+#     Show-CrawlTags -Tag salary_negotiation -Domain muse   the pages that carry one tag
+#     Show-CrawlTags -Url https://www.themuse.com/advice/some-page   the tags on each chunk of one page
 #     Start-Crawl www.themuse.com   start a crawl and show the page limit it was given
 #     Start-Crawl www.themuse.com -Wait   ...then follow it to the end with a progress bar
 #     Wait-Crawl muse            follow the latest crawl of a domain: progress bar, pages/min, ETA, stall warning
@@ -368,6 +372,87 @@ function Show-CrawlHours([int]$Hours = 24, [int[]]$SpikeHours = @(4, 11), [strin
     Write-Host "No job in a spike hour means the crawl did not cause it. Look at the Application Insights 'Queue disposition' traces for retag or backfill tasks instead."
 }
 
+function Show-CrawlTags([string]$Domain, [string]$Tag, [string]$Url, [int]$Top = 40, [int]$Pages = 25, [int]$Scan = 3000) {
+    # What the ontology tagged. Needs the /api/index/tags endpoint (websearch app version with Show-CrawlTags support).
+    #   Show-CrawlTags [domain]            chunks per tag, untagged chunks, and chunks per domain (-Top limits the tag rows)
+    #   Show-CrawlTags -Tag <tag> [domain] the pages that carry that tag, most tagged chunks first (-Pages limits the rows)
+    #   Show-CrawlTags -Url <page url>     the tags on each chunk of one page
+    # Reads the search index: one count query for the counts (plus one for a domain), one query for each of the other views.
+    # sf-knowledge-v2 cannot count by the concepts field (it is not facetable), so the counts are estimated from a sample of
+    # the stored chunks, scaled to the index size, with a margin of error shown. -Scan sets the sample (3000, at most 5000;
+    # a domain always uses 5000).
+    $full = ""
+    if ($Domain) {
+        $found = @(Get-DashboardRows $Domain)
+        if ($found.Count -eq 1) { $full = $found[0].Domain }
+        elseif ($found.Count -gt 1) { Write-Warning "'$Domain' matches $($found.Count) domains ($($found.Domain -join ', ')). Be more specific."; return }
+        elseif ($Domain -like "*.*") { $full = $Domain.ToLower() }
+        else { Write-Warning "No domain matches '$Domain'. Use the full domain, e.g. www.themuse.com"; return }
+    }
+    $enc = { param($v) [uri]::EscapeDataString($v) }
+    if ($Url) {
+        $r = Call GET "/api/index/tags?url=$(& $enc $Url)"
+        if (-not $r -or $r -is [string] -or $null -eq $r.chunks) { Write-Warning "No usable answer for that page. Response: $r"; return }
+        if (-not @($r.chunks).Count) { Write-Host "No chunks of $Url are in the index."; return }
+        Write-Host "$($r.title)  ($($r.domain))"
+        Write-Host $r.url
+        @($r.chunks) | ForEach-Object {
+            [pscustomobject]@{ Chunk = $_.chunk; Tags = $(if (@($_.tags).Count) { @($_.tags) -join ", " } else { "(untagged)" }) }
+        } | Format-Table -AutoSize -Wrap | Out-Host
+        $all = @(@($r.chunks) | ForEach-Object { @($_.tags) } | Where-Object { $_ })
+        if ($all.Count) {
+            Write-Host "Tags on this page:"
+            $all | Group-Object | Sort-Object Count -Descending |
+                ForEach-Object { [pscustomobject]@{ Tag = $_.Name; Chunks = $_.Count } } | Format-Table -AutoSize | Out-Host
+        }
+        return
+    }
+    if ($Tag) {
+        $q = "/api/index/tags?tag=$(& $enc $Tag)&limit=$Pages"
+        if ($full) { $q += "&domain=$(& $enc $full)" }
+        $r = Call GET $q
+        if (-not $r -or $r -is [string] -or $null -eq $r.pages) { Write-Warning "No usable answer. Response: $r"; return }
+        $scope = if ($full) { " in $full" } else { "" }
+        Write-Host ("Tag '{0}'{1}: {2} chunks match, on {3} pages (read {4} chunks)." -f $r.tag, $scope, $r.chunks_matched, $r.pages_found, $r.chunks_read)
+        if ([int]$r.chunks_matched -gt [int]$r.chunks_read) { Write-Warning "More chunks match than were read ($($r.chunks_read)); the page list is partial. Add a domain to narrow it." }
+        @($r.pages) | ForEach-Object {
+            [pscustomobject]@{ Chunks = $_.chunks; Url = $_.url; Title = $(if ($_.title) { "$($_.title)".Substring(0, [Math]::Min(50, "$($_.title)".Length)) } else { "" }) }
+        } | Format-Table -AutoSize -Wrap | Out-Host
+        if ([int]$r.pages_found -gt @($r.pages).Count) { Write-Host "... and $($r.pages_found - @($r.pages).Count) more pages. Use -Pages to show more." }
+        return
+    }
+    $q = "/api/index/tags?scan=$Scan"
+    if ($full) { $q += "&domain=$(& $enc $full)" }
+    $r = Call GET $q
+    if (-not $r -or $r -is [string] -or $null -eq $r.tags) { Write-Warning "No usable answer. Is the websearch app deployed with /api/index/tags? Response: $r"; return }
+    $total = [int]$r.total_chunks
+    $scope = if ($full) { $full } else { "all domains" }
+    $sampled = ($r.source -eq "blob_sample")
+    $label = if ($sampled) { "Est. chunks" } else { "Chunks" }
+    Write-Host ("Tags on {0}: {1}{2:N0} chunks, {3}{4:N0} untagged ({5:N1}%)" -f $scope, $(if ($sampled) { "about " } else { "" }), $total, $(if ($sampled) { "about " } else { "" }), [int]$r.untagged_chunks, $(if ($total) { 100 * [int]$r.untagged_chunks / $total } else { 0 }))
+    if ($sampled) {
+        Write-Host ("Estimated from a sample of {0} stored chunks ({1} in scope), scaled to the index. Shares are good to about +/-{2} points; chunk counts are estimates." -f $r.scanned, $r.sample_chunks, $r.margin_points) -ForegroundColor Yellow
+    }
+    $tagRows = @($r.tags | Sort-Object { [int]$_.chunks } -Descending)
+    $tagRows | Select-Object -First $Top | ForEach-Object {
+        $row = [ordered]@{ Tag = $_.tag }
+        $row[$label] = $_.chunks
+        $row["Share"] = Format-Bar $_.chunks $total 12
+        [pscustomobject]$row
+    } | Format-Table -AutoSize | Out-Host
+    if ($tagRows.Count -gt $Top) { Write-Host "... and $($tagRows.Count - $Top) more tags. Use -Top to show more." }
+    Write-Host "A chunk can carry several tags, so the tag counts add up to more than the chunk total."
+    if (-not $full -and @($r.domains).Count) {
+        Write-Host "Chunks per domain:"
+        @($r.domains) | ForEach-Object {
+            $row = [ordered]@{ Domain = $_.domain }
+            $row[$label] = $_.chunks
+            [pscustomobject]$row
+        } | Format-Table -AutoSize | Out-Host
+        Write-Host "Drill in with: Show-CrawlTags <domain>   or   Show-CrawlTags -Tag <tag> <domain>"
+    }
+}
+
 function Start-Crawl([string]$Domain, [switch]$Wait) {
     if (-not $Domain) { Write-Warning "Give the full domain, e.g. Start-Crawl www.themuse.com"; return }
     $r = Call POST "/api/crawl" @{ domains = @($Domain) }
@@ -406,4 +491,4 @@ function Recover-Crawl([string]$Domain, [int]$StaleMinutes = 5) {
     if ($null -eq $r.requeued) { $r | ConvertTo-Json -Depth 3 }
 }
 
-Write-Host "Loaded. Try: Show-Crawl | Show-CrawlHours | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain>"
+Write-Host "Loaded. Try: Show-Crawl | Show-CrawlHours | Show-CrawlTags | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain>"

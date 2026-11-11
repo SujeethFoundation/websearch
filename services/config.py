@@ -111,6 +111,9 @@ class Settings:
     # The nightly reconcile queues a backfill only when the index holds more than this percent fewer chunks than
     # Blob Storage. A few stored chunks have no text and are never indexed, so some gap is normal.
     index_reconcile_tolerance_pct = _int("INDEX_RECONCILE_TOLERANCE_PCT", 1, 0, 100)
+    # Set to true only for an index whose concepts and domain fields are facetable. In sf-knowledge-v2 they are not,
+    # so tag counts come from a sample of the stored chunks.
+    concepts_facetable = _flag("INDEX_CONCEPTS_FACETABLE", False)
     # Crawl job history. A job with no update for this many days no longer blocks a new crawl of its domain.
     open_job_stale_days = _int("OPEN_JOB_STALE_DAYS", 3, 1)
     # Jobs (and their page rows) not updated for this many days are deleted. The newest job of each domain is kept.

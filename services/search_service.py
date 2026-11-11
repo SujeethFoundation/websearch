@@ -67,6 +67,10 @@ class IndexBusyError(RuntimeError):
     """The search service stayed busy (429 or 503) through every retry."""
 
 
+class FacetUnavailable(RuntimeError):
+    """The index will not return counts for the concepts field (it is not facetable)."""
+
+
 def _breaker_open():
     return time.monotonic() < _breaker_until
 
@@ -590,6 +594,149 @@ class SearchService:
             "search_mode": "hybrid",
             "embedding_enabled": True,
             "results": results,
+        }
+
+    @staticmethod
+    def _domain_filter(domain):
+        return "domain eq '" + str(domain).strip().lower().replace("'", "''") + "'" if domain else None
+
+    def tag_counts(self, domain=None, top=200):
+        """Chunks per ontology tag (the concepts field) from one facet query, plus the untagged chunks.
+
+        Without a domain it also returns chunks per domain. Raises FacetUnavailable when the index does not
+        allow faceting on the concepts field.
+        """
+        if not self.configured:
+            raise RuntimeError("Azure AI Search is not configured.")
+        flt = self._domain_filter(domain)
+        concept_facet = f"concepts,count:{max(1, min(int(top), 1000))}"
+        attempts = [[concept_facet]] if flt else [[concept_facet, "domain,count:100"], [concept_facet]]
+        payload = None
+        for facets in attempts:
+            body = {"search": "*", "top": 0, "count": True, "facets": facets}
+            if flt:
+                body["filter"] = flt
+            response = self._post("search", body, 45, attempts=3, max_wait=5)
+            if response.status_code == 400:
+                last_error = response.text[:300]
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            break
+        if payload is None:
+            raise FacetUnavailable(last_error)
+        found = payload.get("@search.facets") or {}
+        counted = self._post("search", {
+            "search": "*", "top": 0, "count": True,
+            "filter": "not concepts/any()" + (f" and {flt}" if flt else ""),
+        }, 45, attempts=3, max_wait=5)
+        counted.raise_for_status()
+        return {
+            "source": "index",
+            "total_chunks": payload.get("@odata.count"),
+            "untagged_chunks": counted.json().get("@odata.count"),
+            "tags": [{"tag": f.get("value"), "chunks": f.get("count")} for f in found.get("concepts", [])],
+            "domains": [{"domain": f.get("value"), "chunks": f.get("count")} for f in found.get("domain", [])],
+        }
+
+    def count_chunks(self, domain=None):
+        """How many chunks the index holds (for one domain, when given): one count query."""
+        if not self.configured:
+            raise RuntimeError("Azure AI Search is not configured.")
+        body = {"search": "*", "top": 0, "count": True}
+        flt = self._domain_filter(domain)
+        if flt:
+            body["filter"] = flt
+        response = self._post("search", body, 45, attempts=3, max_wait=5)
+        response.raise_for_status()
+        return int(response.json().get("@odata.count") or 0)
+
+    def sample_tag_counts(self, domain=None, scan=3000, population=None):
+        """Chunks per tag estimated from a sample of the stored chunk blobs.
+
+        The index cannot count by the concepts field (it is not facetable), but every stored chunk carries its tags.
+        Blob names start with a hash, so the first `scan` names are an unbiased sample of all chunks. Shares are
+        measured on the sample and scaled to `population`, the number of chunks the index holds (for the domain, when
+        one is given). margin_points is the worst-case 95% margin on a share, in percentage points.
+        """
+        scan = max(100, min(int(scan), 5000))
+        names, _ = self.storage.list_blob_name_page("documents/", page_size=scan)
+        want = str(domain).strip().lower() if domain else None
+
+        def read(name):
+            doc = self.storage.get(name) or {}
+            return str(doc.get("domain") or "").lower(), doc.get("concepts") or []
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            rows = list(pool.map(read, names))
+        tags, hosts, matched, untagged = {}, {}, 0, 0
+        for host, concepts in rows:
+            hosts[host] = hosts.get(host, 0) + 1
+            if want and host != want:
+                continue
+            matched += 1
+            untagged += 0 if concepts else 1
+            for concept in concepts:
+                tags[str(concept)] = tags.get(str(concept), 0) + 1
+        total = int(population) if population is not None else matched
+        scale = (total / matched) if matched else 0
+        ranked = lambda counts, key: [
+            {key: k, "chunks": round(v * scale), "sample_chunks": v}
+            for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+        return {
+            "source": "blob_sample", "scanned": len(names), "sample_chunks": matched,
+            "total_chunks": total, "untagged_chunks": round(untagged * scale),
+            "margin_points": round(98 / (matched ** 0.5), 1) if matched else None,
+            "tags": ranked(tags, "tag"),
+            "domains": [] if want else [
+                {"domain": k, "chunks": round(v * (total / len(names))) if names else 0}
+                for k, v in sorted(hosts.items(), key=lambda kv: (-kv[1], kv[0]))
+            ],
+        }
+
+    def pages_with_tag(self, tag, domain=None, limit=50):
+        """The pages that carry one tag, with how many of their chunks have it. Reads up to 1000 matching chunks."""
+        if not self.configured:
+            raise RuntimeError("Azure AI Search is not configured.")
+        flt = "concepts/any(c: c eq '" + str(tag).strip().lower().replace("'", "''") + "')"
+        domain_filter = self._domain_filter(domain)
+        if domain_filter:
+            flt += " and " + domain_filter
+        response = self._post("search", {
+            "search": "*", "filter": flt, "select": "id,title,url,domain", "top": 1000, "count": True,
+        }, 45, attempts=3, max_wait=5)
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("value", [])
+        pages = {}
+        for row in rows:
+            key = row.get("url") or ""
+            page = pages.setdefault(key, {"url": key, "title": row.get("title"), "domain": row.get("domain"), "chunks": 0})
+            page["chunks"] += 1
+        ranked = sorted(pages.values(), key=lambda p: (-p["chunks"], p["url"]))
+        return {
+            "tag": str(tag).strip().lower(), "chunks_matched": payload.get("@odata.count"), "chunks_read": len(rows),
+            "pages_found": len(ranked), "pages": ranked[:max(1, int(limit))],
+        }
+
+    def page_tags(self, url):
+        """The tags on each chunk of one page, read from the index (no chunk text)."""
+        if not self.configured:
+            raise RuntimeError("Azure AI Search is not configured.")
+        base = str(url).strip().split("#", 1)[0]
+        variants = sorted({base, base.rstrip("/"), base.rstrip("/") + "/"} - {"", "/"})
+        joined = "|".join(v.replace("'", "''") for v in variants)
+        response = self._post("search", {
+            "search": "*", "filter": f"search.in(url, '{joined}', '|')", "top": 1000,
+            "select": "id,title,url,domain,concepts",
+        }, 45, attempts=3, max_wait=5)
+        response.raise_for_status()
+        rows = sorted(response.json().get("value", []), key=lambda r: chunk_index(r.get("id")))
+        return {
+            "url": rows[0].get("url") if rows else base, "title": rows[0].get("title") if rows else None,
+            "domain": rows[0].get("domain") if rows else None,
+            "chunks": [{"chunk": chunk_index(r.get("id")), "tags": r.get("concepts") or []} for r in rows],
         }
 
     def delete_url(self, url):
