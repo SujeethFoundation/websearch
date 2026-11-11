@@ -919,8 +919,9 @@ def scheduled_monthly_crawl(timer: func.TimerRequest) -> None:
 def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
     """Daily 11:00 UTC: index any stored chunk that is missing from the search index.
 
-    Queues the same resumable backfill as POST /api/index/backfill, in "missing" mode, so a clean
-    index costs one cheap existence check per 10 chunks and no writes. The run is skipped when:
+    Queues the same resumable backfill as POST /api/index/backfill, in "missing" mode, but only when the
+    index holds clearly fewer chunks than Blob Storage (see INDEX_RECONCILE_TOLERANCE_PCT). A clean index
+    costs two counts and no per-chunk queries. The run is skipped when:
       - INDEX_RECONCILE_ENABLED is set to false,
       - storage, search, or embeddings are not configured, or
       - the queue already holds more than INDEX_RECONCILE_MAX_QUEUE messages (default 500). That keeps
@@ -940,6 +941,22 @@ def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
         if waiting > limit:
             log.warning("Nightly index reconcile skipped: the queue holds %d messages (limit %d)", waiting, limit)
             return
+        # A "missing" backfill asks the index about every stored chunk, one query per few chunks, so a clean
+        # index still cost tens of thousands of queries a night. Compare two totals first (one count on each
+        # side) and run the backfill only when the index holds clearly fewer chunks than Blob Storage.
+        stored = storage.status(count_blobs=True).get("document_count")
+        indexed = searcher.status().get("document_count")
+        if stored is not None and indexed is not None:
+            gap = int(stored) - int(indexed)
+            allowed = int(int(stored) * settings.index_reconcile_tolerance_pct / 100)
+            # WARNING level on purpose: this is the one line a day that shows what the reconcile decided,
+            # and warnings survive log sampling.
+            if gap <= allowed:
+                log.warning("Nightly index reconcile skipped: the index holds %d of %d stored chunks (gap %d, allowed %d)",
+                            int(indexed), int(stored), gap, allowed)
+                return
+            log.warning("Nightly index reconcile: the index holds %d of %d stored chunks (gap %d, allowed %d); queueing a backfill",
+                        int(indexed), int(stored), gap, allowed)
         queue.send_message(json.dumps({
             "task_type": "index_backfill_page",
             "continuation_token": None,

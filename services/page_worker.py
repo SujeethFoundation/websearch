@@ -195,7 +195,7 @@ class PageWorker:
             # as skipped, so it cannot block stale-page cleanup. A first-time 404 still counts as skipped.
             gone = response.status_code in (404, 410) and bool(previous)
             if gone:
-                self.search.delete_url(url)
+                self.search.delete_page(url, previous.get('chunk_count'))
                 self.state.manifest_delete(domain, url)
             self._complete(job_id,url,claim_token,'skipped',page_fields={'reason':f'http_{response.status_code}'},
                            **({} if gone else {'pages_skipped':1})); return {'status': 'completed'}
@@ -260,9 +260,14 @@ class PageWorker:
         if old_hash==digest:
             self.state.manifest_put(domain,final_url,content_hash=digest,last_seen_job=job_id,etag=response.headers.get('ETag'),last_modified=response.headers.get('Last-Modified'),page_type=page_type)
             self._complete(job_id,url,claim_token,'unchanged',pages_processed=1); self._finalize_if_safe(job_id,domain); return {'status': 'completed'}
-        # Remove prior chunks for this URL before writing a changed version, preventing
-        # orphaned tail chunks when the new page is shorter.
-        self.search.delete_url(final_url)
+        # Chunk ids are <page hash>-<index>, so the new chunks overwrite the old ones in place. Only
+        # tail chunks a shorter page no longer has need deleting, and the manifest records how many
+        # chunks the last version had. A page never seen before has nothing to delete, so there is no
+        # index query for it. Manifest rows written before chunk_count existed fall back to delete_url.
+        prior=previous or self.state.manifest_get(domain,final_url)
+        old_chunks=int((prior or {}).get('chunk_count') or 0)
+        if prior and not old_chunks:
+            self.search.delete_url(final_url)
         page_id=hashlib.sha256(final_url.encode()).hexdigest(); chunks=tagged=untagged=0
         allowed=json.loads(job.get('allowed_concepts_json','[]'))
         # Embed and store a few chunks at a time. Each vector is about 50 KB as a Python list, so holding every
@@ -279,6 +284,8 @@ class PageWorker:
                 chunks+=1; tagged+=bool(concepts); untagged+=not bool(concepts)
             _, group_deferred=self.search.upsert_or_defer(page_documents, persist_blobs=True)
             deferred.extend(group_deferred)
+        if old_chunks>chunks:
+            self.search.delete_chunks(page_id,chunks,old_chunks)
         index_deferred=False
         if deferred:
             # The chunks and their vectors are safely stored. Index them later instead of
@@ -304,11 +311,11 @@ class PageWorker:
         if int(job.get('pages_failed',0)) or int(job.get('pages_skipped',0)) or int(job.get('pages_processed',0)) >= int(job.get('page_limit',0)):
             return
         removed_pages=0; removed_chunks=0
-        for record in self.state.manifest_for_domain(domain, select=['PartitionKey','RowKey','url','last_seen_job','status']):
+        for record in self.state.manifest_for_domain(domain, select=['PartitionKey','RowKey','url','last_seen_job','status','chunk_count']):
             if record.get('last_seen_job') == job_id or record.get('status') == 'stale': continue
             url=record.get('url')
             if not url: continue
-            removed_chunks += self.search.delete_url(url)
+            removed_chunks += self.search.delete_page(url, record.get('chunk_count'))
             try:
                 self.state.manifest_mark_stale(record)
             except Exception:

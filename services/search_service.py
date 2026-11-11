@@ -238,21 +238,23 @@ class SearchService:
         return rows
 
     def _rewrite_existing(self, updates, docs):
-        """Blob-backed retag: re-upload whole documents (with their stored vectors) for chunks already indexed."""
+        """Blob-backed retag: re-upload whole documents (with their stored vectors) with their new concepts.
+
+        Blob Storage holds every chunk, so the index is not asked which chunks it already has (that was one
+        query per batch). A chunk that was not indexed yet is simply indexed now.
+        """
         by_id = {str(d["id"]): d for d in (docs or []) if d.get("id")}
-        ids = [str(doc_id) for doc_id, _ in updates]
-        present = self._existing_ids(ids)
         todo = []
         for doc_id, concepts in updates:
             doc = by_id.get(str(doc_id))
-            if str(doc_id) in present and doc:
+            if doc:
                 fresh = dict(doc)
                 fresh["concepts"] = [str(c) for c in concepts]
                 todo.append(fresh)
         if todo:
             vectors = self._vectors_for(todo)
             self._upload([self._search_doc(d, v) for d, v in zip(todo, vectors)])
-        return len(todo), len(ids) - len(present)
+        return len(todo), len(updates) - len(todo)
 
     def update_concepts(self, updates, docs=None):
         """Apply new concept tags to documents already in the index. No re-embedding of unchanged text.
@@ -353,6 +355,34 @@ class SearchService:
         if failed:
             raise RuntimeError(f"Azure AI Search could not delete {len(failed)} document(s): {failed[:3]}")
         return len(ids)
+
+    def delete_chunks(self, page_id, start, end):
+        """Delete chunks page_id-start up to page_id-(end-1) by id: index entries, blobs and vectors.
+
+        Chunk ids are deterministic (<page hash>-<index>), so no index query is needed to find them.
+        An id that is not there is not an error.
+        """
+        ids = [f"{page_id}-{i}" for i in range(int(start), int(end))]
+        if not ids:
+            return 0
+        self.delete_ids(ids)
+        for doc_id in ids:
+            name = "documents/" + doc_id + ".json"
+            try:
+                self.storage.delete(name)
+                _blob_cache_forget(name)
+                self.storage.delete(self.vector_key(doc_id))
+            except Exception:
+                log.warning("Could not delete stored blob for chunk %s", doc_id, exc_info=True)
+        return len(ids)
+
+    def delete_page(self, url, chunk_count=None):
+        """Remove every chunk of a page. With a known chunk_count this deletes by id and runs no
+        index query. Without one it falls back to delete_url, which does run a query."""
+        if chunk_count:
+            page_id = hashlib.sha256(str(url).encode()).hexdigest()
+            return self.delete_chunks(page_id, 0, int(chunk_count))
+        return self.delete_url(url)
 
     @staticmethod
     def vector_key(doc_id):

@@ -11,6 +11,7 @@
 #     Show-CrawlPages muse       what happened to the latest job's pages, grouped, plus failed URLs
 #     Show-CrawlPaths tealhq     the latest job's pages grouped by URL section (/post, /job ...) and outcome
 #     Show-CrawlTimeline tealhq -Path /job   when pages under a path were discovered, done and rejected (UTC)
+#     Show-CrawlHours            which crawl jobs were running in each UTC hour, to match Azure AI Search query spikes (-Hours 48, -SpikeHours 4,11, -Domain muse)
 #     Start-Crawl www.themuse.com   start a crawl and show the page limit it was given
 #     Start-Crawl www.themuse.com -Wait   ...then follow it to the end with a progress bar
 #     Wait-Crawl muse            follow the latest crawl of a domain: progress bar, pages/min, ETA, stall warning
@@ -318,6 +319,55 @@ function Show-CrawlTimeline([string]$Domain, [string]$Path = "/job", [int]$Bucke
     if ($underFound.Count) { Write-Host ("{0} found {1:MM-dd HH:mm} to {2:MM-dd HH:mm} UTC: {3} pages." -f $Path, $underFound[0].Created.ToUniversalTime(), $underFound[-1].Created.ToUniversalTime(), $underFound.Count) }
 }
 
+function ConvertTo-UtcTime($value) {
+    # Windows PowerShell returns timestamps as text, PowerShell 7 as DateTime. A time with no offset counts as UTC.
+    if ($null -eq $value -or "$value" -eq "") { return $null }
+    if ($value -is [datetime]) { return $value.ToUniversalTime() }
+    try { [DateTimeOffset]::Parse("$value", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime }
+    catch { $null }
+}
+
+function Show-CrawlHours([int]$Hours = 24, [int[]]$SpikeHours = @(4, 11), [string]$Domain = "") {
+    # Which crawl jobs were running in each UTC hour, to compare with Azure AI Search query spikes.
+    # A job counts as running from created_utc to updated_utc (its last write), so one that sat idle in the middle still shows. Reads the latest 100 jobs.
+    $r = Call GET "/api/crawl-status"
+    if (-not $r -or -not $r.jobs) { Write-Warning "No jobs came back. Raw response: $($r | ConvertTo-Json -Depth 3 -Compress)"; return }
+    $now   = (Get-Date).ToUniversalTime()
+    $since = $now.AddHours(-$Hours)
+    $jobs = @(foreach ($j in $r.jobs) {
+        if ($Domain -and $j.domain -notlike "*$Domain*") { continue }
+        $created = ConvertTo-UtcTime $j.created_utc
+        $updated = ConvertTo-UtcTime $j.updated_utc
+        if (-not $created) { continue }
+        if (-not $updated) { $updated = $created }
+        [pscustomobject]@{
+            Domain = $j.domain; Status = (Short-Status $j.status); Created = $created; Updated = $updated
+            Done = $j.pages_processed; Chunks = $j.chunks_indexed; Pend = $j.pending; Job = (Get-JobId $j).Substring(0, 8)
+        }
+    })
+    $recent = @($jobs | Where-Object { $_.Updated -ge $since } | Sort-Object Created)
+    if (-not $recent.Count) { Write-Host "No crawl job was active in the last $Hours hours."; return }
+    Write-Host "Crawl jobs active in the last $Hours hours (UTC; now $($now.ToString('MM-dd HH:mm')))"
+    $recent | Format-Table Domain, Status,
+        @{ n = "Created"; e = { $_.Created.ToString("MM-dd HH:mm") } },
+        @{ n = "Updated"; e = { $_.Updated.ToString("MM-dd HH:mm") } },
+        Done, Chunks, Pend, Job -AutoSize | Out-Host
+    $first = [datetime]::new($since.Year, $since.Month, $since.Day, $since.Hour, 0, 0, [DateTimeKind]::Utc)
+    $table = for ($h = $first; $h -lt $now; $h = $h.AddHours(1)) {
+        $end    = $h.AddHours(1)
+        $active = @($jobs | Where-Object { $_.Created -lt $end -and $_.Updated -ge $h })
+        [pscustomobject]@{
+            "UTC hour" = $h.ToString("MM-dd HH:00")
+            Jobs       = $active.Count
+            Domains    = (@($active | ForEach-Object { $_.Domain } | Sort-Object -Unique) -join ", ")
+            Note       = if ($SpikeHours -contains $h.Hour) { "<-- spike hour" } else { "" }
+        }
+    }
+    Write-Host "Active crawl jobs by UTC hour:"
+    $table | Format-Table -AutoSize -Wrap | Out-Host
+    Write-Host "No job in a spike hour means the crawl did not cause it. Look at the Application Insights 'Queue disposition' traces for retag or backfill tasks instead."
+}
+
 function Start-Crawl([string]$Domain, [switch]$Wait) {
     if (-not $Domain) { Write-Warning "Give the full domain, e.g. Start-Crawl www.themuse.com"; return }
     $r = Call POST "/api/crawl" @{ domains = @($Domain) }
@@ -356,4 +406,4 @@ function Recover-Crawl([string]$Domain, [int]$StaleMinutes = 5) {
     if ($null -eq $r.requeued) { $r | ConvertTo-Json -Depth 3 }
 }
 
-Write-Host "Loaded. Try: Show-Crawl | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain>"
+Write-Host "Loaded. Try: Show-Crawl | Show-CrawlHours | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain>"

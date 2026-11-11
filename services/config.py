@@ -80,7 +80,9 @@ class Settings:
     search_null_vector_fields = tuple(
         x.strip() for x in os.getenv("AZURE_SEARCH_NULL_VECTOR_FIELDS", "").split(",") if x.strip()
     )
-    index_backfill_batch_size = max(1, min(int(os.getenv("INDEX_BACKFILL_BATCH_SIZE", "10")), 25))
+    # Chunks per backfill task. A "missing" backfill asks the index about each task's chunks with one query, so
+    # a larger batch means fewer queries.
+    index_backfill_batch_size = max(1, min(int(os.getenv("INDEX_BACKFILL_BATCH_SIZE", "50")), 100))
 
     max_pages = int(os.getenv("MAX_PAGES_PER_DOMAIN", "10000"))
     max_crawl_depth = int(os.getenv("MAX_CRAWL_DEPTH", "5"))
@@ -106,6 +108,9 @@ class Settings:
     weekly_crawl_domains = frozenset(_csv("WEEKLY_CRAWL_DOMAINS", "sujeeth.org,topics.sujeeth.org"))
     index_reconcile_enabled = _flag("INDEX_RECONCILE_ENABLED", True)
     index_reconcile_max_queue = _int("INDEX_RECONCILE_MAX_QUEUE", 500)
+    # The nightly reconcile queues a backfill only when the index holds more than this percent fewer chunks than
+    # Blob Storage. A few stored chunks have no text and are never indexed, so some gap is normal.
+    index_reconcile_tolerance_pct = _int("INDEX_RECONCILE_TOLERANCE_PCT", 1, 0, 100)
     # Crawl job history. A job with no update for this many days no longer blocks a new crawl of its domain.
     open_job_stale_days = _int("OPEN_JOB_STALE_DAYS", 3, 1)
     # Jobs (and their page rows) not updated for this many days are deleted. The newest job of each domain is kept.
