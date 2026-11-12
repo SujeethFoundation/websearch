@@ -177,6 +177,13 @@ class Settings:
     search_breaker_seconds = _float("SEARCH_BREAKER_SECONDS", 120)
     embed_batch_size = _int("EMBED_BATCH_SIZE", 16, 1)
     embed_min_interval = _float("EMBED_MIN_INTERVAL_SECONDS", 0)
+    # Search-question embeddings sit on the search path, so they are bounded: one request waits at most
+    # EMBED_QUERY_TIMEOUT_SECONDS, there are at most EMBED_QUERY_ATTEMPTS tries, and a throttled answer that asks for a
+    # wait longer than EMBED_QUERY_MAX_WAIT_SECONDS is not waited out. The search then continues with keywords only
+    # (search_mode "keyword") instead of holding the caller. Indexing keeps its own, longer retries.
+    embed_query_timeout = max(1.0, _float("EMBED_QUERY_TIMEOUT_SECONDS", 8))
+    embed_query_attempts = _int("EMBED_QUERY_ATTEMPTS", 2, 1, 6)
+    embed_query_max_wait = max(0.0, _float("EMBED_QUERY_MAX_WAIT_SECONDS", 2))
     index_max_deferrals = _int("INDEX_MAX_DEFERRALS", 12, 0)
 
     # How long the ontology client keeps a successful manifest or domain-concept answer.

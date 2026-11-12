@@ -971,7 +971,39 @@ def test_a_question_is_embedded_once_and_remembered(monkeypatch):
     service, calls = embedding_service(monkeypatch)
     first = service.embed_query("How do I find a mentor?")
     assert service.embed_query("how do i   find a mentor?") == first and len(calls) == 1
-    assert calls[0][1] == 20                                   # gives up sooner than indexing does
+    assert calls[0][1] == settings.embed_query_timeout         # gives up sooner than indexing does
+    assert settings.embed_query_timeout < 90
+
+
+class ThrottledResp:
+    def __init__(self, retry_after):
+        self.status_code = 429
+        self.headers = {"Retry-After": str(retry_after)}
+
+    def raise_for_status(self):
+        raise RuntimeError("429 throttled")
+
+
+def test_a_throttled_question_does_not_wait_out_a_long_retry_after(monkeypatch):
+    service, _ = embedding_service(monkeypatch)
+    calls, slept = [], []
+    service.session = types.SimpleNamespace(
+        post=lambda url, params=None, json=None, timeout=None: calls.append(timeout) or ThrottledResp(30))
+    monkeypatch.setattr(es.time, "sleep", lambda s: slept.append(s))
+    with pytest.raises(RuntimeError, match="429"):
+        service.embed_query("how do I find a mentor")
+    assert len(calls) == 1 and not slept                       # asked to wait 30 s: the search goes on without it
+
+
+def test_a_short_throttle_is_retried_within_the_attempt_limit(monkeypatch):
+    service, _ = embedding_service(monkeypatch)
+    monkeypatch.setattr(settings, "embed_query_attempts", 2)
+    answers = [ThrottledResp(1), VecResp(DIMS)]
+    service.session = types.SimpleNamespace(post=lambda url, params=None, json=None, timeout=None: answers.pop(0))
+    slept = []
+    monkeypatch.setattr(es.time, "sleep", lambda s: slept.append(s))
+    assert len(service.embed_query("a short wait")) == DIMS
+    assert slept == [1.0]
 
 
 def test_the_question_cache_is_bounded(monkeypatch):

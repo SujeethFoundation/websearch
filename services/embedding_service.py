@@ -45,8 +45,10 @@ class EmbeddingService:
         self._query_cache = OrderedDict()
         self._query_lock = threading.Lock()
 
-    def _post_with_retry(self, url, payload, throttled=True, attempts=MAX_ATTEMPTS, timeout=90):
-        """POST with exponential backoff on throttling and transient server errors."""
+    def _post_with_retry(self, url, payload, throttled=True, attempts=MAX_ATTEMPTS, timeout=90, fail_fast_over=None):
+        """POST with exponential backoff on throttling and transient server errors.
+
+        With fail_fast_over, a wait longer than that many seconds is not slept: the error is raised at once."""
         response = None
         for attempt in range(attempts):
             if throttled:
@@ -62,6 +64,8 @@ class EmbeddingService:
                 if attempt == attempts - 1:
                     raise
                 wait = min(2 ** attempt, MAX_WAIT_SECONDS)
+                if fail_fast_over is not None:
+                    wait = min(wait, fail_fast_over)
                 log.warning("Embedding request failed (%s); retry %d/%d in %ss",
                             exc.__class__.__name__, attempt + 1, attempts - 1, wait)
                 time.sleep(wait)
@@ -73,6 +77,10 @@ class EmbeddingService:
                 except ValueError:
                     wait = 2 ** attempt
                 wait = min(wait, MAX_WAIT_SECONDS)
+                if fail_fast_over is not None and wait > fail_fast_over:
+                    log.warning("Embedding endpoint returned %s and asked for a %ss wait; not waiting on the search path",
+                                response.status_code, wait)
+                    response.raise_for_status()
                 log.warning("Embedding endpoint returned %s; retry %d/%d in %ss",
                             response.status_code, attempt + 1, attempts - 1, wait)
                 time.sleep(wait)
@@ -100,7 +108,8 @@ class EmbeddingService:
             "model": settings.embedding_deployment,
             "input": [str(text).strip()],
             "dimensions": settings.embedding_dimensions,
-        }, throttled=False, attempts=3, timeout=20)
+        }, throttled=False, attempts=settings.embed_query_attempts, timeout=settings.embed_query_timeout,
+            fail_fast_over=settings.embed_query_max_wait)
         data = response.json().get("data", [])
         if len(data) != 1 or len(data[0]["embedding"]) != settings.embedding_dimensions:
             raise RuntimeError("The embedding service returned an unexpected answer for a search question.")
