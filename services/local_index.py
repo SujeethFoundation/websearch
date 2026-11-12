@@ -469,6 +469,14 @@ class LocalIndexStore:
                     found.add(f"{page_id}-{int(row['RowKey'])}")
         return found
 
+    def counts_by_domain(self):
+        """{domain: chunks} for everything the table holds, in one keys-and-domains scan (no text)."""
+        counts = {}
+        for entity in self.chunks.list_entities(select=["domain"], results_per_page=1000):
+            domain = str(entity.get("domain") or "").lower()
+            counts[domain] = counts.get(domain, 0) + 1
+        return counts
+
     def count(self, domain=None):
         """How many chunks the table holds (for one domain, when given). Reads keys and domains only, no text."""
         want = str(domain).strip().lower() if domain else None
@@ -681,6 +689,7 @@ class LocalIndexManager:
             "memory_mb": round(index.memory_bytes() / 1e6, 1) if index else 0,
             "process_memory_mb": process_memory_mb(),
             "text_in_memory": settings.local_index_text_in_memory,
+            "writes": {"local_index_write": settings.local_index_write, "ai_search_writes": settings.ai_search_writes},
             "version": self._version,
             "age_seconds": round(time.monotonic() - self._loaded_at) if index else None,
             "loads": s["loads"],

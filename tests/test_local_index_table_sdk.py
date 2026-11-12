@@ -99,3 +99,9 @@ def test_existing_ids_and_counts_work_against_the_real_sdk(store):
                           + [li.entity_from_search_doc(doc("p2", 0, domain="themuse.com"))])
     assert store.existing_ids(["p1-0", "p1-3", "p1-9", "p2-0", "p7-0"]) == {"p1-0", "p1-3", "p2-0"}
     assert store.count() == 5 and store.count("themuse.com") == 1 and store.count("nowhere.org") == 0
+
+
+def test_counts_by_domain_work_against_the_real_sdk(store):
+    store.upsert_entities([li.entity_from_search_doc(doc("p1", n)) for n in range(3)]
+                          + [li.entity_from_search_doc(doc("p2", n, domain="themuse.com")) for n in range(2)])
+    assert store.counts_by_domain() == {"sujeeth.org": 3, "themuse.com": 2}

@@ -1052,6 +1052,28 @@ def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
 # ---------------------------------------------------------------------------------------------------------------
 # Local index: load it when the worker starts, so the first search does not wait for the table scan.
 # ---------------------------------------------------------------------------------------------------------------
+@app.route(route="local-index/status", methods=["GET"])
+def local_index_status(req):
+    """What this instance has loaded, and with ?count=true what the table holds right now: rows in all and per domain
+    (a read of keys and domains only, a few seconds on a large table) and the messages waiting on the queue, which is
+    how a backfill is followed. Each call reaches one instance, so loaded figures differ between calls."""
+    out = searcher.local.describe()
+    if not searcher.local.enabled:
+        return response({**out, "error": "Set LOCAL_INDEX_CONNECTION_STRING (or the blob storage connection string) first."}, 503)
+    if str(req.params.get("count") or "").lower() in ("1", "true", "yes"):
+        try:
+            by_domain = searcher.local.store().counts_by_domain()
+            out["table_rows"] = sum(by_domain.values())
+            out["table_by_domain"] = [{"domain": d, "chunks": n} for d, n in sorted(by_domain.items(), key=lambda kv: (-kv[1], kv[0]))]
+        except Exception as exc:
+            out["table_error"] = f"{type(exc).__name__}: {exc}"[:200]
+        try:
+            out["queue_messages"] = int(queue_processor.queue.get_queue_properties().approximate_message_count or 0)
+        except Exception:
+            out["queue_messages"] = None
+    return response(out)
+
+
 @app.route(route="local-index/reload", methods=["POST"])
 def local_index_reload(req):
     """Rebuild this instance's in-memory index from the table now and say how long it took. (Other instances reload

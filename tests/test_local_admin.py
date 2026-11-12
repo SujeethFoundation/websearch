@@ -208,3 +208,39 @@ def test_the_backfill_route_accepts_local_mode_only_when_the_table_takes_writes(
     assert fa.index_backfill._function._func(request("POST", "index/backfill", body={"mode": "bogus"})).status_code == 400
     monkeypatch.setattr(settings, "search_configured", False)           # missing mode works with the table as the index
     assert fa.index_backfill._function._func(request("POST", "index/backfill", body={"mode": "missing"})).status_code == 202
+
+
+# ---- the status route the helper script reads
+
+def test_the_table_counts_chunks_per_domain_in_one_scan(conf):
+    store = filled_store([make_doc(1, 0), make_doc(1, 1), make_doc(2, 0, domain="themuse.com")])
+    assert store.counts_by_domain() == {"sujeeth.org": 2, "themuse.com": 1}
+
+
+def test_the_status_route_reports_the_loaded_index_the_table_rows_and_the_queue(conf, monkeypatch):
+    svc = tagged_service()
+    monkeypatch.setattr(fa, "searcher", svc)
+    queue = types.SimpleNamespace(get_queue_properties=lambda: types.SimpleNamespace(approximate_message_count=7))
+    monkeypatch.setattr(fa, "queue_processor", types.SimpleNamespace(queue=queue))
+    plain = json.loads(fa.local_index_status._function._func(request("GET", "local-index/status")).get_body())
+    assert plain["backend"] == "local" and "table_rows" not in plain
+    assert plain["writes"] == {"local_index_write": True, "ai_search_writes": False}
+    counted = json.loads(fa.local_index_status._function._func(request("GET", "local-index/status", {"count": "true"})).get_body())
+    assert counted["table_rows"] == 6 and counted["queue_messages"] == 7
+    assert counted["table_by_domain"] == [{"domain": "sujeeth.org", "chunks": 3}, {"domain": "themuse.com", "chunks": 3}]
+
+
+def test_the_status_route_survives_a_failed_count_and_a_missing_queue(conf, monkeypatch):
+    svc = tagged_service()
+    svc.local._store.chunks.list_entities = lambda **kw: (_ for _ in ()).throw(RuntimeError("storage down"))
+    monkeypatch.setattr(fa, "searcher", svc)
+    monkeypatch.setattr(fa, "queue_processor", None)
+    body = json.loads(fa.local_index_status._function._func(request("GET", "local-index/status", {"count": "1"})).get_body())
+    assert "storage down" in body["table_error"] and body["queue_messages"] is None and "table_rows" not in body
+
+
+def test_the_status_route_says_so_when_there_is_no_table_connection(conf, monkeypatch):
+    monkeypatch.setattr(fa, "searcher", types.SimpleNamespace(
+        local=types.SimpleNamespace(enabled=False, describe=lambda: {"backend": "azure", "enabled": False})))
+    reply = fa.local_index_status._function._func(request("GET", "local-index/status"))
+    assert reply.status_code == 503

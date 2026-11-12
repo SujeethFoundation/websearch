@@ -24,6 +24,13 @@
 #     Get-CrawlJobId muse        the full job id of the domain's latest job
 #     Stop-Crawl muse            cancel every open job of the domain (asks first; -Force skips the question)
 #     Call GET "/api/health"     any raw call
+#
+# Local search (the index kept in Table Storage; needs the local search patch on the app):
+#     Show-LocalIndex            settings in force and what one instance has loaded (-Count adds the table rows per domain and the queue backlog; -CountBlobs adds the stored chunks)
+#     Start-LocalBackfill        copy every stored chunk into the table; asks first (Start-LocalBackfill muse for one domain; -Follow watches it fill)
+#     Watch-LocalBackfill        follow a backfill: rows, rows added, rows per minute, queue backlog (-CountBlobs for a progress bar and ETA)
+#     Watch-Websearch            health watcher: per instance uptime and restarts, index loaded and size, memory, searches and timings, shadow comparison, cache; a summary with checks on Ctrl+C
+#     Watch-Websearch -Every 5 -Polls 120 -InstanceMb 2048 -MinCompared 300 -MinOverlap 0.6 -MinTop 0.5     (the bars for the checks are yours to choose)
 
 # Run as a normal script, the commands below would vanish when the script ends. Stop early and say how to load it.
 if ($MyInvocation.InvocationName -ne ".") {
@@ -491,4 +498,260 @@ function Recover-Crawl([string]$Domain, [int]$StaleMinutes = 5) {
     if ($null -eq $r.requeued) { $r | ConvertTo-Json -Depth 3 }
 }
 
-Write-Host "Loaded. Try: Show-Crawl | Show-CrawlHours | Show-CrawlTags | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain>"
+# ---------------------------------------------------------------------------------------------------------------
+# Local search (the index kept in Table Storage): backfill, and a health watcher.
+# ---------------------------------------------------------------------------------------------------------------
+
+function Get-Num($v) { if ($null -eq $v -or "$v" -eq "") { 0.0 } else { [double]$v } }
+
+function Format-Cell($v, [string]$fmt = "N0") {
+    if ($null -eq $v -or "$v" -eq "") { return "-" }
+    try { "{0:$fmt}" -f [double]$v } catch { "$v" }
+}
+
+function Short-Instance($name) {
+    $s = "$name"
+    if ($s.Length -gt 12) { $s.Substring(0, 6) + ".." + $s.Substring($s.Length - 4) } else { $s }
+}
+
+function Show-LocalIndex([switch]$Count, [switch]$CountBlobs) {
+    # The local index at a glance. Each call reaches one instance, so the "loaded" figures belong to that instance.
+    #   Show-LocalIndex                 settings in force and what this instance has loaded
+    #   Show-LocalIndex -Count          also what the table holds now (rows in all and per domain) and the queue backlog
+    #   Show-LocalIndex -Count -CountBlobs   also the stored chunks in Blob Storage, to see how much is copied (slow: lists every blob)
+    $q = "/api/local-index/status" + $(if ($Count) { "?count=true" } else { "" })
+    $r = Call GET $q
+    if (-not $r -or $r -is [string]) { Write-Warning "No usable answer from $q. Is the websearch app deployed with the local search patch? Response: $r"; return }
+    $w = $r.writes
+    Write-Host ("Backend: {0}   LOCAL_INDEX_WRITE: {1}   AI_SEARCH_WRITES: {2}" -f $r.backend, $w.local_index_write, $w.ai_search_writes)
+    if ($r.loaded) {
+        $readSeconds = (Get-Num $r.load_seconds) - (Get-Num $r.build_seconds)
+        Write-Host ("This instance: {0:N0} chunks on {1:N0} pages, {2} MB index, process {3} MB, loaded in {4}s (read {5}s, build {6}s), {7}s ago, {8} load(s)" -f `
+            $r.chunks, $r.pages, $r.memory_mb, $r.process_memory_mb, $r.load_seconds, (Format-Cell $readSeconds "N1"), $r.build_seconds, $r.age_seconds, $r.loads)
+    } else {
+        Write-Host "This instance has not loaded the index yet." -ForegroundColor Yellow
+    }
+    if ($r.last_error) { Write-Host "Last error: $($r.last_error)" -ForegroundColor Red }
+    $rows = $null
+    if ($Count) {
+        if ($r.table_error) { Write-Warning "The table could not be counted: $($r.table_error)" }
+        elseif ($null -ne $r.table_rows) {
+            $rows = [int]$r.table_rows
+            Write-Host ("`nThe table holds {0:N0} chunks. Queue backlog: {1}" -f $rows, $(if ($null -ne $r.queue_messages) { "{0:N0} messages" -f [int]$r.queue_messages } else { "unknown" }))
+            @($r.table_by_domain) | ForEach-Object { [pscustomobject]@{ Domain = $_.domain; Chunks = $_.chunks; Share = (Format-Bar $_.chunks $rows 12) } } | Format-Table -AutoSize | Out-Host
+        }
+    }
+    if ($CountBlobs) {
+        Write-Host "Counting stored chunks in Blob Storage (this lists every blob and can take minutes) ..."
+        $b = Call GET "/api/index-status?count_blobs=true"
+        $stored = if ($b -and $b.blob_storage) { $b.blob_storage.document_count } else { $null }
+        if ($null -ne $stored) {
+            Write-Host ("Blob Storage holds {0:N0} chunks." -f [int]$stored)
+            if ($null -ne $rows -and [int]$stored -gt 0) { Write-Host ("Copied to the table: {0}" -f (Format-Bar $rows $stored 20)) }
+            return [pscustomobject]@{ TableRows = $rows; StoredChunks = [int]$stored }
+        }
+    }
+    if ($null -ne $rows) { [pscustomobject]@{ TableRows = $rows; StoredChunks = $null } }
+}
+
+function Watch-LocalBackfill([int]$Every = 20, [int]$StableRounds = 3, [switch]$CountBlobs, [int]$Polls = 0) {
+    # Follows a local backfill: rows in the table, rows added since the last look, rows per minute, and the queue backlog.
+    # With -CountBlobs it first counts the stored chunks (slow, once) and then shows a progress bar and an ETA.
+    # It stops by itself after $StableRounds looks with no new rows and an empty queue. Ctrl+C stops watching; the backfill keeps running.
+    $target = $null
+    if ($CountBlobs) {
+        Write-Host "Counting stored chunks in Blob Storage first (once; this lists every blob) ..."
+        $b = Call GET "/api/index-status?count_blobs=true"
+        if ($b -and $b.blob_storage -and $null -ne $b.blob_storage.document_count) { $target = [int]$b.blob_storage.document_count; Write-Host ("{0:N0} stored chunks to copy." -f $target) }
+        else { Write-Warning "Could not count the stored chunks; following without a target." }
+    }
+    $began = Get-Date; $prev = $null; $firstRows = $null; $stable = 0; $stuck = 0; $n = 0
+    Write-Host "Following the backfill every $Every s. Ctrl+C stops watching; the backfill keeps running."
+    Write-Host ("{0,-8} {1,9} {2,8} {3,9} {4,8}  {5}" -f "Time(UTC)", "Rows", "Added", "Rows/min", "Queue", "Progress")
+    while ($true) {
+        $r = Call GET "/api/local-index/status?count=true"
+        $n++
+        if (-not $r -or $r -is [string] -or $null -eq $r.table_rows) {
+            Write-Warning ("No row count this time. " + $(if ($r.table_error) { $r.table_error } else { "Response: $r" }))
+        } else {
+            $rows = [int]$r.table_rows
+            if ($null -eq $firstRows) { $firstRows = $rows }
+            $added = if ($null -ne $prev) { $rows - $prev } else { 0 }
+            $minutes = [Math]::Max(0.1, ((Get-Date) - $began).TotalMinutes)
+            $rate = if ($n -gt 1) { ($rows - $firstRows) / $minutes } else { 0 }
+            $queue = $r.queue_messages
+            $bar = ""
+            if ($target) {
+                $bar = Format-Bar $rows $target 20
+                $left = $target - $rows
+                if ($rate -gt 1 -and $left -gt 0) { $bar += ("  ETA {0:N0} min" -f ($left / $rate)) }
+            }
+            Write-Host ("{0,-8} {1,9:N0} {2,8:N0} {3,9:N0} {4,8}  {5}" -f (Get-Date).ToUniversalTime().ToString("HH:mm:ss"), $rows, $added, $rate, $(if ($null -ne $queue) { "{0:N0}" -f [int]$queue } else { "?" }), $bar)
+            $queueEmpty = ($null -eq $queue) -or ([int]$queue -eq 0)
+            if ($null -ne $prev -and $rows -eq $prev) {
+                if ($queueEmpty) { $stable++ } else { $stuck++ }
+            } else { $stable = 0; $stuck = 0 }
+            if ($stuck -ge 5) { Write-Warning "The queue is not empty but no rows were added for $stuck looks. Check the app's logs for index_blob_batch errors." ; $stuck = 0 }
+            if ($stable -ge $StableRounds) {
+                Write-Host ("Done: no new rows and an empty queue for {0} looks. The table holds {1:N0} chunks." -f $StableRounds, $rows) -ForegroundColor Green
+                if ($target -and $rows -lt $target) { Write-Warning ("The table holds {0:N0} fewer chunks than Blob Storage. Chunks without text are skipped, so a small gap is normal; run Start-LocalBackfill again to be sure." -f ($target - $rows)) }
+                return
+            }
+            $prev = $rows
+        }
+        if ($Polls -gt 0 -and $n -ge $Polls) { return }
+        Start-Sleep -Seconds $Every
+    }
+}
+
+function Start-LocalBackfill([string]$Domain, [switch]$Follow, [switch]$CountBlobs, [switch]$Force, [int]$Every = 20) {
+    # Queues a copy of every stored chunk into the local index table (POST /api/index/backfill with mode local).
+    # It runs on the crawl queue, resumes by itself, reuses stored vectors, does not touch Azure AI Search, and embeds only
+    # chunks that have no stored vector. Safe to run again. Needs LOCAL_INDEX_WRITE=true on the app.
+    #   Start-LocalBackfill                 everything
+    #   Start-LocalBackfill muse            only domains matching "muse"
+    #   Start-LocalBackfill -Follow         ...and watch the table fill (add -CountBlobs for a progress bar and ETA)
+    $s = Call GET "/api/local-index/status"
+    if (-not $s -or $s -is [string]) { Write-Warning "Could not read /api/local-index/status. Is the websearch app deployed with the local search patch? Response: $s"; return }
+    Write-Host ("Backend: {0}   LOCAL_INDEX_WRITE: {1}   AI_SEARCH_WRITES: {2}" -f $s.backend, $s.writes.local_index_write, $s.writes.ai_search_writes)
+    if (-not $s.enabled) { Write-Warning "The app has no table connection. Set LOCAL_INDEX_CONNECTION_STRING (or BLOB_STORAGE_CONNECTION_STRING) first."; return }
+    if (-not $s.writes.local_index_write) {
+        Write-Warning "LOCAL_INDEX_WRITE is not true on the app. Set it first, so chunks crawled during the backfill reach the table too, then run this again."
+        return
+    }
+    $body = @{ mode = "local" }
+    $scope = "every stored chunk"
+    if ($Domain) {
+        $found = @(Get-DashboardRows $Domain)
+        if ($found.Count -eq 1) { $full = $found[0].Domain }
+        elseif ($found.Count -gt 1) { Write-Warning "'$Domain' matches $($found.Count) domains ($($found.Domain -join ', ')). Be more specific."; return }
+        elseif ($Domain -like "*.*") { $full = $Domain.ToLower() }
+        else { Write-Warning "No domain matches '$Domain'. Use the full domain, e.g. www.themuse.com"; return }
+        $body.domains = @($full)
+        $scope = "chunks of $full"
+    }
+    if (-not $Force) {
+        $answer = Read-Host "Copy $scope into the local index table? Chunks with no stored vector are embedded, which uses embedding quota. (y/N)"
+        if ($answer -notmatch '^(y|yes)$') { Write-Host "Cancelled."; return }
+    }
+    $r = Call POST "/api/index/backfill" $body
+    if (-not $r -or $r -is [string]) { Write-Warning "The backfill was not queued. Response: $r"; return }
+    Write-Host ("{0}: {1}" -f $r.status, $r.message) -ForegroundColor Green
+    if ($Follow) { Watch-LocalBackfill -Every $Every -CountBlobs:$CountBlobs }
+    else { Write-Host "Follow it with: Watch-LocalBackfill   (add -CountBlobs for a progress bar)" }
+}
+
+function Show-WatchSummary($seen, [int]$InstanceMb, [int]$MinCompared, [double]$MinOverlap, [double]$MinTop, $backend, [int]$restarts, $restartLog) {
+    $list = @($seen.Values | ForEach-Object { [pscustomobject]$_ } | Sort-Object First)
+    if (-not $list.Count) { Write-Host "`nNo instance answered."; return }
+    Write-Host "`n=== Summary ==="
+    # One line per instance, so nothing is hidden on a narrow console.
+    foreach ($i in $list) {
+        $err = if ($i.Err) { "  ERROR: " + $i.Err.Substring(0, [Math]::Min(60, $i.Err.Length)) } else { "" }
+        $line = ("{0,-13} polls {1,3}  restarts {2}  up {3:N0}s  loaded {4}  chunks {5:N0}  process {6:N0} MB (highest)  loads {7} ({8}s)  searches {9:N0}  fallbacks {10}  shadow {11:N0}{12}" -f `
+            (Short-Instance $i.Name), $i.Polls, $i.Restarts, $i.Up, $(if ($i.Loaded) { "yes" } else { "NO" }), $i.Chunks, $i.MaxProc, $i.Loads, (Format-Cell $i.LoadSecs "N1"), $i.Searches, $i.Fallbacks, $i.ShadowN, $err)
+        if ($i.Restarts -or $i.Err -or -not $i.Loaded) { Write-Host $line -ForegroundColor Red } else { Write-Host $line }
+    }
+    # Counters are per process and only grow, so the last value seen from each instance is that instance's total.
+    $sum = { param($name) [double](($list | ForEach-Object { Get-Num $_.$name } | Measure-Object -Sum).Sum) }
+    $shadowN = & $sum "ShadowN"
+    $searches = & $sum "Searches"
+    if ($searches -gt 0) {
+        $emb = ($list | ForEach-Object { (Get-Num $_.EmbMs) * (Get-Num $_.Searches) } | Measure-Object -Sum).Sum / $searches
+        $idx = ($list | ForEach-Object { (Get-Num $_.IdxMs) * (Get-Num $_.Searches) } | Measure-Object -Sum).Sum / $searches
+        Write-Host ("Local searches: {0:N0}   average embedding call {1:N0} ms   average search in memory {2:N2} ms" -f $searches, $emb, $idx)
+    }
+    $overlap = $null; $top = $null
+    if ($shadowN -gt 0) {
+        $overlap = ($list | ForEach-Object { (Get-Num $_.Overlap) * (Get-Num $_.ShadowN) } | Measure-Object -Sum).Sum / $shadowN
+        $top = ($list | ForEach-Object { (Get-Num $_.Top1) * (Get-Num $_.ShadowN) } | Measure-Object -Sum).Sum / $shadowN
+        Write-Host ("Shadow comparison against Azure AI Search: {0:N0} searches   average overlap of the top results {1:N3}   top result agrees {2:N3}" -f $shadowN, $overlap, $top)
+        $failed = & $sum "ShadowFailed"
+        if ($failed -gt 0) { Write-Host ("  {0:N0} comparison(s) failed to run locally." -f $failed) -ForegroundColor Yellow }
+    }
+    $azReq = & $sum "AzReq"; $azTot = & $sum "AzTotal"
+    if ($azReq -gt 0) { Write-Host ("Azure AI Search queries answered by these instances: {0:N0}   average {1:N2} Compute Units each ({2:N0} in all)" -f $azReq, ($azTot / $azReq), $azTot) }
+    $hits = & $sum "QHits"; $miss = & $sum "QMiss"
+    if (($hits + $miss) -gt 0) { Write-Host ("Result cache: {0:N0} hits, {1:N0} misses ({2:P0} hit rate)" -f $hits, $miss, ($hits / ($hits + $miss))) }
+    Write-Host "`nChecks (each poll reaches one instance, so watch long enough to see them all; $($list.Count) seen):"
+    $mark = { param($ok, $text) if ($null -eq $ok) { Write-Host "  [ - ] $text" } elseif ($ok) { Write-Host "  [ OK ] $text" -ForegroundColor Green } else { Write-Host "  [FAIL] $text" -ForegroundColor Red } }
+    & $mark (-not ($list | Where-Object { -not $_.Loaded })) "every instance seen has the index loaded"
+    & $mark (-not ($list | Where-Object { $_.Err })) "no instance reports a load or refresh error"
+    & $mark ($restarts -eq 0) $(if ($restarts) { "no restarts while watching: $restarts seen (" + (($restartLog | Select-Object -Last 3) -join "; ") + ")" } else { "no restarts while watching" })
+    $maxProc = [double](($list | ForEach-Object { Get-Num $_.MaxProc } | Measure-Object -Maximum).Maximum)
+    if ($maxProc -gt 0 -and $InstanceMb -gt 0) { & $mark (($maxProc / $InstanceMb) -lt 0.75) ("highest process memory {0:N0} MB of {1:N0} MB ({2:P0}); under 75% leaves room for a rebuild" -f $maxProc, $InstanceMb, ($maxProc / $InstanceMb)) }
+    if ($backend -eq "shadow") {
+        & $mark ($shadowN -ge $MinCompared) ("at least {0:N0} shadow comparisons (have {1:N0})" -f $MinCompared, $shadowN)
+        if ($MinOverlap -gt 0 -and $null -ne $overlap) { & $mark ($overlap -ge $MinOverlap) ("average overlap at least {0:N2} (is {1:N3})" -f $MinOverlap, $overlap) }
+        if ($MinTop -gt 0 -and $null -ne $top) { & $mark ($top -ge $MinTop) ("top result agrees at least {0:N2} (is {1:N3})" -f $MinTop, $top) }
+        if (-not $MinOverlap -and $null -ne $overlap) { Write-Host "  [ - ] overlap and top-result agreement are shown above; add -MinOverlap and -MinTop to check them against your own bar" }
+    }
+    if ($backend -eq "local") { & $mark ((& $sum "Fallbacks") -eq 0) "no searches fell back to Azure AI Search" }
+}
+
+function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2048, [int]$MinCompared = 200, [double]$MinOverlap = 0, [double]$MinTop = 0) {
+    # Polls /api/health and shows, for every instance that answers: uptime and process id (a restart shows as a new id or uptime dropping),
+    # whether the local index is loaded and how big, the process memory, searches and the average embedding and in-memory search time,
+    # fallbacks to Azure AI Search, the shadow comparison with Azure AI Search, and the result cache hit rate.
+    # Each poll reaches one instance. Ctrl+C (or -Polls N) stops it and prints a summary with checks.
+    #   Watch-Websearch                         every 10 seconds
+    #   Watch-Websearch -Every 5 -Polls 120     ten minutes, then the summary
+    #   Watch-Websearch -InstanceMb 2048 -MinCompared 300 -MinOverlap 0.6 -MinTop 0.5   the bars for the checks (you choose them)
+    $seen = @{}; $n = 0; $attempts = 0; $rows = 0; $restarts = 0; $restartLog = @(); $backend = ""
+    Write-Host "Watching $script:AzureUrl every $Every s. Ctrl+C stops and prints a summary."
+    $header = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,8} {6,6} {7,6} {8,6} {9,6} {10,4} {11,7} {12,7} {13,5} {14,6}  {15}" -f `
+        "Time", "Instance", "Pid", "Up(s)", "Loaded", "Chunks", "ProcMB", "Srch", "EmbMs", "IdxMs", "Fall", "ShadowN", "Overlap", "Top1", "QCache", "Notes")
+    try {
+        while ($true) {
+            $attempts++
+            $h = Call GET "/api/health"
+            if (-not $h -or $h -is [string] -or -not $h.process) {
+                Write-Host ("{0,-8} poll failed or the app has no process section yet (deploy the health patch)" -f (Get-Date).ToUniversalTime().ToString("HH:mm:ss")) -ForegroundColor Yellow
+            } else {
+                $n++
+                $p = $h.process; $l = $h.local_index; $sh = $l.shadow; $qc = $h.query_cache; $az = $h.ai_search_compute.query
+                $backend = "$($h.search_backend)"
+                $name = "$($p.instance)"; $notes = @()
+                if (-not $seen.ContainsKey($name)) {
+                    $seen[$name] = @{ Name = $name; First = $n; Polls = 0; Restarts = 0; Pid = $p.pid; Up = [int]$p.uptime_seconds; MaxProc = 0 }
+                    $notes += "first seen"
+                } else {
+                    $rec = $seen[$name]
+                    if ($p.pid -ne $rec.Pid -or [int]$p.uptime_seconds -lt $rec.Up) {
+                        $rec.Restarts++; $restarts++
+                        $why = if ($p.pid -ne $rec.Pid) { "process id changed" } else { "uptime went back down" }
+                        $restartLog += "$(Short-Instance $name) $why at $((Get-Date).ToUniversalTime().ToString('HH:mm'))"
+                        $notes += "RESTART ($why)"
+                    }
+                }
+                $rec = $seen[$name]
+                $rec.Polls++; $rec.Pid = $p.pid; $rec.Up = [int]$p.uptime_seconds
+                $rec.Loaded = [bool]$l.loaded; $rec.Chunks = [int](Get-Num $l.chunks)
+                if ((Get-Num $l.process_memory_mb) -gt $rec.MaxProc) { $rec.MaxProc = [int](Get-Num $l.process_memory_mb) }
+                $rec.Loads = [int](Get-Num $l.loads); $rec.LoadSecs = $l.load_seconds
+                $rec.Searches = [int](Get-Num $l.searches); $rec.EmbMs = $l.avg_embed_ms; $rec.IdxMs = $l.avg_search_ms
+                $rec.Fallbacks = [int](Get-Num $l.fallbacks_to_ai_search)
+                $rec.ShadowN = [int](Get-Num $sh.compared); $rec.ShadowFailed = [int](Get-Num $sh.failed)
+                $rec.Overlap = $sh.average_overlap; $rec.Top1 = $sh.top_result_agrees
+                $rec.Err = "$($l.last_error)"
+                $rec.AzReq = [int](Get-Num $az.requests); $rec.AzTotal = Get-Num $az.total
+                $rec.QHits = [int](Get-Num $qc.hits); $rec.QMiss = [int](Get-Num $qc.misses)
+                if ($rec.Err) { $notes += "ERROR: " + $rec.Err.Substring(0, [Math]::Min(50, $rec.Err.Length)) }
+                if ($rows % 20 -eq 0) { Write-Host $header }
+                $rows++
+                $qrate = if ($null -ne $qc.hit_rate) { "{0:P0}" -f [double]$qc.hit_rate } else { "-" }
+                $line = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,8} {6,6} {7,6} {8,6} {9,6} {10,4} {11,7} {12,7} {13,5} {14,6}  {15}" -f `
+                    (Get-Date).ToUniversalTime().ToString("HH:mm:ss"), (Short-Instance $name), $p.pid, (Format-Cell $p.uptime_seconds), $(if ($l.loaded) { "yes" } else { "no" }),
+                    (Format-Cell $l.chunks), (Format-Cell $l.process_memory_mb), (Format-Cell $l.searches), (Format-Cell $l.avg_embed_ms), (Format-Cell $l.avg_search_ms "N2"),
+                    (Format-Cell $l.fallbacks_to_ai_search), (Format-Cell $sh.compared), (Format-Cell $sh.average_overlap "N2"), (Format-Cell $sh.top_result_agrees "N2"), $qrate, ($notes -join "; "))
+                if ($notes -match "RESTART|ERROR") { Write-Host $line -ForegroundColor Red } else { Write-Host $line }
+            }
+            if ($Polls -gt 0 -and $attempts -ge $Polls) { break }
+            Start-Sleep -Seconds $Every
+        }
+    } finally {
+        Show-WatchSummary $seen $InstanceMb $MinCompared $MinOverlap $MinTop $backend $restarts $restartLog
+    }
+}
+
+Write-Host "Loaded. Try: Show-Crawl | Show-CrawlHours | Show-CrawlTags | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain> | Show-LocalIndex -Count | Start-LocalBackfill -Follow | Watch-Websearch"
