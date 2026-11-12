@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 import requests
 from services.config import settings
 from services.embedding_service import EmbeddingService
@@ -129,6 +130,8 @@ _query_lock = threading.Lock()
 # Bumped every time the cache is cleared. A search remembers the number it started under and stores its answer only if
 # the number is unchanged, so an answer computed from an index that has since been replaced is never kept.
 _query_generation = [0]
+_diagnose_lock = threading.Lock()
+_diagnose_last = [-1e9]   # monotonic time of the last shadow diagnosis
 
 
 def normalize_query(query):
@@ -840,8 +843,8 @@ class SearchService:
                             _query_cache.pop(old, None)
         return answer
 
-    def _search_azure(self, query, concepts, domains, limit, label):
-        """The Azure AI Search hybrid query. Returns (answer, Compute Units the query used or None)."""
+    def _azure_body(self, query, concepts, domains, limit):
+        """The request body of the Azure AI Search hybrid query."""
         domain_values = self._odata_values(domains)
         concept_values = self._odata_values(concepts)
         filter_expr = (
@@ -867,6 +870,27 @@ class SearchService:
             body["searchFields"] = settings.search_fields
         if settings.search_max_text_recall and not _hybrid_option_rejected[0]:
             body["hybridSearch"] = {"maxTextRecallSize": settings.search_max_text_recall}
+        return body
+
+    def _azure_part(self, query, concepts, domains, part, limit=3):
+        """One half of the Azure query on its own ("text" or "vector"), for diagnosis: [{title, url, score}, ...]."""
+        body = self._azure_body(query, concepts, domains, limit)
+        body.pop("count", None)
+        body.pop("hybridSearch", None)
+        if part == "text":
+            body.pop("vectorQueries")
+        else:
+            for key in ("search", "searchMode", "searchFields"):
+                body.pop(key, None)
+        body["select"] = "id,title,url"
+        response = self._post("search", body, 45, attempts=2, max_wait=3, label="diagnose")
+        response.raise_for_status()
+        return [{"rank": i + 1, "title": r.get("title"), "url": r.get("url"), "score": round(float(r.get("@search.score", 0.0)), 6),
+                 "chunk": r.get("id")} for i, r in enumerate(response.json().get("value", [])[:limit])]
+
+    def _search_azure(self, query, concepts, domains, limit, label):
+        """The Azure AI Search hybrid query. Returns (answer, Compute Units the query used or None)."""
+        body = self._azure_body(query, concepts, domains, limit)
         response = self._post("search", body, 45, attempts=3, max_wait=5, label=label)
         if response.status_code == 400 and "hybridSearch" in body:
             # An API version or service that does not accept the option must not break search.
@@ -943,7 +967,8 @@ class SearchService:
         embed_ms = (time.perf_counter() - began) * 1000
         began = time.perf_counter()
         candidates = max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10)
-        hits, matching = index.search(terms, qcode, domains, concepts, candidates=candidates, limit=limit, qvec=qvec)
+        hits, matching = index.search(terms, qcode, domains, concepts, candidates=candidates, limit=limit, qvec=qvec,
+                                      text_candidates=settings.local_text_recall or settings.search_max_text_recall or 1000)
         texts = self._local_texts(index, [row for row, _ in hits])
         results = []
         for row, score in hits:
@@ -990,7 +1015,10 @@ class SearchService:
                         return [{"rank": i + 1, "title": r.get("title"), "url": r.get("url"), "score": r.get("score"),
                                  "chunk": r.get("chunk_id")} for i, r in enumerate(results[:5])]
                     example = {"time": time.strftime("%H:%M:%S", time.gmtime()), "query": query[:300],
+                               "filters": {"concepts": sorted(concepts or []), "domains": sorted(domains or [])},
                                "azure": brief(azure_answer["results"]), "local": brief(local["results"])}
+                    if settings.local_shadow_diagnose and self._diagnose_due():
+                        example["halves"] = self._shadow_halves(query, concepts, domains)
                 self.local.record_shadow(len(set(a) & set(b)) / max(1, len(a)), bool(a and b and a[0] == b[0]),
                                          page_overlap=len(set(pa) & set(pb)) / max(1, len(pa)),
                                          top1_page_same=same_page, example=example)
@@ -998,6 +1026,42 @@ class SearchService:
                 self.local.record_shadow_failure()
 
         _shadow_pool.submit(work)
+
+    def _diagnose_due(self):
+        """True at most once every LOCAL_SHADOW_DIAGNOSE_MIN_SECONDS, so diagnosing never becomes a steady Azure cost."""
+        now = time.monotonic()
+        with _diagnose_lock:
+            if now - _diagnose_last[0] < settings.local_shadow_diagnose_min_seconds:
+                return False
+            _diagnose_last[0] = now
+            return True
+
+    def _shadow_halves(self, query, concepts, domains):
+        """Each engine's keyword half and vector half on their own (top three), so a disagreement can be put down to one."""
+        def local_part(keyword):
+            index = self.local.current()
+            row_brief = lambda hits: [{"rank": i + 1, "title": index.titles[r], "url": index.urls[r], "score": round(float(s), 6),
+                                       "chunk": index.ids[r]} for i, (r, s) in enumerate(hits[:3])]
+            if keyword:
+                hits, _ = index.search(query_terms(query), None, domains, concepts, candidates=50, limit=3,
+                                       text_candidates=settings.local_text_recall or settings.search_max_text_recall or 1000)
+            else:
+                get_vectors = getattr(self.embedder, "embed_query_vectors", None)
+                if not get_vectors:
+                    return []
+                qcode, qvec = get_vectors(query)
+                hits, _ = index.search(np.zeros(0, dtype=np.uint64), qcode, domains, concepts, candidates=50, limit=3, qvec=qvec)
+            return row_brief(hits)
+
+        halves = {}
+        for name, call in (("local_keyword", lambda: local_part(True)), ("local_vector", lambda: local_part(False)),
+                           ("azure_text", lambda: self._azure_part(query, concepts, domains, "text")),
+                           ("azure_vector", lambda: self._azure_part(query, concepts, domains, "vector"))):
+            try:
+                halves[name] = call()
+            except Exception as exc:
+                halves[name] = {"error": f"{exc.__class__.__name__}: {str(exc)[:120]}"}
+        return halves
 
     @staticmethod
     def _domain_filter(domain):

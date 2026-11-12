@@ -30,7 +30,7 @@
 #     Start-LocalBackfill        copy every stored chunk into the table; asks first (Start-LocalBackfill muse for one domain; -Follow watches it fill)
 #     Watch-LocalBackfill        follow a backfill: rows, rows added, rows per minute, queue backlog (-CountBlobs for a progress bar and ETA)
 #     Watch-Websearch            health watcher: per instance uptime and restarts, index loaded and size, memory, searches and timings, shadow comparison, cache; a summary with checks on Ctrl+C
-#     Show-ShadowDiffs           the latest shadow comparisons whose top pages differed: the question, then Azure AI Search's and the local index's top five (-Count 10)
+#     Show-ShadowDiffs           the latest shadow comparisons whose top pages differed: the question, the ontology filters it ran under, Azure AI Search's and the local index's top five (-Count 10); with LOCAL_SHADOW_DIAGNOSE=true on the app, also each engine's keyword half and vector half on their own
 #     Seed-EmbedCache            embed common questions ahead of time into the shared question cache (Seed-EmbedCache "How do I volunteer?"; or -Path file.txt, one per line)
 #     Watch-Websearch -Every 5 -Polls 120 -InstanceMb 2048 -MinCompared 300 -MinOverlap 0.6 -MinTop 0.5     (the bars for the checks are yours to choose)
 
@@ -669,12 +669,34 @@ function Show-ShadowDiffs([int]$Count = 10) {
         $url = "$($x.url)" -replace '^https?://(www\.)?', ''; if ($url.Length -gt 60) { $url = $url.Substring(0, 60) + "..." }
         "{0}. {1}  <{2}>" -f $x.rank, $title, $url
     }
+    $halfLabels = [ordered]@{ azure_text = "Azure keyword"; local_keyword = "Local keyword"; azure_vector = "Azure vector "; local_vector = "Local vector " }
+    $anyHalves = $false
     foreach ($d in @($r.diffs)) {
         Write-Host ""
         Write-Host ("[{0} UTC] {1}" -f $d.time, $d.query) -ForegroundColor Cyan
+        if ($d.filters) { Write-Host ("  filters: concepts [{0}]  domains [{1}]" -f (@($d.filters.concepts) -join ", "), (@($d.filters.domains) -join ", ")) -ForegroundColor DarkGray }
         foreach ($x in @($d.azure)) { Write-Host ("  Azure  " + (& $line $x)) }
         foreach ($x in @($d.local)) { Write-Host ("  Local  " + (& $line $x)) }
+        if ($d.halves) {
+            $anyHalves = $true
+            Write-Host "  each half on its own (top three):" -ForegroundColor DarkGray
+            foreach ($name in $halfLabels.Keys) {
+                $h = $d.halves.$name
+                if ($null -eq $h) { continue }
+                # A failed half is an object with an "error"; a list of results is an array (asking an array for ".error" gives an array of nulls).
+                if ($h -isnot [array] -and $h.error) { Write-Host ("    {0}: {1}" -f $halfLabels[$name], $h.error) -ForegroundColor Yellow; continue }
+                $parts = New-Object System.Collections.Generic.List[string]
+                foreach ($item in @($h)) {
+                    $shortTitle = "$($item.title)"
+                    if ($shortTitle.Length -gt 34) { $shortTitle = $shortTitle.Substring(0, 34) + "..." }
+                    $parts.Add(("{0}. {1}" -f $item.rank, $shortTitle))
+                }
+                $text = if ($parts.Count) { [string]::Join("  |  ", $parts) } else { "(no results)" }
+                Write-Host ("    {0}: {1}" -f $halfLabels[$name], $text)
+            }
+        }
     }
+    if (-not $anyHalves) { Write-Host "`nTo see each engine's keyword half and vector half on their own, set LOCAL_SHADOW_DIAGNOSE=true on the app (two extra Azure AI Search queries per disagreement, at most one every 5 seconds), then run this again." -ForegroundColor DarkGray }
 }
 
 function Seed-EmbedCache([string[]]$Question, [string]$Path) {

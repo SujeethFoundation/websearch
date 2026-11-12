@@ -118,6 +118,15 @@ class Settings:
     # which keeps them (its stop word list is empty), so they are stored with every chunk and, by default, searched for like
     # any other word; they score low because nearly every chunk has them. "english" drops a list of 33 of them from questions.
     local_index_stopwords = os.getenv("LOCAL_INDEX_STOPWORDS", "none").strip().lower()
+    # How many keyword-ranked chunks go into the rank fusion with the vector results. Azure AI Search feeds up to 1,000
+    # (hybridSearch.maxTextRecallSize, default 1000) to its fusion, so a chunk strong on vectors but ranked 80th on keywords
+    # still gets its keyword credit. 0 uses SEARCH_MAX_TEXT_RECALL when that is set (so the two engines match), else 1000.
+    local_text_recall = _int("LOCAL_TEXT_RECALL", 0, 0, 10000)
+    # When a shadow comparison finds different top pages, also run each engine's keyword half and vector half on their own
+    # (two extra Azure AI Search queries, at most one such comparison every LOCAL_SHADOW_DIAGNOSE_MIN_SECONDS), so the
+    # difference can be put down to the keyword half, the vector half or the fusion. For investigating, not for always.
+    local_shadow_diagnose = _flag("LOCAL_SHADOW_DIAGNOSE", False)
+    local_shadow_diagnose_min_seconds = _float("LOCAL_SHADOW_DIAGNOSE_MIN_SECONDS", 5)
     local_rescore = _flag("LOCAL_RESCORE", True)
     local_rescore_pool = _int("LOCAL_RESCORE_POOL", 300, 20, 5000)
     # Search-question embeddings are remembered so a question is embedded once, not once per instance. Only the 1-bit

@@ -173,6 +173,19 @@ listed words from questions only, with no rewrite needed. On 40,000 synthetic ch
 costs about 0.9 ms more a search, and the keyword postings grow. Chunks written before this change lack the common words, so
 **run the local backfill again** (the same run that writes the vectors for rescoring).
 
+**Keyword depth in the rank fusion.** Azure AI Search feeds up to 1,000 keyword-ranked results (`hybridSearch.maxTextRecallSize`,
+default 1,000) and the nearest `k` vector results into its rank fusion. The local search used to fuse only the top 50 of each, so
+a chunk strong on vectors but ranked 80th by keywords got no keyword credit locally and did in Azure, which reorders results. It
+now fuses as many keyword results as Azure does: `LOCAL_TEXT_RECALL` if set, else `SEARCH_MAX_TEXT_RECALL` (so the two engines match
+when you have set that), else 1,000. About 0.6 ms more a search at 40,000 chunks. The vector side still uses `SEARCH_VECTOR_K` (50).
+
+**Diagnosing a disagreement.** Each saved shadow disagreement now carries the ontology filters (concepts and domains) the question
+ran under: a page the filters leave out can never be returned by either engine, whatever the ranking. With
+`LOCAL_SHADOW_DIAGNOSE=true` it also carries each engine's keyword half and vector half on their own (top three), which says whether a
+difference comes from the keyword scoring, the vector ranking or the fusion. That costs two extra Azure AI Search queries per saved
+disagreement, at most one disagreement every `LOCAL_SHADOW_DIAGNOSE_MIN_SECONDS` (5), so turn it on to investigate and off after.
+`Show-ShadowDiffs` prints all of it.
+
 **Question cache.** Turning a question into a vector is a network call (often 150 ms or more) and the only slow step of a local
 search. Each question is now embedded once, not once per instance: an instance looks in its own memory (10,000 questions,
 `EMBED_CACHE_MEMORY_ENTRIES`), then in a table every instance shares (`EMBED_CACHE_TABLE`, default the index table's name

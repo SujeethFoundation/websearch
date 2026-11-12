@@ -404,10 +404,12 @@ class LocalIndex:
         distance = _popcount_rows(self.codes[rows] ^ query)
         return [int(rows[pos]) for pos in self._top(distance, count, False)]
 
-    def search(self, terms, qcode, domains, concepts, candidates=50, limit=5, qvec=None):
+    def search(self, terms, qcode, domains, concepts, candidates=50, limit=5, qvec=None, text_candidates=None):
         """(hits, matching) where hits is [(row, score), ...] best first and matching counts the chunks that passed
         the filters. qcode may be None, which leaves out the vector half (keyword only). qvec is the question's 8-bit
-        vector; with it (and vectors in the index) the vector half is re-ranked by cosine similarity."""
+        vector; with it (and vectors in the index) the vector half is re-ranked by cosine similarity. `candidates` is how
+        many vector results enter the rank fusion, `text_candidates` (default the same) how many keyword results do: Azure
+        AI Search feeds up to 1,000 keyword results and the nearest k vectors, which the caller can mirror."""
         if not self.n:
             return [], 0
         rows = self._rows(domains, concepts)
@@ -416,7 +418,7 @@ class LocalIndex:
         fused = {}
         scores = self.keyword_scores(terms)[rows]
         hit = np.flatnonzero(scores > 0)
-        for rank, pos in enumerate(self._top(scores[hit], candidates, True)):
+        for rank, pos in enumerate(self._top(scores[hit], text_candidates or candidates, True)):
             row = int(rows[hit[pos]])
             fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
         if qcode is not None and self.code_bytes:
