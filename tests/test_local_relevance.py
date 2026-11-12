@@ -155,12 +155,13 @@ def test_the_www_copy_of_a_page_is_the_same_page_and_the_same_chunk_is_returned_
 # ---- through the search service and the route
 
 def test_the_service_applies_the_settings_and_reports_how_it_ranked(conf, monkeypatch):
+    monkeypatch.setattr(settings, "local_phrase_boost", 0.0)          # this test is about the concept bonus alone
     q, docs = week4_corpus()
     svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
     answer = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, concept_weights=OWN)
     assert answer["results"][0]["chunk_id"] == "page1-0"
     assert answer["ranking"] == {"question_concepts": {"career_mentor": 1.1, "week_4": 1.2}, "concept_boost": 1.0,
-                                 "phrase_boost": 1.0, "max_per_page": 2}
+                                 "phrase_boost": 0.0, "max_per_page": 2}
     monkeypatch.setattr(settings, "local_concept_boost", 0.0)
     off = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, concept_weights=OWN)
     assert off["results"][0]["chunk_id"] != "page1-0" and off["ranking"]["question_concepts"] == {}
@@ -193,6 +194,7 @@ def test_an_engine_can_be_forced_for_one_search_and_never_falls_back(conf, monke
 
 
 def test_kept_answers_are_separate_for_each_way_of_ranking(conf, monkeypatch):
+    monkeypatch.setattr(settings, "local_phrase_boost", 0.0)          # the concept bonus alone decides here
     monkeypatch.setattr(settings, "search_cache_seconds", 60)
     monkeypatch.setattr(ss, "_query_cache", {})
     q, docs = week4_corpus()
@@ -330,7 +332,7 @@ def test_a_pair_weighs_what_its_commoner_word_weighs_and_unknown_words_drop_out(
     q, docs = phrase_corpus()
     index = index_of(docs)
     pairs = dict(index.question_phrases(WORDS_Q + " zebra"))
-    assert set(pairs) == {"how many", "many students", "students completed", "completed career", "career circles"}   # no pair with 'zebra'
+    assert set(pairs) == {"many students", "students completed", "completed career", "career circles"}   # no "how many", no pair with 'zebra'
     rare = index_of(docs + [make_doc(99, 0, content="unique rareword students")])
     weights = dict(rare.question_phrases("rareword students many"))
     assert weights["rareword students"] == pytest.approx(rare.term_idf("students")[0])          # the commoner of the two
@@ -425,3 +427,36 @@ def test_the_routes_pass_tried_settings_through(conf, monkeypatch):
     assert seen["ranking"] is None
     fa.search_explain._function._func(post("search/explain", {"query": "week 4", "ranking": {"concept_boost": 2}}))
     assert seen["explain"]["ranking"] == {"concept_boost": 2}
+
+
+def test_question_words_never_start_or_end_a_phrase(conf):
+    docs = [make_doc(1, 0, content="how do i reach out to a professional about what does a mentor do in week 4", vector=np.ones(DIMS)),
+            make_doc(2, 0, content="other words entirely", vector=np.ones(DIMS))]
+    index = index_of(docs)
+    assert [p for p, _ in index.question_phrases("How do I reach out to a professional?")] == ["reach out", "out to a professional"]
+    assert [p for p, _ in index.question_phrases("What does a mentor do in week 4?")] == ["mentor do in week", "week 4"]
+    assert index.question_phrases("how do i") == [] and index.question_phrases("what does it do") == []
+
+
+def test_a_faq_style_chunk_gets_nothing_for_how_do_i(conf):
+    q = np.ones(DIMS)
+    docs = [make_doc(1, 0, content="how do i ask for a raise and how do i find a mentor", vector=q),
+            make_doc(2, 0, content="steps to become a mentor at the foundation", vector=q)]
+    index = index_of(docs)
+    phrases = index.question_phrases("How do I become a mentor?")
+    assert [p for p, _ in phrases] == ["become a mentor"]
+    assert index.phrase_share(0, phrases) == 0.0 and index.phrase_share(1, phrases) == 1.0
+
+
+def test_content_words_too_far_apart_in_the_question_are_not_a_phrase(conf):
+    index = index_of([make_doc(1, 0, content="alpha one two three four five beta gamma", vector=np.ones(DIMS))])
+    assert [p for p, _ in index.question_phrases("alpha is it not of the on beta gamma")] == ["beta gamma"]
+
+
+def test_week_4_as_a_phrase_now_lifts_the_foundations_chunk_on_its_own(conf, monkeypatch):
+    monkeypatch.setattr(settings, "local_concept_boost", 0.0)         # no concept bonus: the phrase alone
+    q, docs = week4_corpus()
+    svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
+    with_phrase = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5)
+    without = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, ranking={"phrase_boost": 0})
+    assert with_phrase["results"][0]["chunk_id"] == "page1-0" and without["results"][0]["chunk_id"] != "page1-0"

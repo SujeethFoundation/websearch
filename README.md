@@ -204,7 +204,9 @@ returned once each.
 **Words side by side.** Keyword scoring ignores word order: "114 students completed Career Circles" scores like the same words
 scattered over a page. A chunk whose text or title holds the question's neighbouring words next to each other now gets a
 bonus: `LOCAL_PHRASE_BOOST` (1.0) times the share of the question's word pairs it holds, on the same scale as the concept bonus.
-Each pair weighs what its commoner word weighs, so "how many" counts for almost nothing and "students completed" for a lot.
+Only words that say what the question is about start or end a pair, with the question's own wording between them
+("reach out to a professional" gives "reach out" and "out to a professional"), so "how do" and "do I" never earn the bonus
+on a page that merely happens to be written as questions and answers. Each pair weighs what the commoner of its two words weighs.
 It is checked on the best `LOCAL_PHRASE_POOL` (100) candidates, costs about 0.7 ms a search at 40,000 chunks, and needs the
 chunk text in memory (`LOCAL_INDEX_TEXT_IN_MEMORY=true`, the default). `0` turns it off.
 

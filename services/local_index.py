@@ -51,6 +51,14 @@ STOPWORDS = frozenset(
     "a an and are as at be but by for if in into is it no not of on or such that the their then there these they "
     "this to was will with".split()
 )
+# Words that hold a question together but say nothing about its topic. Two of the question's words are only looked for as
+# a phrase when both are outside this list, so "how do" and "do I" can never earn the phrase bonus on a page that merely
+# happens to be written as questions and answers.
+FUNCTION_WORDS = STOPWORDS | frozenset(
+    "about am any been can could did do does from get had has have how i just may me might must my our should so than "
+    "those us we what when where which who why would you your describe explain please show tell".split()
+)
+PHRASE_SPAN = 4  # two of the question's content words make a phrase when at most this many words apart in the question
 _TOKEN = re.compile(r"[^\W_]+")  # runs of letters and digits in any script
 
 
@@ -455,18 +463,22 @@ class LocalIndex:
         return float(np.log(1.0 + (self.n - df + 0.5) / (df + 0.5))), df
 
     def question_phrases(self, question):
-        """[(pair of neighbouring words from the question, weight), ...]. A pair weighs what its commoner word weighs, so
-        "how many" counts for almost nothing and "students completed" for a lot. Pairs with a word no chunk has are left
-        out: nothing can hold them."""
+        """[(phrase, weight), ...]: for each two content words that follow each other in the question (function words
+        between them allowed, at most PHRASE_SPAN words apart), the question's own wording from the first to the second:
+        "reach out to a professional" gives "reach out" and "out to a professional". Function words are never an end of
+        a phrase, so "how do" and "do i" are not looked for. A phrase weighs what the commoner of its two content words
+        weighs. Phrases with a word no chunk has are left out: nothing can hold them."""
         words = tokens(question, False)
+        content = [i for i, w in enumerate(words) if w not in FUNCTION_WORDS and (len(w) > 1 or w.isdigit())]
         seen, out = set(), []
-        for a, b in zip(words, words[1:]):
-            if (a, b) in seen or a == b:
+        for i, j in zip(content, content[1:]):
+            phrase = " ".join(words[i:j + 1])
+            if words[i] == words[j] or j - i > PHRASE_SPAN or phrase in seen:
                 continue
-            seen.add((a, b))
-            (ia, da), (ib, db) = self.term_idf(a), self.term_idf(b)
+            seen.add(phrase)
+            (ia, da), (ib, db) = self.term_idf(words[i]), self.term_idf(words[j])
             if da and db:
-                out.append((f"{a} {b}", min(ia, ib)))
+                out.append((phrase, min(ia, ib)))
         return out
 
     def phrase_share(self, row, phrases):
