@@ -275,11 +275,18 @@ class QueueProcessor:
             mode = task.get("mode")
             domains = task.get("domains") or []
             try:
-                outcome = self.search.index_blobs(names, only_missing=(mode == "missing"), domains=domains)
-                result = {"status": "indexed", "blobs_read": len(names), "documents_indexed": outcome["indexed"],
-                          "already_indexed": outcome["already_indexed"]}
-                log.info("Index batch mode=%s read=%s already_indexed=%s indexed=%s",
-                         mode or "all", len(names), outcome["already_indexed"], outcome["indexed"])
+                if mode == "local":
+                    # Copy to the local index table only; Azure AI Search is not touched.
+                    outcome = self.search.local_backfill(names, domains=domains)
+                    result = {"status": "local_indexed", "blobs_read": len(names), "documents_indexed": outcome["written"],
+                              "already_indexed": 0}
+                    log.info("Local index batch read=%s written=%s", len(names), outcome["written"])
+                else:
+                    outcome = self.search.index_blobs(names, only_missing=(mode == "missing"), domains=domains)
+                    result = {"status": "indexed", "blobs_read": len(names), "documents_indexed": outcome["indexed"],
+                              "already_indexed": outcome["already_indexed"]}
+                    log.info("Index batch mode=%s read=%s already_indexed=%s indexed=%s",
+                             mode or "all", len(names), outcome["already_indexed"], outcome["indexed"])
             except IndexBusyError:
                 if attempt >= MAX_INDEX_DEFERRALS:
                     raise

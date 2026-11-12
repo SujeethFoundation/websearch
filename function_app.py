@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
 from datetime import datetime, timezone
 import azure.functions as func
@@ -195,6 +196,11 @@ def add_best_bets(result, query, concepts, selected_domains):
     result["best_bets"] = {"status": status, "count": count, "max": BEST_BETS_MAX}
 
 
+def index_available():
+    """True when there is an index to use: Azure AI Search is configured, or the table takes the writes."""
+    return bool(settings.search_configured or settings.local_index_write)
+
+
 @app.route(route="health", methods=["GET"])
 def health(req):
     return response({
@@ -212,7 +218,10 @@ def health(req):
         "crawl_queue": settings.crawl_queue,
         "max_pages_per_domain": settings.max_pages,
         "max_crawl_depth": settings.max_crawl_depth,
-        "search_mode": "azure_ai_search_hybrid" if settings.search_configured and settings.embedding_configured else "not_configured",
+        "search_mode": ("local_hybrid" if settings.search_backend == "local" else
+                        "azure_ai_search_hybrid" if settings.search_configured and settings.embedding_configured else "not_configured"),
+        "search_backend": settings.search_backend,
+        "local_index": searcher.local.describe(),
         "process": process_info(),
         "blob_cache": blob_cache_stats(),
         "ai_search_compute": compute_unit_stats(),
@@ -314,8 +323,8 @@ def index_tags(req):
       ?tag=salary_negotiation    the pages that carry that tag (add &limit=50)
       ?url=https://...           the tags on each chunk of one page
     """
-    if not settings.search_configured:
-        return response({"error": "Azure AI Search is not configured."}, 503)
+    if not index_available():
+        return response({"error": "Azure AI Search is not configured, and the local index table is not in use."}, 503)
     try:
         domain = (req.params.get("domain") or "").strip().lower() or None
         tag = (req.params.get("tag") or "").strip()
@@ -325,7 +334,7 @@ def index_tags(req):
         if tag:
             limit = min(max(int(req.params.get("limit", "50")), 1), 500)
             return response(searcher.pages_with_tag(tag, domain, limit))
-        if settings.concepts_facetable:
+        if settings.concepts_facetable or searcher.uses_local_admin():
             try:
                 return response(searcher.tag_counts(domain))
             except FacetUnavailable:
@@ -353,12 +362,17 @@ def index_backfill(req):
     body = read_body(req)
     domains = _domains(body)
     mode = str(body.get("mode") or "missing").strip().lower()
-    if mode not in ("missing", "all"):
-        return response({"error": "mode must be 'missing' or 'all'"}, 400)
+    if mode not in ("missing", "all", "local"):
+        return response({"error": "mode must be 'missing', 'all' or 'local'"}, 400)
     if not settings.azure_storage_connection or not storage.container or not queue_processor:
         return response({"error": "Azure Blob Storage and AzureWebJobsStorage must be configured."}, 503)
-    if not settings.search_configured or not settings.embedding_configured:
-        return response({"error": "Configure Azure AI Search and Foundry embeddings before backfill."}, 503)
+    if mode == "local":
+        if not settings.local_index_write:
+            return response({"error": "Set LOCAL_INDEX_WRITE=true first, so new chunks reach the local table as well."}, 409)
+        if not settings.embedding_configured:
+            return response({"error": "Configure Foundry embeddings before the backfill (chunks without a stored vector are embedded)."}, 503)
+    elif not index_available() or not settings.embedding_configured:
+        return response({"error": "Configure Azure AI Search (or the local index table) and Foundry embeddings before backfill."}, 503)
     try:
         _enqueue({
             "task_type": "index_backfill_page",
@@ -373,7 +387,9 @@ def index_backfill(req):
             "domains": domains or "all",
             "source_prefix": "documents/",
             "batch_size": settings.index_backfill_batch_size,
-            "message": (f"The queue worker will page through Blob Storage and index only the chunks that are not in {settings.search_index_name} yet."
+            "message": (f"The queue worker will page through Blob Storage and copy every chunk to the local index table ({settings.local_index_table}); Azure AI Search is not touched."
+                        if mode == "local" else
+                        f"The queue worker will page through Blob Storage and index only the chunks that are not in {settings.search_index_name} yet."
                         if mode == "missing" else
                         f"The queue worker will page through Blob Storage and re-send every chunk to {settings.search_index_name}."),
         }, 202)
@@ -398,8 +414,8 @@ def index_page(req):
     so a later crawl cannot replace the page. Resubmitting the same URL replaces its chunks.
     """
     body = read_body(req)
-    if not settings.search_configured or not settings.embedding_configured:
-        return response({"error": "Configure Azure AI Search and Foundry embeddings before adding pages."}, 503)
+    if not index_available() or not settings.embedding_configured:
+        return response({"error": "Configure Azure AI Search (or the local index table) and Foundry embeddings before adding pages."}, 503)
     try:
         url = normalize_url(str(body.get("url") or "").strip())
         host = (urlparse(url).hostname or "").lower()
@@ -478,8 +494,8 @@ def index_retag(req):
     """
     if not settings.azure_storage_connection or not storage.container or not queue_processor:
         return response({"error": "Azure Blob Storage and AzureWebJobsStorage must be configured."}, 503)
-    if not settings.search_configured:
-        return response({"error": "Configure Azure AI Search before re-tagging."}, 503)
+    if not index_available():
+        return response({"error": "Configure Azure AI Search (or the local index table) before re-tagging."}, 503)
     body = read_body(req)
     domains = _domains(body)
     try:
@@ -567,7 +583,7 @@ def document(req):
     chunk_id = str(body.get("chunk_id") or "").strip()
     if not url and not chunk_id:
         return response({"error": "JSON body requires url or chunk_id"}, 400)
-    if not settings.search_configured:
+    if not settings.search_configured and settings.search_backend != "local":
         return response({"error": "Azure AI Search is not configured."}, 503)
     try:
         neighbors = int(body.get("neighbors", 1))
@@ -997,7 +1013,7 @@ def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
         log.info("Nightly index reconcile is turned off (INDEX_RECONCILE_ENABLED)")
         return
     if (not settings.azure_storage_connection or not storage.container or not queue_processor
-            or not settings.search_configured or not settings.embedding_configured):
+            or not index_available() or not settings.embedding_configured):
         log.warning("Nightly index reconcile skipped: storage, search, or embeddings are not configured")
         return
     try:
@@ -1031,3 +1047,31 @@ def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
         log.info("Nightly index reconcile queued (the queue held %d messages)", waiting)
     except Exception:
         log.exception("Nightly index reconcile could not be queued")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Local index: load it when the worker starts, so the first search does not wait for the table scan.
+# ---------------------------------------------------------------------------------------------------------------
+@app.route(route="local-index/reload", methods=["POST"])
+def local_index_reload(req):
+    """Rebuild this instance's in-memory index from the table now and say how long it took. (Other instances reload
+    by themselves a few minutes after the table's version row changes.)"""
+    if not searcher.local.enabled:
+        return response({"error": "Set LOCAL_INDEX_CONNECTION_STRING (or the blob storage connection string) first."}, 503)
+    try:
+        searcher.local.reload()
+        return response({"status": "reloaded", **searcher.local.describe()})
+    except Exception as exc:
+        log.exception("Local index reload failed")
+        return response({"error": str(exc)}, 502)
+
+
+def _preload_local_index():
+    try:
+        searcher.local.current()
+    except Exception:
+        log.warning("Local index preload did not finish; the first search will try again", exc_info=True)
+
+
+if settings.search_backend in ("local", "shadow") and settings.local_index_preload and searcher.local.enabled:
+    threading.Thread(target=_preload_local_index, name="local-index-preload", daemon=True).start()

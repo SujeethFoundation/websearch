@@ -106,6 +106,62 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `ONTOLOGY_CACHE_SECONDS` | `120` | How long a successful ontology manifest or domain-concept answer is reused. `0` turns the cache off. A failed answer is never cached |
 | `FULL_TEXT_DOMAINS` | `sujeeth.org,topics.sujeeth.org` | Domains `/document` may return in full |
 | `EXCERPT_MAX_CHARS` | `3000` | Cap for every other domain |
+| `SEARCH_BACKEND` | `azure` | `azure`: every search goes to Azure AI Search (as before). `shadow`: Azure AI Search answers and a sample of searches also runs in the app and is compared. `local`: the app answers from memory. See "Search inside the app" |
+| `AI_SEARCH_WRITES` | `true` | Whether chunks are still written to and deleted from Azure AI Search. Turn off once nothing needs the index |
+| `LOCAL_INDEX_WRITE` | `false` | Also write every chunk to the Table Storage table the local index reads. Turn on before the backfill |
+| `LOCAL_INDEX_CONNECTION_STRING`, `LOCAL_INDEX_TABLE` | the blob connection string, `searchchunks` | Where the table lives (letters and digits only). A small `searchchunksmeta` table holds the version row |
+| `LOCAL_INDEX_TEXT_IN_MEMORY` | `true` | Keep chunk text in memory (fast), or read the few chunks a search returns from the table (about a third of the memory) |
+| `LOCAL_INDEX_POLL_SECONDS`, `LOCAL_INDEX_MIN_RELOAD_SECONDS` | `60`, `600` | How often an instance checks the version row, and the least time between rebuilds |
+| `LOCAL_INDEX_TITLE_WEIGHT` | `3` | How much a title word counts against a body word in keyword scoring. Used when a chunk is written, so changing it needs a new backfill |
+| `LOCAL_INDEX_PRELOAD` | `true` | Load the index when the worker starts (only when the backend is `local` or `shadow`) |
+| `LOCAL_SEARCH_FALLBACK` | `true` | When the local index is not ready, answer from Azure AI Search instead of failing |
+| `LOCAL_SHADOW_SAMPLE` | `0` | Share of searches (0 to 1) that shadow mode also runs locally and compares |
+
+## Search inside the app (Table Storage)
+
+Azure AI Search on the Serverless tier meters every query. This option answers searches inside the app instead, so a
+search costs CPU on the instance that runs it. Nothing changes until you set `SEARCH_BACKEND`.
+
+**How it works.** Each chunk is one row of a Table Storage table (`PartitionKey` is the page id, `RowKey` the chunk
+number). The row holds the title, url, domain, concepts, the chunk text, the embedding reduced to one bit per dimension
+(192 bytes), and the chunk's words as hashes with counts, worked out once when the row is written. Every instance scans
+the table into memory (a few seconds), then answers a search by: keeping the chunks in the listed domains that carry one
+of the concepts; BM25 over the question's words (any word may match), best 50; Hamming distance between the question's
+bit vector and each chunk's, nearest 50; and reciprocal rank fusion of the two lists. A one-row table holds a random
+version token that writers change after they write; instances check it every `LOCAL_INDEX_POLL_SECONDS` and rebuild in
+the background, swapping the new index in. A failed rebuild keeps the old index. `document` reads (`fetch_chunks`) are
+answered from the same index.
+
+The question's vector now comes from an Azure OpenAI call made by this app (the search service's vectorizer used to make
+it). It uses the same deployment, skips the indexing throttle, gives up after 20 seconds and remembers the last 2,000
+questions. If it fails, the search falls back to keywords only (`search_mode` is `keyword`).
+
+**Moving over, in this order**
+1. Set the instance size (2,048 MB), deploy, and set `LOCAL_INDEX_WRITE=true`. New and changed chunks now go to both places.
+2. Copy what is already stored: `POST /api/index/backfill` with `{"mode": "local"}`. It runs on the queue like the other
+   backfills, resumes by itself, reuses stored vectors, and does not touch Azure AI Search. Check `/api/health` for `local_index.chunks`.
+3. Set `SEARCH_BACKEND=shadow` and `LOCAL_SHADOW_SAMPLE=0.1`. Azure AI Search still answers; `/api/health` reports
+   `local_index.shadow` (`average_overlap` of the top results and `top_result_agrees`). Compare on real questions before going on.
+4. Set `SEARCH_BACKEND=local`. If the local index is not ready, searches fall back to Azure AI Search (see `fallbacks_to_ai_search`).
+5. Later, set `AI_SEARCH_WRITES=false` to stop writing to Azure AI Search. A table write failure is then raised, so the queue retries it.
+
+`POST /api/local-index/reload` rebuilds this instance's index now and returns how long it took.
+
+**Memory (measured on synthetic chunks, per 40,000 chunks).** Steady: about 230 MB with text in memory, about 90 MB without.
+While a rebuild runs there is a peak about 400 MB higher, with the old index still in use. `/api/health` shows
+`local_index.process_memory_mb`. As a rule, 2,048 MB instances are comfortable up to about 60,000 chunks with text in memory;
+beyond that set `LOCAL_INDEX_TEXT_IN_MEMORY=false` (each search then reads about five table rows, and a read costs a fraction of a cent per 10,000), or use 4,096 MB.
+
+**The table as the index of record.** When `SEARCH_BACKEND=local`, or `AI_SEARCH_WRITES=false`, the admin reads use the
+table too: `index/tags` (exact counts, no sampling, in every form: totals, `?domain=`, `?tag=`, `?url=`), `index-status` and the
+nightly reconcile (the document count is read from the table, keys and domains only, so it takes a few seconds), and
+`index/backfill` in `missing` mode (it asks the table which chunks it already holds). Re-tagging and manual page adds
+write to the table. With these in place nothing in the app needs Azure AI Search once `AI_SEARCH_WRITES=false`. The
+Compute Unit and query-tuning settings apply to Azure AI Search only.
+
+**Not the same as Azure AI Search.** Keyword scoring is BM25 over lower-cased words with Lucene's English stop words
+removed and no stemming; the title counts `LOCAL_INDEX_TITLE_WEIGHT` times. Vectors are compared as one bit per dimension
+without rescoring. Rankings will differ somewhat, which is what shadow mode measures.
 
 ## Operating notes
 
@@ -183,6 +239,10 @@ its row and any mention of it in this file.
 pip install -r requirements.txt
 python -m pytest -q tests
 ```
+
+`tests/test_local_index_table_sdk.py` runs the local index against a real Table Storage endpoint and is skipped unless
+`LOCAL_INDEX_TEST_CONNECTION` is set. The Azurite emulator works (`npm install -g azurite`, `azurite-table --silent --location azurite-data`,
+then set the variable to its connection string); the file's header has the exact command.
 
 ## Known limitations
 

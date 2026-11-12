@@ -4,6 +4,7 @@ import copy
 import hashlib
 import logging
 import os
+import random
 import struct
 import threading
 import time
@@ -12,6 +13,9 @@ import requests
 from services.config import settings
 from services.embedding_service import EmbeddingService
 from services.http_pool import pooled_session
+from services.local_index import (
+    LocalIndexManager, LocalIndexUnavailable, binary_code, entity_from_search_doc, query_terms, split_chunk_id,
+)
 
 log = logging.getLogger("sujeeth-web-search.ai-search")
 
@@ -113,6 +117,9 @@ def compute_unit_stats():
 # Set when the service rejects the hybridSearch option, so later searches stop sending it.
 _hybrid_option_rejected = [False]
 
+# Shadow mode runs a sample of searches locally in the background and compares them with Azure AI Search.
+_shadow_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="local-shadow")
+
 # Search results kept for SEARCH_CACHE_SECONDS (off by default). Keyed on the normalized question, the concepts, the
 # domains and the limit. Each entry remembers the Compute Units its query used, so /health can say how many a hit
 # saved. Failed searches and searches that found nothing are never kept.
@@ -211,6 +218,7 @@ class SearchService:
         self.embedder = EmbeddingService()
         self.session = pooled_session()
         self.session.headers.update({"api-key": settings.search_api_key})
+        self.local = LocalIndexManager()
 
     @property
     def configured(self):
@@ -289,20 +297,51 @@ class SearchService:
         return item
 
     def _upload(self, docs):
-        if not self.configured:
-            raise RuntimeError("Azure AI Search is not configured.")
         outcomes = []
-        for start in range(0, len(docs), settings.search_batch_size):
-            batch = docs[start:start + settings.search_batch_size]
-            # Blob-backed indexes keep no stored vector copy, so a merge cannot update a vector: replace whole documents.
-            action = "upload" if settings.search_blob_backed else "mergeOrUpload"
-            actions = [{"@search.action": action, **x} for x in batch]
-            result = self._write_batch(actions)
-            failures = [x for x in result if not x.get("status")]
-            if failures:
-                raise RuntimeError(f"Azure AI Search rejected {len(failures)} document(s): {failures[:3]}")
-            outcomes.extend(result)
+        if settings.ai_search_writes:
+            if not self.configured:
+                raise RuntimeError("Azure AI Search is not configured.")
+            for start in range(0, len(docs), settings.search_batch_size):
+                batch = docs[start:start + settings.search_batch_size]
+                # Blob-backed indexes keep no stored vector copy, so a merge cannot update a vector: replace whole documents.
+                action = "upload" if settings.search_blob_backed else "mergeOrUpload"
+                actions = [{"@search.action": action, **x} for x in batch]
+                result = self._write_batch(actions)
+                failures = [x for x in result if not x.get("status")]
+                if failures:
+                    raise RuntimeError(f"Azure AI Search rejected {len(failures)} document(s): {failures[:3]}")
+                outcomes.extend(result)
+        self._local_write(docs)
         return outcomes
+
+    def _local_write(self, docs, strict=False):
+        """Write chunks to the Table Storage table the local index reads, then change its version row so every
+        instance reloads. While Azure AI Search still takes the writes, a failure here is logged and the backfill can
+        repair it; once Azure AI Search is off (or when strict), the failure is raised so the queue retries."""
+        if not settings.local_index_write or not docs:
+            return
+        try:
+            entities = [entity_from_search_doc(d) for d in docs if d.get(settings.search_vector_field) is not None]
+            store = self.local.store()
+            store.upsert_entities(entities)
+            store.bump_version()
+        except Exception:
+            if strict or not settings.ai_search_writes:
+                raise
+            log.warning("Could not write %d chunk(s) to the local index table; the local backfill can repair it",
+                        len(docs), exc_info=True)
+
+    def _local_delete(self, ids):
+        if not settings.local_index_write or not ids:
+            return
+        try:
+            store = self.local.store()
+            store.delete_ids(ids)
+            store.bump_version()
+        except Exception:
+            if not settings.ai_search_writes:
+                raise
+            log.warning("Could not delete %d chunk(s) from the local index table", len(ids), exc_info=True)
 
     def _blob_text(self, doc_id):
         """Text of one chunk from memory or Blob Storage, or None when the blob is missing."""
@@ -382,7 +421,7 @@ class SearchService:
         stores no vector copy, so there the whole document is re-uploaded from `docs` instead.
         Returns (updated, not_indexed).
         """
-        if not self.configured:
+        if settings.ai_search_writes and not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
         if settings.search_blob_backed:
             return self._rewrite_existing(updates, docs)
@@ -409,6 +448,14 @@ class SearchService:
         With chunk_id, returns that chunk and up to `neighbors` chunks on each side. With
         url, returns every chunk of the page. Returns (rows, focus_index, total_chunks).
         """
+        if settings.search_backend == "local":
+            try:
+                return self._fetch_chunks_local(url, chunk_id, neighbors, max_chars, timings)
+            except LocalIndexUnavailable as exc:
+                if not (settings.local_search_fallback and self.configured):
+                    raise RuntimeError(f"The local search index is not available: {exc}") from exc
+                self.local.record_fallback()
+                log.warning("Local index not available (%s); reading the page from Azure AI Search", exc)
         if not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
         focus = None
@@ -463,15 +510,82 @@ class SearchService:
                     timings["count_ms"] = round((time.perf_counter() - began) * 1000)
         return rows, focus, total
 
+    def _fetch_chunks_local(self, url, chunk_id, neighbors, max_chars, timings):
+        """fetch_chunks answered from the in-memory index. Same return value: (rows, focus, total_chunks)."""
+        began = time.perf_counter()
+        index = self.local.current()
+        focus = None
+        if chunk_id:
+            try:
+                page_id, focus = split_chunk_id(chunk_id)
+            except ValueError:
+                raise ValueError("chunk_id must look like <page>-<number>.") from None
+            reach = max(0, min(int(neighbors), 3))
+            wanted = [f"{page_id}-{i}" for i in range(max(0, focus - reach), focus + reach + 1)]
+            order = [index.by_id[w] for w in wanted if w in index.by_id]
+            total = len(index.pages.get(page_id, []))
+        elif url:
+            base = str(url).strip().split("#", 1)[0]
+            variants = sorted({base, base.rstrip("/"), base.rstrip("/") + "/"} - {"", "/"})
+            seen = {}
+            for variant in variants:
+                for i in index.by_url.get(variant, []):
+                    seen[i] = True
+            order = sorted(seen, key=lambda i: chunk_index(index.ids[i]))
+            total = len(order)
+            order = order[:400]  # a page this long is cut off at 400 chunks, as before
+        else:
+            raise ValueError("Provide url or chunk_id.")
+        if timings is not None:
+            timings["index_query_ms"] = round((time.perf_counter() - began) * 1000)
+        began = time.perf_counter()
+        texts = self._local_texts(index, order, None if chunk_id else max_chars)
+        rows = []
+        for i in order:
+            row = index.row_dict(i)
+            row["content"] = texts.get(i, "")
+            rows.append(row)
+        if timings is not None:
+            timings["blob_ms"] = round((time.perf_counter() - began) * 1000)
+        return rows, focus, (total if rows else None)
+
+    def local_backfill(self, blob_names, domains=None, workers=8):
+        """Copy chunks from Blob Storage into the local index table, without touching Azure AI Search.
+
+        Stored vectors are reused (a chunk with no stored vector is embedded, as the AI Search backfill would). Raises on
+        any failure, so the queue retries the batch. Returns counts."""
+        only = {str(x).lower() for x in (domains or []) if str(x).strip()}
+        docs = []
+        for name in blob_names:
+            doc = self.storage.get(name)
+            if doc and doc.get("id") and doc.get("content"):
+                if only and str(doc.get("domain") or "").lower() not in only:
+                    continue
+                docs.append(doc)
+        if not docs:
+            return {"read": len(blob_names), "written": 0}
+        groups = [docs[i:i + 25] for i in range(0, len(docs), 25)]
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(groups)))) as pool:
+            vector_sets = list(pool.map(self._vectors_for, groups))
+        search_docs = []
+        for group, vectors in zip(groups, vector_sets):
+            search_docs.extend(self._search_doc(d, v) for d, v in zip(group, vectors))
+        self._local_write(search_docs, strict=True)
+        return {"read": len(blob_names), "written": len(search_docs)}
+
     def delete_ids(self, ids):
         """Delete documents from the index by id. Deleting an id that is not there is not an error."""
         ids = [str(x) for x in ids if x]
-        if not self.configured or not ids:
+        if not ids:
             return 0
-        results = self._write_batch([{"@search.action": "delete", "id": doc_id} for doc_id in ids])
-        failed = [x for x in results if not x.get("status")]
-        if failed:
-            raise RuntimeError(f"Azure AI Search could not delete {len(failed)} document(s): {failed[:3]}")
+        if settings.ai_search_writes and self.configured:
+            results = self._write_batch([{"@search.action": "delete", "id": doc_id} for doc_id in ids])
+            failed = [x for x in results if not x.get("status")]
+            if failed:
+                raise RuntimeError(f"Azure AI Search could not delete {len(failed)} document(s): {failed[:3]}")
+        elif not settings.local_index_write:
+            return 0
+        self._local_delete(ids)
         return len(ids)
 
     def delete_chunks(self, page_id, start, end):
@@ -587,9 +701,15 @@ class SearchService:
             raise IndexBusyError(f"Azure AI Search is busy; {len(deferred)} chunk(s) are stored but not indexed.")
         return count
 
+    def uses_local_admin(self):
+        """True when the table, not Azure AI Search, is the index of record: the counts, tags and checks below read it."""
+        return settings.search_backend == "local" or not settings.ai_search_writes
+
     def _existing_ids(self, ids):
         """Which of these chunk ids are already in the index."""
         ids = [str(x) for x in ids]
+        if not settings.ai_search_writes:
+            return self.local.store().existing_ids(ids)
         found = set()
         for start in range(0, len(ids), 100):
             group = ids[start:start + 100]
@@ -661,7 +781,8 @@ class SearchService:
         domains = sorted({str(x).lower() for x in (domains or [])})
         if not concepts or not domains:
             raise ValueError("Search requires ontology-resolved concepts and domains.")
-        if not self.configured:
+        backend = settings.search_backend
+        if backend != "local" and not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
         cache_key = None
         if settings.search_cache_seconds > 0:
@@ -679,6 +800,30 @@ class SearchService:
             if cached is not None:
                 cached["query"] = query  # the caller's own wording, not the first asker's
                 return cached
+        answer, units = None, None
+        if backend == "local":
+            try:
+                answer = self._search_local(query, concepts, domains, limit)
+            except LocalIndexUnavailable as exc:
+                if not (settings.local_search_fallback and self.configured):
+                    raise RuntimeError(f"The local search index is not available: {exc}") from exc
+                self.local.record_fallback()
+                log.warning("Local index not available (%s); answering from Azure AI Search", exc)
+        if answer is None:
+            answer, units = self._search_azure(query, concepts, domains, limit, label)
+            if backend == "shadow":
+                self._maybe_shadow(query, concepts, domains, limit, answer)
+        if cache_key is not None and answer.get("results"):
+            with _query_lock:
+                _query_cache[cache_key] = (time.monotonic() + settings.search_cache_seconds, copy.deepcopy(answer), units)
+                limit_entries = settings.search_cache_max_entries
+                if len(_query_cache) > limit_entries:
+                    for old in list(_query_cache)[: max(1, limit_entries // 10)]:
+                        _query_cache.pop(old, None)
+        return answer
+
+    def _search_azure(self, query, concepts, domains, limit, label):
+        """The Azure AI Search hybrid query. Returns (answer, Compute Units the query used or None)."""
         domain_values = self._odata_values(domains)
         concept_values = self._odata_values(concepts)
         filter_expr = (
@@ -736,18 +881,87 @@ class SearchService:
             "embedding_enabled": True,
             "results": results,
         }
-        if cache_key is not None and results:
+        try:
+            units = float(response.headers.get("x-ms-azs-compute-units-consumed"))
+        except (TypeError, ValueError):
+            units = None
+        return answer, units
+
+    def _local_texts(self, index, rows, max_chars=None, batch=8):
+        """{row: text} for these rows, in the order given. With max_chars, stop once that much text is loaded."""
+        out, loaded, position = {}, 0, 0
+        while position < len(rows):
+            if max_chars is not None and loaded >= max_chars:
+                break
+            group = rows[position:position + batch]
+            if index.texts is not None:
+                texts = [index.texts[i] for i in group]
+            else:
+                store = self.local.store()
+                with ThreadPoolExecutor(max_workers=max(1, min(batch, len(group)))) as pool:
+                    texts = [t or "" for t in pool.map(lambda i: store.get_text(index.ids[i]), group)]
+            for i, text in zip(group, texts):
+                out[i] = text
+                loaded += len(text)
+            position += batch
+        return out
+
+    def _search_local(self, query, concepts, domains, limit):
+        """The same hybrid search, answered from the in-memory index. Raises LocalIndexUnavailable when it is not ready."""
+        index = self.local.current()
+        terms = query_terms(query)
+        began = time.perf_counter()
+        qcode, keyword_only = None, False
+        try:
+            qcode = binary_code(self.embedder.embed_query(query))
+        except Exception as exc:
+            keyword_only = True
+            log.warning("Search question could not be embedded (%s); searching by keywords only", type(exc).__name__)
+        embed_ms = (time.perf_counter() - began) * 1000
+        began = time.perf_counter()
+        candidates = max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10)
+        hits, matching = index.search(terms, qcode, domains, concepts, candidates=candidates, limit=limit)
+        texts = self._local_texts(index, [row for row, _ in hits])
+        results = []
+        for row, score in hits:
+            data = index.row_dict(row)
+            results.append({
+                "title": data["title"],
+                "url": data["url"],
+                "snippet": (texts.get(row) or "")[:700],
+                "domain": data["domain"],
+                "concepts": data["concepts"],
+                "score": round(float(score), 6),
+                "source": "website",
+                "chunk_id": data["id"],
+            })
+        self.local.record_search(embed_ms, (time.perf_counter() - began) * 1000, keyword_only)
+        return {
+            "query": query,
+            "count": len(results),
+            "total_matches": matching,
+            "search_mode": "keyword" if keyword_only else "hybrid",
+            "embedding_enabled": not keyword_only,
+            "backend": "local",
+            "results": results,
+        }
+
+    def _maybe_shadow(self, query, concepts, domains, limit, azure_answer):
+        """Run a sample of searches locally too, in the background, and record how closely they agree."""
+        sample = settings.local_shadow_sample
+        if sample <= 0 or random.random() >= sample or not azure_answer.get("results"):
+            return
+
+        def work():
             try:
-                units = float(response.headers.get("x-ms-azs-compute-units-consumed"))
-            except (TypeError, ValueError):
-                units = None
-            with _query_lock:
-                _query_cache[cache_key] = (time.monotonic() + settings.search_cache_seconds, copy.deepcopy(answer), units)
-                limit_entries = settings.search_cache_max_entries
-                if len(_query_cache) > limit_entries:
-                    for old in list(_query_cache)[: max(1, limit_entries // 10)]:
-                        _query_cache.pop(old, None)
-        return answer
+                local = self._search_local(query, concepts, domains, limit)
+                a = [r["chunk_id"] for r in azure_answer["results"]]
+                b = [r["chunk_id"] for r in local["results"]]
+                self.local.record_shadow(len(set(a) & set(b)) / max(1, len(a)), bool(a and b and a[0] == b[0]))
+            except Exception:
+                self.local.record_shadow_failure()
+
+        _shadow_pool.submit(work)
 
     @staticmethod
     def _domain_filter(domain):
@@ -759,6 +973,8 @@ class SearchService:
         Without a domain it also returns chunks per domain. Raises FacetUnavailable when the index does not
         allow faceting on the concepts field.
         """
+        if self.uses_local_admin():
+            return self._local_tag_counts(domain, top)
         if not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
         flt = self._domain_filter(domain)
@@ -794,6 +1010,9 @@ class SearchService:
 
     def count_chunks(self, domain=None):
         """How many chunks the index holds (for one domain, when given): one count query."""
+        if self.uses_local_admin():
+            index = self.local.current()
+            return index.n if not domain else int((index.domain_codes == self._domain_code(index, domain)).sum())
         if not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
         body = {"search": "*", "top": 0, "count": True}
@@ -850,6 +1069,8 @@ class SearchService:
 
     def pages_with_tag(self, tag, domain=None, limit=50):
         """The pages that carry one tag, with how many of their chunks have it. Reads up to 1000 matching chunks."""
+        if self.uses_local_admin():
+            return self._local_pages_with_tag(tag, domain, limit)
         if not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
         flt = "concepts/any(c: c eq '" + str(tag).strip().lower().replace("'", "''") + "')"
@@ -875,6 +1096,8 @@ class SearchService:
 
     def page_tags(self, url):
         """The tags on each chunk of one page, read from the index (no chunk text)."""
+        if self.uses_local_admin():
+            return self._local_page_tags(url)
         if not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
         base = str(url).strip().split("#", 1)[0]
@@ -893,6 +1116,17 @@ class SearchService:
         }
 
     def delete_url(self, url):
+        if not settings.ai_search_writes and settings.local_index_write:
+            # The table is the index now: a page's chunks all share one partition, named by the hash of its url.
+            ids = self.local.store().page_ids(hashlib.sha256(str(url).encode()).hexdigest())
+            if not ids:
+                return 0
+            self._local_delete(ids)
+            for doc_id in ids:
+                self.storage.delete("documents/" + str(doc_id) + ".json")
+                _blob_cache_forget("documents/" + str(doc_id) + ".json")
+                self.storage.delete(self.vector_key(doc_id))
+            return len(ids)
         if not self.configured:
             # Legacy fallback is retained for local development only.
             removed = 0
@@ -910,6 +1144,7 @@ class SearchService:
         if not ids:
             return 0
         self._write_batch([{"@search.action": "delete", "id": doc_id} for doc_id in ids])
+        self._local_delete(ids)
         for doc_id in ids:
             self.storage.delete("documents/" + str(doc_id) + ".json")
             _blob_cache_forget("documents/" + str(doc_id) + ".json")
@@ -917,6 +1152,87 @@ class SearchService:
         return len(ids)
 
     def status(self):
+        if self.uses_local_admin():
+            # The table is the index: count what it holds now (a read of keys and domains, no text).
+            out = {"configured": True, "index": settings.local_index_table, "source": "local_index_table",
+                   "embedding_configured": settings.embedding_configured}
+            try:
+                out["document_count"] = self.local.store().count()
+            except Exception as exc:
+                out["document_count"] = None
+                out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        else:
+            out = self._status_azure()
+        if settings.search_backend != "azure" or settings.local_index_write:
+            out["local_index"] = self.local.describe()
+        return out
+
+    # ---- the same admin reads, answered from the in-memory index ----
+    @staticmethod
+    def _domain_code(index, domain):
+        want = str(domain).strip().lower()
+        return index.domain_names.index(want) if want in index.domain_names else -1
+
+    def _local_rows(self, index, domain=None):
+        if not domain:
+            return range(index.n)
+        code = self._domain_code(index, domain)
+        return [int(i) for i in (index.domain_codes == code).nonzero()[0]]
+
+    def _local_tag_counts(self, domain=None, top=200):
+        index = self.local.current()
+        rows = self._local_rows(index, domain)
+        tags, hosts, untagged = {}, {}, 0
+        for i in rows:
+            concepts = index.concepts[i]
+            untagged += 0 if concepts else 1
+            for c in concepts:
+                tags[c] = tags.get(c, 0) + 1
+            if not domain:
+                host = index.domain_names[index.domain_codes[i]]
+                hosts[host] = hosts.get(host, 0) + 1
+        rank = lambda counts, key, limit: [{key: k, "chunks": v} for k, v in
+                                           sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]]
+        return {
+            "source": "local_index",
+            "total_chunks": len(rows),
+            "untagged_chunks": untagged,
+            "tags": rank(tags, "tag", max(1, min(int(top), 1000))),
+            "domains": rank(hosts, "domain", 100),
+        }
+
+    def _local_pages_with_tag(self, tag, domain=None, limit=50):
+        index = self.local.current()
+        want = str(tag).strip().lower()
+        pages, matched = {}, 0
+        for i in self._local_rows(index, domain):
+            if want in {c.lower() for c in index.concepts[i]}:
+                matched += 1
+                page = pages.setdefault(index.urls[i], {"url": index.urls[i], "title": index.titles[i],
+                                                        "domain": index.domain_names[index.domain_codes[i]], "chunks": 0})
+                page["chunks"] += 1
+        ranked = sorted(pages.values(), key=lambda p: (-p["chunks"], p["url"]))
+        return {"tag": want, "chunks_matched": matched, "chunks_read": matched, "pages_found": len(ranked),
+                "pages": ranked[:max(1, int(limit))]}
+
+    def _local_page_tags(self, url):
+        index = self.local.current()
+        base = str(url).strip().split("#", 1)[0]
+        variants = sorted({base, base.rstrip("/"), base.rstrip("/") + "/"} - {"", "/"})
+        seen = {}
+        for variant in variants:
+            for i in index.by_url.get(variant, []):
+                seen[i] = True
+        rows = sorted(seen, key=lambda i: chunk_index(index.ids[i]))
+        first = rows[0] if rows else None
+        return {
+            "url": index.urls[first] if rows else base,
+            "title": index.titles[first] if rows else None,
+            "domain": index.domain_names[index.domain_codes[first]] if rows else None,
+            "chunks": [{"chunk": chunk_index(index.ids[i]), "tags": list(index.concepts[i])} for i in rows],
+        }
+
+    def _status_azure(self):
         if not self.configured:
             return {"configured": False, "index": settings.search_index_name}
         response = self._post("search", {

@@ -17,6 +17,14 @@ def _int(name, default, low=None, high=None):
     return value
 
 
+def _flag(name, default):
+    """A true/false app setting. A blank value falls back to the default."""
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return bool(default)
+    return value in ("1", "true", "yes", "on")
+
+
 def _float(name, default):
     try:
         return float(os.getenv(name, "") or default)
@@ -81,6 +89,31 @@ class Settings:
     search_vector_k = _int("SEARCH_VECTOR_K", 0, 0, 1000)
     search_count = os.getenv("SEARCH_COUNT", "true").strip().lower() in ("1", "true", "yes", "on")
     search_fields = os.getenv("SEARCH_FIELDS", "").strip()
+
+    # ---- Search inside the app over chunks kept in Azure Table Storage (see services/local_index.py) ----
+    # SEARCH_BACKEND: azure = every search goes to Azure AI Search (the default and the behavior before this existed);
+    # shadow = Azure AI Search answers, and a sample of searches is also run locally and compared (see
+    # LOCAL_SHADOW_SAMPLE), to check the local results before switching; local = the app answers from memory.
+    search_backend = (os.getenv("SEARCH_BACKEND", "azure").strip().lower() or "azure")
+    if search_backend not in ("azure", "local", "shadow"):
+        search_backend = "azure"
+    # Whether chunks are still written to (and deleted from) Azure AI Search. Turn off once nothing needs the index.
+    ai_search_writes = _flag("AI_SEARCH_WRITES", True)
+    # Whether chunks are also written to the Table Storage table the local index reads. Turn on before the backfill.
+    local_index_write = _flag("LOCAL_INDEX_WRITE", False)
+    local_index_connection = (os.getenv("LOCAL_INDEX_CONNECTION_STRING", "").strip()
+                              or blob_connection_string or azure_storage_connection)
+    local_index_table = "".join(ch for ch in os.getenv("LOCAL_INDEX_TABLE", "searchchunks") if ch.isalnum()) or "searchchunks"
+    # Keep every chunk's text in memory (fast, about 4 KB a chunk) or fetch the few chunks a search returns from the table.
+    local_index_text_in_memory = _flag("LOCAL_INDEX_TEXT_IN_MEMORY", True)
+    local_index_poll_seconds = _int("LOCAL_INDEX_POLL_SECONDS", 60, 5)
+    local_index_min_reload_seconds = _int("LOCAL_INDEX_MIN_RELOAD_SECONDS", 600, 0)
+    local_index_title_weight = _int("LOCAL_INDEX_TITLE_WEIGHT", 3, 1, 20)
+    local_index_preload = _flag("LOCAL_INDEX_PRELOAD", True)
+    # When the local index is not ready, answer from Azure AI Search instead of failing.
+    local_search_fallback = _flag("LOCAL_SEARCH_FALLBACK", True)
+    # Share of searches (0 to 1) that shadow mode also runs locally and compares with Azure AI Search.
+    local_shadow_sample = min(1.0, max(0.0, _float("LOCAL_SHADOW_SAMPLE", 0.0)))
     # A search that repeats within SEARCH_CACHE_SECONDS (same question once case, spacing and trailing punctuation
     # are ignored, same concepts, domains and limit) is answered from memory instead of querying the index again.
     # 0 turns it off. The index only changes when pages are crawled, so a few minutes of reuse is safe; another
