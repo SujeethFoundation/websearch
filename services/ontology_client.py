@@ -5,12 +5,13 @@ from urllib.parse import quote
 
 import requests
 from services.config import settings
+from services.http_pool import pooled_session
 
 
 class OntologyClient:
     def __init__(self):
         self.base = settings.ontology_api_url
-        self.session = requests.Session()
+        self.session = pooled_session()
         self.session.headers.update({"Accept": "application/json"})
         if settings.ontology_function_key:
             self.session.headers["x-functions-key"] = settings.ontology_function_key
@@ -30,6 +31,10 @@ class OntologyClient:
         if ttl > 0:
             with self._cache_lock:
                 self._cache[key] = (now + ttl, value)
+                limit = settings.ontology_cache_max_entries
+                if len(self._cache) > limit:
+                    for old in list(self._cache)[: max(1, limit // 10)]:
+                        self._cache.pop(old, None)
         return value
 
     def _url(self, path):
@@ -69,10 +74,16 @@ class OntologyClient:
         return self._cached("crawl-manifest", lambda: self.get("/api/ontology/crawl-manifest"))
 
     def resolve_domains(self, concepts, purpose="search"):
-        return self.post("/api/ontology/domain-resolution", {
+        # Reused for ONTOLOGY_CACHE_SECONDS, like the manifests and domain validation. Every search resolves
+        # its concepts twice (the MCP server resolves first, then the search resolves again), and the answer
+        # depends only on the concepts and the purpose, so without this each search made two requests to the
+        # ontology app. A change to which domains a concept allows takes effect after that interval. The key
+        # keeps the concepts in the order given, so a different order is a different entry.
+        key = "resolve:" + str(purpose) + ":" + ",".join(str(c) for c in concepts)
+        return self._cached(key, lambda: self.post("/api/ontology/domain-resolution", {
             "concepts": concepts,
             "purpose": purpose,
-        })
+        }))
 
     def validate_domains(self, domains, purpose="search"):
         # Reused for ONTOLOGY_CACHE_SECONDS, like the manifests, so a page read does not wait on

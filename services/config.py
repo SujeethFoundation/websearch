@@ -130,6 +130,12 @@ class Settings:
 
     # How long the ontology client keeps a successful manifest or domain-concept answer.
     ontology_cache_seconds = _int("ONTOLOGY_CACHE_SECONDS", 120, 0)
+    # Most entries the ontology answer cache keeps. The oldest tenth is dropped when it is exceeded.
+    ontology_cache_max_entries = _int("ONTOLOGY_CACHE_MAX_ENTRIES", 2000, 10)
+    # Connections kept open per host by each HTTP session. requests keeps only 10 by default; an instance
+    # that runs more requests than that at once opens extra connections and throws them away after one use
+    # ("Connection pool is full, discarding connection"), which costs a new TLS handshake every time.
+    http_pool_size = _int("HTTP_POOL_SIZE", 64, 1, 1000)
 
     def page_limit_for(self, domain=None):
         """Pages per domain: MAX_PAGES_PER_DOMAIN, the same for every domain.

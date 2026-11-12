@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from services.config import settings
 from services.embedding_service import EmbeddingService
+from services.http_pool import pooled_session
 
 log = logging.getLogger("sujeeth-web-search.ai-search")
 
@@ -128,7 +129,7 @@ class SearchService:
     def __init__(self, storage):
         self.storage = storage
         self.embedder = EmbeddingService()
-        self.session = requests.Session()
+        self.session = pooled_session()
         self.session.headers.update({"api-key": settings.search_api_key})
 
     @property

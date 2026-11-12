@@ -6,6 +6,7 @@ import time
 import requests
 
 from services.config import settings
+from services.http_pool import pooled_session
 
 log = logging.getLogger("sujeeth-web-search.embeddings")
 
@@ -35,7 +36,7 @@ def _throttle():
 
 class EmbeddingService:
     def __init__(self):
-        self.session = requests.Session()
+        self.session = pooled_session()
         self.session.headers.update({"api-key": settings.embedding_key})
 
     def _post_with_retry(self, url, payload):
