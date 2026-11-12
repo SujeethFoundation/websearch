@@ -148,6 +148,9 @@ class FakeSearch:
         self.deleted.append(url)
         return 2
 
+    def delete_page(self, url, chunk_count=None):       # what the page worker calls (the real one deletes by id when it knows the count)
+        return self.delete_url(url)
+
 
 class FinalizeState:
     def __init__(self, rows):
@@ -172,7 +175,7 @@ class FakeOntology:
         return {"crawl_domains": [{"domain": "example.org"}]}
 
 
-def test_stale_cleanup_skips_current_and_already_stale_rows_and_reads_five_columns():
+def test_stale_cleanup_skips_current_and_already_stale_rows_and_reads_six_columns():
     rows = [
         {"RowKey": "seen", "url": "https://example.org/seen", "last_seen_job": "j", "status": "current"},
         {"RowKey": "gone", "url": "https://example.org/gone", "last_seen_job": "old", "status": "current"},
@@ -184,7 +187,7 @@ def test_stale_cleanup_skips_current_and_already_stale_rows_and_reads_five_colum
     worker._finalize_if_safe("j", "example.org")
     assert search.deleted == ["https://example.org/gone", "https://example.org/legacy"]
     assert state.marked == ["gone", "legacy"]
-    assert set(state.select) == {"PartitionKey", "RowKey", "url", "last_seen_job", "status"}
+    assert set(state.select) == {"PartitionKey", "RowKey", "url", "last_seen_job", "status", "chunk_count"}   # chunk_count lets the delete go by id
     assert state.changes[0]["stale_pages_removed"] == 2 and state.changes[0]["stale_chunks_removed"] == 4
 
 

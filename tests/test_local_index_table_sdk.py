@@ -26,7 +26,6 @@ DIMS = 1536
 @pytest.fixture
 def store(monkeypatch):
     monkeypatch.setattr(settings, "embedding_dimensions", DIMS)
-    monkeypatch.setattr(settings, "search_vector_field", "contentVector")
     return li.LocalIndexStore(connection_string=CONNECTION, table_name="t" + uuid.uuid4().hex[:12])
 
 
@@ -76,17 +75,15 @@ def test_write_through_search_and_delete_work_end_to_end(store, monkeypatch):
         def embed_query(self, text):
             return list(np.random.default_rng(5).standard_normal(DIMS))
 
-    monkeypatch.setattr(settings, "search_backend", "local")
-    monkeypatch.setattr(settings, "local_index_write", True)
-    monkeypatch.setattr(settings, "ai_search_writes", False)
     monkeypatch.setattr(settings, "search_cache_seconds", 0)
-    monkeypatch.setattr(ss.SearchService, "configured", property(lambda self: False))
     svc = object.__new__(ss.SearchService)
     svc.storage, svc.embedder, svc.local = Blobs(), Embedder(), li.LocalIndexManager(store=store)
     docs = [doc("pageA", n) for n in range(6)] + [doc("pageB", n, domain="themuse.com", concepts=("resume",)) for n in range(4)]
     svc._upload([svc._search_doc({k: v for k, v in d.items() if k != "contentVector"}, d["contentVector"]) for d in docs])
     answer = svc.search("mentor guide", concepts=["circle"], domains=["sujeeth.org"], limit=5)
-    assert answer["count"] == 5 and {r["chunk_id"].split("-")[0] for r in answer["results"]} == {"pageA"}
+    assert answer["count"] == 1 and answer["results"][0]["chunk_id"].startswith("pageA-")          # each page once
+    several = svc.search("mentor guide", concepts=["circle"], domains=["sujeeth.org"], limit=5, ranking={"unique_pages": False})
+    assert several["count"] == 5 and {r["chunk_id"].split("-")[0] for r in several["results"]} == {"pageA"}
     rows, focus, total = svc.fetch_chunks(url="https://sujeeth.org/pageA", max_chars=100000)
     assert total == 6 and [r["id"] for r in rows] == [f"pageA-{n}" for n in range(6)]
     assert svc.delete_ids([f"pageA-{n}" for n in range(6)]) == 6

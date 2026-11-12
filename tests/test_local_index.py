@@ -414,15 +414,11 @@ def test_a_scan_can_leave_out_the_text():
 @pytest.fixture
 def conf(monkeypatch):
     monkeypatch.setattr(settings, "embedding_dimensions", DIMS)
-    monkeypatch.setattr(settings, "search_vector_field", "contentVector")
-    monkeypatch.setattr(settings, "search_backend", "local")
-    monkeypatch.setattr(settings, "local_index_write", True)
-    monkeypatch.setattr(settings, "ai_search_writes", False)
+    monkeypatch.setattr(settings, "embedding_configured", True)
     monkeypatch.setattr(settings, "local_index_text_in_memory", True)
     monkeypatch.setattr(settings, "local_index_poll_seconds", 5)
     monkeypatch.setattr(settings, "local_index_min_reload_seconds", 0)
     monkeypatch.setattr(settings, "search_cache_seconds", 0)
-    monkeypatch.setattr(ss.SearchService, "configured", property(lambda self: False))
 
 
 def wait_for(predicate, seconds=5.0):
@@ -562,53 +558,22 @@ class Blobs:
         self.blobs.pop(name, None)
 
 
-class AzureResp:
-    def __init__(self, code=200, body=None):
-        self.status_code, self._body, self.headers = code, body or {}, {}
-
-    def json(self):
-        return self._body
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise requests.HTTPError(str(self.status_code), response=self)
-
-
-class AzureSession:
-    def __init__(self, hits=None):
-        self.hits, self.posts = hits or [], []
-
-    def post(self, url, json=None, timeout=None):
-        self.posts.append((url, json))
-        if "/docs/index" in url:
-            return AzureResp(200, {"value": [{"key": a["id"], "status": True, "statusCode": 200} for a in json["value"]]})
-        return AzureResp(200, {"value": self.hits, "@odata.count": len(self.hits)})
-
-
-def make_service(conf_unused=None, store=None, embedder=None, session=None, azure=False):
+def make_service(conf_unused=None, store=None, embedder=None):
     svc = object.__new__(ss.SearchService)
-    svc.session, svc.storage = session or AzureSession(), Blobs()
+    svc.storage = Blobs()
     svc.embedder = embedder or Embedder()
     svc.local = li.LocalIndexManager(store=store or filled_store())
     return svc
 
 
-def azure_configured(monkeypatch):
-    monkeypatch.setattr(ss.SearchService, "configured", property(lambda self: True))
-    monkeypatch.setattr(settings, "search_endpoint", "https://x", raising=False)
-    monkeypatch.setattr(settings, "search_index_name", "sf", raising=False)
-    monkeypatch.setattr(settings, "search_api_version", "v", raising=False)
-    monkeypatch.setattr(settings, "search_blob_backed", False)
-
-
 ASK = dict(concepts=["circle", "mentor", "resume"], domains=["sujeeth.org", "themuse.com"])
 
 
-def test_a_local_search_returns_the_same_shape_as_the_azure_search(conf):
+def test_a_search_returns_the_documented_shape(conf):
     svc = make_service()
     answer = svc.search("w5 w60 w120", limit=5, **ASK)
     assert set(answer) >= {"query", "count", "total_matches", "search_mode", "embedding_enabled", "results"}
-    assert answer["count"] == 5 and answer["search_mode"] == "hybrid" and answer["backend"] == "local"
+    assert answer["count"] == 5 and answer["search_mode"] == "hybrid"
     assert answer["total_matches"] == 100
     assert set(answer["results"][0]) == {"title", "url", "snippet", "domain", "concepts", "score", "source", "chunk_id"}
     first = answer["results"][0]
@@ -643,7 +608,7 @@ def test_snippets_come_from_the_table_when_text_is_not_kept_in_memory(conf, monk
 def test_the_result_cache_still_works_in_front_of_the_local_search(conf, monkeypatch):
     monkeypatch.setattr(settings, "search_cache_seconds", 600)
     monkeypatch.setattr(ss, "_query_cache", {})
-    monkeypatch.setattr(ss, "_query_stats", {"hits": 0, "misses": 0, "saved": 0.0})
+    monkeypatch.setattr(ss, "_query_stats", {"hits": 0, "misses": 0})
     embedder = Embedder()
     svc = make_service(embedder=embedder)
     first = svc.search("w5 w60", **ASK)
@@ -651,73 +616,9 @@ def test_the_result_cache_still_works_in_front_of_the_local_search(conf, monkeyp
     assert second["results"] == first["results"] and len(embedder.query_calls) == 1
 
 
-def test_when_the_local_index_is_empty_the_search_falls_back_to_azure(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    hit = {"id": "page1-0", "title": "T", "url": "https://sujeeth.org/p1", "domain": "sujeeth.org", "concepts": ["circle"],
-           "content": "azure text", "@search.score": 0.5}
-    svc = make_service(store=new_store(), session=AzureSession([hit]))
-    answer = svc.search("mentor", **ASK)
-    assert answer["results"][0]["snippet"] == "azure text" and "backend" not in answer
-    assert svc.local.describe()["fallbacks_to_ai_search"] == 1
-
-
-def test_without_the_fallback_an_unavailable_index_is_an_error(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    monkeypatch.setattr(settings, "local_search_fallback", False)
+def test_an_unavailable_index_is_an_error(conf):
     with pytest.raises(RuntimeError, match="not available"):
         make_service(store=new_store()).search("mentor", **ASK)
-
-
-def test_local_search_works_when_azure_ai_search_is_not_configured_at_all(conf):
-    assert make_service().search("w5", **ASK)["count"] > 0
-
-
-def test_azure_backend_is_unchanged_and_does_not_touch_the_local_index(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    monkeypatch.setattr(settings, "search_backend", "azure")
-    session = AzureSession([{"id": "page1-0", "title": "T", "url": "u", "domain": "d", "concepts": ["c"], "content": "x", "@search.score": 1}])
-    svc = make_service(session=session)
-    assert svc.search("mentor", **ASK)["count"] == 1
-    assert svc.local.describe()["loaded"] is False and len(session.posts) == 1
-
-
-def test_shadow_mode_answers_from_azure_and_compares_a_sample_locally(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    monkeypatch.setattr(settings, "local_shadow_sample", 1.0)
-    local_answer = make_service().search("w5 w60", **ASK)           # the backend is local here
-    monkeypatch.setattr(settings, "search_backend", "shadow")
-    ids = [r["chunk_id"] for r in local_answer["results"]]
-    hits = [{"id": i, "title": "T", "url": "u", "domain": "sujeeth.org", "concepts": ["circle"], "content": "x", "@search.score": 1} for i in ids]
-    svc = make_service(session=AzureSession(hits))
-    answer = svc.search("w5 w60", **ASK)
-    assert "backend" not in answer                                  # the caller got the Azure answer
-    assert wait_for(lambda: svc.local.describe()["shadow"]["compared"] == 1)
-    shadow = svc.local.describe()["shadow"]
-    assert shadow["average_overlap"] == 1.0 and shadow["top_result_agrees"] == 1.0
-
-
-def test_shadow_mode_records_disagreement_and_failures(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    monkeypatch.setattr(settings, "search_backend", "shadow")
-    monkeypatch.setattr(settings, "local_shadow_sample", 1.0)
-    hits = [{"id": "elsewhere-0", "title": "T", "url": "u", "domain": "d", "concepts": ["c"], "content": "x", "@search.score": 1}]
-    svc = make_service(session=AzureSession(hits))
-    svc.search("w5 w60", **ASK)
-    assert wait_for(lambda: svc.local.describe()["shadow"]["compared"] == 1)
-    assert svc.local.describe()["shadow"]["average_overlap"] == 0.0
-    broken = make_service(store=new_store(), session=AzureSession(hits))
-    broken.search("w5 w60", **ASK)
-    assert wait_for(lambda: broken.local.describe()["shadow"]["failed"] == 1)
-
-
-def test_shadow_sampling_can_be_off(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    monkeypatch.setattr(settings, "search_backend", "shadow")
-    monkeypatch.setattr(settings, "local_shadow_sample", 0.0)
-    svc = make_service(session=AzureSession([{"id": "a-0", "title": "T", "url": "u", "domain": "d", "concepts": [], "content": "x", "@search.score": 1}]))
-    svc.search("w5", **ASK)
-    time.sleep(0.2)
-    assert svc.local.describe()["shadow"]["compared"] == 0 and svc.local.describe()["loaded"] is False
 
 
 # ---- reading pages
@@ -771,12 +672,9 @@ def test_a_local_page_read_feeds_assemble_document(conf):
     assert [r["id"] for r in chosen] == ["page1-2", "page1-3", "page1-4"] and not truncated
 
 
-def test_a_page_read_falls_back_to_azure_when_the_index_is_unavailable(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    row = {"id": "page1-0", "title": "T", "url": "https://sujeeth.org/p1", "domain": "sujeeth.org", "concepts": [], "content": "azure"}
-    svc = make_service(store=new_store(), session=AzureSession([row]))
-    rows, _, _ = svc.fetch_chunks(url="https://sujeeth.org/p1", max_chars=1000)
-    assert rows[0]["content"] == "azure"
+def test_a_page_read_when_the_index_is_unavailable_is_an_error(conf):
+    with pytest.raises(RuntimeError, match="not available"):
+        make_service(store=new_store()).fetch_chunks(url="https://sujeeth.org/p1", max_chars=1000)
 
 
 # ---- writing
@@ -785,34 +683,14 @@ def search_docs(svc, docs):
     return [svc._search_doc({k: v for k, v in d.items() if k != "contentVector"}, d["contentVector"]) for d in docs]
 
 
-def test_chunks_go_to_the_table_and_the_version_changes_when_azure_writes_are_off(conf):
+def test_chunks_go_to_the_table_and_the_version_changes(conf):
     store = new_store()
     svc = make_service(store=store)
     svc._upload(search_docs(svc, [make_doc(1, n) for n in range(3)]))
-    assert len(store.chunks.rows) == 3 and store.get_version() and svc.session.posts == []
+    assert len(store.chunks.rows) == 3 and store.get_version()
 
 
-def test_with_both_writes_on_chunks_go_to_azure_and_the_table(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    monkeypatch.setattr(settings, "ai_search_writes", True)
-    store = new_store()
-    svc = make_service(store=store)
-    svc._upload(search_docs(svc, [make_doc(1, n) for n in range(3)]))
-    assert len(store.chunks.rows) == 3 and len(svc.session.posts) == 1
-
-
-def test_a_table_failure_is_only_logged_while_azure_still_takes_the_writes(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    monkeypatch.setattr(settings, "ai_search_writes", True)
-    store = new_store(FakeTable())
-    store.chunks.submit_transaction = lambda ops: (_ for _ in ()).throw(RuntimeError("table down"))
-    store.chunks.upsert_entity = lambda e, mode=None: (_ for _ in ()).throw(RuntimeError("table down"))
-    svc = make_service(store=store)
-    svc._upload(search_docs(svc, [make_doc(1, 0)]))            # does not raise
-    assert len(svc.session.posts) == 1
-
-
-def test_a_table_failure_is_raised_once_azure_is_off_so_the_queue_retries(conf):
+def test_a_table_failure_is_raised_so_the_queue_retries(conf):
     store = new_store(FakeTable())
     store.chunks.submit_transaction = lambda ops: (_ for _ in ()).throw(RuntimeError("table down"))
     store.chunks.upsert_entity = lambda e, mode=None: (_ for _ in ()).throw(RuntimeError("table down"))
@@ -821,14 +699,36 @@ def test_a_table_failure_is_raised_once_azure_is_off_so_the_queue_retries(conf):
         svc._upload(search_docs(svc, [make_doc(1, 0)]))
 
 
-def test_the_table_is_not_written_unless_asked(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    monkeypatch.setattr(settings, "ai_search_writes", True)
-    monkeypatch.setattr(settings, "local_index_write", False)
-    store = new_store()
+class Throttled(Exception):
+    status_code = 429
+
+
+def test_a_busy_table_raises_index_busy_so_the_work_can_be_deferred(conf):
+    store = new_store(FakeTable())
+    store.chunks.submit_transaction = lambda ops: (_ for _ in ()).throw(Throttled("server busy"))
+    store.chunks.upsert_entity = lambda e, mode=None: (_ for _ in ()).throw(Throttled("server busy"))
     svc = make_service(store=store)
-    svc._upload(search_docs(svc, [make_doc(1, 0)]))
-    assert not store.chunks.rows and store.get_version() is None
+    with pytest.raises(ss.IndexBusyError):
+        svc._upload(search_docs(svc, [make_doc(1, 0)]))
+    store.delete_ids = lambda ids: (_ for _ in ()).throw(Throttled("server busy"))
+    with pytest.raises(ss.IndexBusyError):
+        svc.delete_ids(["page1-0"])
+
+
+def test_which_failures_count_as_busy():
+    assert ss._is_transient(Throttled("x")) and ss._is_transient(TimeoutError()) and ss._is_transient(ConnectionError())
+    assert ss._is_transient(type("ServiceRequestError", (Exception,), {})("x"))
+    assert not ss._is_transient(RuntimeError("table down")) and not ss._is_transient(ValueError("bad row"))
+
+
+def test_without_a_table_connection_a_write_or_a_delete_says_so(conf):
+    svc = make_service()
+    svc.local = types.SimpleNamespace(enabled=False)
+    with pytest.raises(RuntimeError, match="LOCAL_INDEX_CONNECTION_STRING"):
+        svc._upload(search_docs(svc, [make_doc(1, 0)]))
+    with pytest.raises(RuntimeError, match="LOCAL_INDEX_CONNECTION_STRING"):
+        svc.delete_ids(["page1-0"])
+    assert svc._upload([]) is None and svc.delete_ids([]) == 0           # nothing to write is not an error
 
 
 def test_deleting_chunks_removes_them_from_the_table_too(conf):
@@ -836,11 +736,6 @@ def test_deleting_chunks_removes_them_from_the_table_too(conf):
     svc = make_service(store=store)
     assert svc.delete_ids(["page1-0", "page1-1"]) == 2
     assert sorted(r for _, r in store.chunks.rows) == ["000002", "000003"]
-
-
-def test_delete_ids_does_nothing_when_neither_index_is_in_use(conf, monkeypatch):
-    monkeypatch.setattr(settings, "local_index_write", False)
-    assert make_service().delete_ids(["page1-0"]) == 0
 
 
 def test_delete_url_uses_the_table_when_it_is_the_index(conf):
@@ -892,16 +787,15 @@ def backfill_service(conf_unused=None, with_vectors=True):
 
 def test_the_backfill_copies_blob_chunks_to_the_table_and_embeds_only_what_has_no_stored_vector(conf):
     svc, store, names = backfill_service()
-    outcome = svc.local_backfill(names)
-    assert outcome == {"read": 6, "written": 6} and len(store.chunks.rows) == 6
+    outcome = svc.index_blobs(names)
+    assert outcome == {"read": 6, "already_indexed": 0, "indexed": 6} and len(store.chunks.rows) == 6
     assert sum(svc.embedder.calls) == 1                       # only the chunk without a stored vector
     assert store.get_version()
-    assert svc.session.posts == []                             # Azure AI Search was never touched
 
 
 def test_a_backfilled_chunk_can_be_found_by_search(conf):
     svc, store, names = backfill_service()
-    svc.local_backfill(names)
+    svc.index_blobs(names)
     hit = svc.search("chunk", concepts=["circle"], domains=["sujeeth.org"], limit=5)
     assert hit["count"] > 0
 
@@ -909,8 +803,8 @@ def test_a_backfilled_chunk_can_be_found_by_search(conf):
 def test_the_backfill_can_be_limited_to_domains_and_skips_chunks_without_text(conf):
     svc, store, names = backfill_service()
     svc.storage.put("documents/blank-0.json", {"id": "blank-0", "domain": "sujeeth.org", "content": ""})
-    assert svc.local_backfill(names + ["documents/blank-0.json", "documents/gone.json"], domains=["other.org"])["written"] == 0
-    assert svc.local_backfill(names + ["documents/blank-0.json", "documents/gone.json"], domains=["sujeeth.org"])["written"] == 6
+    assert svc.index_blobs(names + ["documents/blank-0.json", "documents/gone.json"], domains=["other.org"])["indexed"] == 0
+    assert svc.index_blobs(names + ["documents/blank-0.json", "documents/gone.json"], domains=["sujeeth.org"])["indexed"] == 6
 
 
 def test_a_backfill_failure_is_raised_so_the_queue_retries_the_batch(conf):
@@ -918,7 +812,7 @@ def test_a_backfill_failure_is_raised_so_the_queue_retries_the_batch(conf):
     store.chunks.submit_transaction = lambda ops: (_ for _ in ()).throw(RuntimeError("table down"))
     store.chunks.upsert_entity = lambda e, mode=None: (_ for _ in ()).throw(RuntimeError("table down"))
     with pytest.raises(RuntimeError, match="table down"):
-        svc.local_backfill(names)
+        svc.index_blobs(names)
 
 
 # ---- the queue
@@ -938,16 +832,21 @@ def processor(search):
     return proc
 
 
-def test_a_queued_local_batch_goes_to_the_table_and_not_to_azure(conf):
+def test_a_queued_batch_in_any_backfill_mode_goes_through_index_blobs(conf):
+    seen = []
+
     class Search:
-        def local_backfill(self, names, domains=None):
-            return {"read": len(names), "written": len(names)}
+        def index_blobs(self, names, only_missing=False, domains=None):
+            seen.append(only_missing)
+            return {"read": len(names), "already_indexed": 0, "indexed": len(names)}
 
-        def index_blobs(self, *a, **k):
-            raise AssertionError("Azure AI Search must not be touched in local mode")
-
-    result = processor(Search()).process(json.dumps({"task_type": "index_blob_batch", "blob_names": ["a", "b"], "mode": "local"}))
-    assert result["status"] == "local_indexed" and result["documents_indexed"] == 2
+    for mode, only_missing in (("local", False), ("all", False), (None, False), ("missing", True)):
+        task = {"task_type": "index_blob_batch", "blob_names": ["a", "b"]}
+        if mode:
+            task["mode"] = mode
+        result = processor(Search()).process(json.dumps(task))
+        assert result["status"] == "indexed" and result["documents_indexed"] == 2
+        assert seen[-1] is only_missing                          # "local" is the old name for "all"
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1054,34 +953,45 @@ def settings_in_a_fresh_process(**env):
     import os
     import subprocess
     import sys
-    clean = {k: v for k, v in os.environ.items() if not k.startswith(("SEARCH_", "AI_SEARCH", "LOCAL_"))}
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(("SEARCH_", "AI_SEARCH", "LOCAL_", "AZURE_SEARCH"))}
     clean.update(env)
-    code = ("import json; from services.config import settings as s; print(json.dumps([s.search_backend, s.ai_search_writes, "
-            "s.local_index_write, s.local_shadow_sample, s.local_index_table, s.local_index_text_in_memory, s.local_search_fallback]))")
+    code = ("import json; from services.config import settings as s; print(json.dumps([s.local_index_table, "
+            "s.local_index_text_in_memory, s.search_unique_pages, s.local_text_recall, s.search_vector_k]))")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out = subprocess.run([sys.executable, "-c", code], env=clean, cwd=root, capture_output=True, text=True, check=True)
     return json.loads(out.stdout)
 
 
-def test_the_defaults_leave_behavior_exactly_as_it_was():
-    assert settings_in_a_fresh_process() == ["azure", True, False, 0.0, "searchchunks", True, True]
+def test_the_defaults():
+    assert settings_in_a_fresh_process() == ["searchchunks", True, True, 0, 0]
 
 
-def test_bad_setting_values_fall_back():
-    got = settings_in_a_fresh_process(SEARCH_BACKEND="nonsense", LOCAL_SHADOW_SAMPLE="7", LOCAL_INDEX_TABLE="my-chunks_table!")
-    assert got[0] == "azure" and got[3] == 1.0 and got[4] == "mychunkstable"
-    assert settings_in_a_fresh_process(SEARCH_BACKEND=" LOCAL ", AI_SEARCH_WRITES="false", LOCAL_INDEX_WRITE="yes")[:3] == ["local", False, True]
+def test_bad_setting_values_fall_back_and_the_old_azure_settings_are_ignored():
+    got = settings_in_a_fresh_process(LOCAL_INDEX_TABLE="my-chunks_table!", SEARCH_UNIQUE_PAGES="false", LOCAL_TEXT_RECALL="99999")
+    assert got[0] == "mychunkstable" and got[2] is False and got[3] == 10000                # clamped to its largest value
+    assert settings_in_a_fresh_process(AZURE_SEARCH_ENDPOINT="https://x", AZURE_SEARCH_API_KEY="k", SEARCH_BACKEND="azure") == ["searchchunks", True, True, 0, 0]
 
 
-def test_health_reports_the_local_index(conf):
+def test_the_removed_settings_are_gone():
+    for name in ("search_endpoint", "search_api_key", "search_index_name", "search_backend", "ai_search_writes", "local_index_write",
+                 "local_search_fallback", "local_shadow_sample", "search_configured", "search_blob_backed", "search_vector_field",
+                 "search_max_text_recall", "search_count", "search_fields", "concepts_facetable"):
+        assert not hasattr(settings, name), name
+
+
+def test_health_reports_the_local_index_and_nothing_about_azure_ai_search(conf, monkeypatch):
     import azure.functions as func
     import function_app as fa
+    monkeypatch.setattr(fa, "searcher", make_service())
+    monkeypatch.setattr(settings, "embedding_configured", True, raising=False)
     request = func.HttpRequest("GET", "/api/health", headers={}, body=b"")
     body = json.loads(fa.health._function._func(request).get_body())
-    assert body["search_backend"] == "local" and body["search_mode"] == "local_hybrid"
-    assert body["local_index"]["backend"] == "local" and "shadow" in body["local_index"]
+    assert body["search_mode"] == "local_hybrid" and body["index_configured"] is True and body["local_index"]["enabled"] is True
+    assert not {"ai_search_configured", "ai_search_index", "ai_search_compute", "search_backend", "search_tuning", "blob_cache"} & set(body)
+    assert "shadow" not in body["local_index"] and "fallbacks_to_ai_search" not in body["local_index"] and "backend" not in body["local_index"]
 
 
-def test_status_includes_the_local_index_once_it_is_in_use(conf):
-    svc = make_service()
-    assert svc.status()["local_index"]["backend"] == "local"
+def test_status_counts_the_table_and_includes_what_this_instance_has_loaded(conf):
+    out = make_service().status()
+    assert out["configured"] is True and out["source"] == "local_index_table" and out["document_count"] == 100
+    assert out["local_index"]["enabled"] is True

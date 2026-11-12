@@ -71,36 +71,11 @@ class Settings:
     embedding_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "v1")
     embedding_dimensions = int(os.getenv("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1536"))
 
-    search_endpoint = os.getenv(
-        "AZURE_SEARCH_ENDPOINT", "https://sujeeth-aisearch.search.windows.net"
-    ).rstrip("/")
-    search_api_key = os.getenv("AZURE_SEARCH_API_KEY", "")
-    search_index_name = os.getenv("AZURE_SEARCH_INDEX_NAME", "sf-knowledge-v2")
-    search_api_version = os.getenv("AZURE_SEARCH_API_VERSION", "2025-09-01")
-    # Query tuning for cost on the Serverless tier, where each query uses Compute Units. Every default keeps
-    # the behavior the app had before these settings existed. Change one at a time and compare the Compute
-    # Units per search that /health reports (ai_search_compute) and the relevance of the results.
-    #   SEARCH_MAX_TEXT_RECALL: hybridSearch.maxTextRecallSize, how many keyword matches feed the rank fusion.
-    #     The service default is 1,000 and compute scales roughly with it. 0 sends nothing (service default).
-    #   SEARCH_VECTOR_K: nearest neighbours the vector query fetches. 0 keeps max(50, limit * 10).
-    #   SEARCH_COUNT: false stops asking the service to count every match (total_matches is then null).
-    #   SEARCH_FIELDS: comma-separated fields the keyword half searches. Blank searches every searchable field.
-    search_max_text_recall = _int("SEARCH_MAX_TEXT_RECALL", 0, 0, 10000)
+    # How many nearest neighbours the vector half puts into the rank fusion. 0 keeps max(50, limit * 10).
     search_vector_k = _int("SEARCH_VECTOR_K", 0, 0, 1000)
-    search_count = os.getenv("SEARCH_COUNT", "true").strip().lower() in ("1", "true", "yes", "on")
-    search_fields = os.getenv("SEARCH_FIELDS", "").strip()
 
     # ---- Search inside the app over chunks kept in Azure Table Storage (see services/local_index.py) ----
-    # SEARCH_BACKEND: azure = every search goes to Azure AI Search (the default and the behavior before this existed);
-    # shadow = Azure AI Search answers, and a sample of searches is also run locally and compared (see
-    # LOCAL_SHADOW_SAMPLE), to check the local results before switching; local = the app answers from memory.
-    search_backend = (os.getenv("SEARCH_BACKEND", "azure").strip().lower() or "azure")
-    if search_backend not in ("azure", "local", "shadow"):
-        search_backend = "azure"
-    # Whether chunks are still written to (and deleted from) Azure AI Search. Turn off once nothing needs the index.
-    ai_search_writes = _flag("AI_SEARCH_WRITES", True)
-    # Whether chunks are also written to the Table Storage table the local index reads. Turn on before the backfill.
-    local_index_write = _flag("LOCAL_INDEX_WRITE", False)
+    # The table is the index: every chunk the crawler writes goes to it, and every instance keeps a copy in memory.
     local_index_connection = (os.getenv("LOCAL_INDEX_CONNECTION_STRING", "").strip()
                               or blob_connection_string or azure_storage_connection)
     local_index_table = "".join(ch for ch in os.getenv("LOCAL_INDEX_TABLE", "searchchunks") if ch.isalnum()) or "searchchunks"
@@ -112,23 +87,16 @@ class Settings:
     local_index_preload = _flag("LOCAL_INDEX_PRELOAD", True)
     # The 1-bit codes find a shortlist of close chunks quickly, but they rank poorly among close neighbours. Each chunk
     # also keeps its vector at 8 bits a dimension (about 1.5 KB), and the best LOCAL_RESCORE_POOL chunks by code are
-    # re-ranked by cosine similarity on those. Needs the table rows to carry the vectors (run the local backfill again
-    # after upgrading); until every row has one, the search quietly uses the codes alone.
-    # What the index does with common words ("the", "is", "to"). The Azure index uses the default Standard Lucene analyzer,
-    # which keeps them (its stop word list is empty), so they are stored with every chunk and, by default, searched for like
-    # any other word; they score low because nearly every chunk has them. "english" drops a list of 33 of them from questions.
+    # re-ranked by cosine similarity on those. Needs the table rows to carry the vectors (run the backfill again after
+    # upgrading); until every row has one, the search quietly uses the codes alone.
+    # What the index does with common words ("the", "is", "to"). They are stored with every chunk and, by default,
+    # searched for like any other word; they score low because nearly every chunk has them. "english" drops a list of 33
+    # of them from questions only.
     local_index_stopwords = os.getenv("LOCAL_INDEX_STOPWORDS", "none").strip().lower()
-    # How many keyword-ranked chunks go into the rank fusion with the vector results. Azure AI Search feeds up to 1,000
-    # (hybridSearch.maxTextRecallSize, default 1000) to its fusion, so a chunk strong on vectors but ranked 80th on keywords
-    # still gets its keyword credit. 0 uses SEARCH_MAX_TEXT_RECALL when that is set (so the two engines match), else 1000.
+    # How many keyword-ranked chunks go into the rank fusion with the vector results (the vector side takes
+    # SEARCH_VECTOR_K). A chunk strong on vectors but ranked 80th on keywords still gets its keyword credit. 0 means 1,000.
     local_text_recall = _int("LOCAL_TEXT_RECALL", 0, 0, 10000)
-    # When a shadow comparison finds different top pages, also run each engine's keyword half and vector half on their own
-    # (two extra Azure AI Search queries, at most one such comparison every LOCAL_SHADOW_DIAGNOSE_MIN_SECONDS), so the
-    # difference can be put down to the keyword half, the vector half or the fusion. For investigating, not for always.
-    local_shadow_diagnose = _flag("LOCAL_SHADOW_DIAGNOSE", False)
-    local_shadow_diagnose_min_seconds = _float("LOCAL_SHADOW_DIAGNOSE_MIN_SECONDS", 5)
-    # Ranking beyond what Azure AI Search does (local search only; the shadow comparison leaves both out, so it still
-    # measures whether the two engines agree):
+    # Ranking beyond the plain rank fusion of the keyword and vector lists:
     # - A chunk tagged with a concept the question itself named ("week 4", "mentor") ranks above one that only passes the
     #   filter through a concept the ontology added by relationship. The bonus is LOCAL_CONCEPT_BOOST times the share of the
     #   question's own concepts the chunk carries, on the scale of a first place in one ranked list. 0 turns it off.
@@ -145,11 +113,9 @@ class Settings:
     local_phrase_pool = _int("LOCAL_PHRASE_POOL", 100, 10, 1000)
     local_rescore = _flag("LOCAL_RESCORE", True)
     # Every result is a different page: a page is returned once, as its best chunk, and the www. and bare copies of an
-    # address count as one page (both engines). The answer holds fewer than `limit` results only when fewer pages match.
-    # Azure AI Search returns chunks, so it is asked for SEARCH_UNIQUE_OVERFETCH times as many (at most 50) and the best
-    # chunk of each page is kept. false allows several chunks of one page again (LOCAL_MAX_PER_PAGE applies).
+    # address count as one page. The answer holds fewer than `limit` results only when fewer pages match. false allows
+    # several chunks of one page again (LOCAL_MAX_PER_PAGE applies).
     search_unique_pages = _flag("SEARCH_UNIQUE_PAGES", True)
-    search_unique_overfetch = _int("SEARCH_UNIQUE_OVERFETCH", 6, 1, 20)
     local_rescore_pool = _int("LOCAL_RESCORE_POOL", 300, 20, 5000)
     # Search-question embeddings are remembered so a question is embedded once, not once per instance. Only the 1-bit
     # code the local search uses is kept (192 bytes for 1536 dimensions), never the question's text. Memory first, then a
@@ -161,29 +127,14 @@ class Settings:
     embed_cache_ttl_days = _float("EMBED_CACHE_TTL_DAYS", 30)                     # 0 keeps entries until the model changes
     embed_cache_read_timeout = max(0.2, _float("EMBED_CACHE_TIMEOUT_SECONDS", 2))  # one table read or write
     embed_cache_cooldown = max(1.0, _float("EMBED_CACHE_COOLDOWN_SECONDS", 30))   # after a failure, skip the table this long
-    # When the local index is not ready, answer from Azure AI Search instead of failing.
-    local_search_fallback = _flag("LOCAL_SEARCH_FALLBACK", True)
-    # Share of searches (0 to 1) that shadow mode also runs locally and compares with Azure AI Search.
-    local_shadow_sample = min(1.0, max(0.0, _float("LOCAL_SHADOW_SAMPLE", 0.0)))
     # A search that repeats within SEARCH_CACHE_SECONDS (same question once case, spacing and trailing punctuation
     # are ignored, same concepts, domains and limit) is answered from memory instead of querying the index again.
     # 0 turns it off. The index only changes when pages are crawled, so a few minutes of reuse is safe; another
     # instance can serve an older answer for up to this long after a crawl. Each entry is roughly 10 KB.
     search_cache_seconds = _int("SEARCH_CACHE_SECONDS", 0, 0, 86400)
     search_cache_max_entries = _int("SEARCH_CACHE_MAX_ENTRIES", 500, 10, 100000)
-    search_batch_size = max(1, min(int(os.getenv("AZURE_SEARCH_BATCH_SIZE", "100")), 500))
-    # The vector field that receives chunk vectors and is searched. To move to a compressed field in the same
-    # index, add that field to the index definition, point AZURE_SEARCH_VECTOR_FIELD at it, and list the old field
-    # in AZURE_SEARCH_NULL_VECTOR_FIELDS so every rewritten chunk drops its old vector and frees that quota.
-    search_vector_field = os.getenv("AZURE_SEARCH_VECTOR_FIELD", "contentVector").strip() or "contentVector"
-    # When true, Blob Storage is the only copy of chunk text and vectors. The index keeps no retrievable text and no
-    # stored vector copy, so every index write replaces the whole document and result text is read from blobs.
-    search_blob_backed = os.getenv("AZURE_SEARCH_BLOB_BACKED", "true").strip().lower() in ("1", "true", "yes", "on")
-    search_null_vector_fields = tuple(
-        x.strip() for x in os.getenv("AZURE_SEARCH_NULL_VECTOR_FIELDS", "").split(",") if x.strip()
-    )
-    # Chunks per backfill task. A "missing" backfill asks the index about each task's chunks with one query, so
-    # a larger batch means fewer queries.
+    # Chunks per backfill task. A "missing" backfill asks the table about each page of the task's chunks, so a larger
+    # batch means fewer round trips.
     index_backfill_batch_size = max(1, min(int(os.getenv("INDEX_BACKFILL_BATCH_SIZE", "50")), 100))
 
     max_pages = int(os.getenv("MAX_PAGES_PER_DOMAIN", "10000"))
@@ -213,9 +164,6 @@ class Settings:
     # The nightly reconcile queues a backfill only when the index holds more than this percent fewer chunks than
     # Blob Storage. A few stored chunks have no text and are never indexed, so some gap is normal.
     index_reconcile_tolerance_pct = _int("INDEX_RECONCILE_TOLERANCE_PCT", 1, 0, 100)
-    # Set to true only for an index whose concepts and domain fields are facetable. In sf-knowledge-v2 they are not,
-    # so tag counts come from a sample of the stored chunks.
-    concepts_facetable = _flag("INDEX_CONCEPTS_FACETABLE", False)
     # Crawl job history. A job with no update for this many days no longer blocks a new crawl of its domain.
     open_job_stale_days = _int("OPEN_JOB_STALE_DAYS", 3, 1)
     # Jobs (and their page rows) not updated for this many days are deleted. The newest job of each domain is kept.
@@ -223,8 +171,8 @@ class Settings:
     job_cleanup_enabled = _flag("JOB_CLEANUP_ENABLED", True)
 
     # Index writes and embeddings (these were read in search_service.py, queue_worker.py and embedding_service.py).
-    search_min_interval = _float("SEARCH_MIN_INTERVAL_SECONDS", 0)
-    search_write_attempts = _int("SEARCH_WRITE_ATTEMPTS", 8, 1)
+    # After the index table stays busy or unreachable, other writes on this instance skip straight to deferral for this
+    # many seconds, so workers keep crawling instead of each waiting out the failure.
     search_breaker_seconds = _float("SEARCH_BREAKER_SECONDS", 120)
     embed_batch_size = _int("EMBED_BATCH_SIZE", 16, 1)
     embed_min_interval = _float("EMBED_MIN_INTERVAL_SECONDS", 0)
@@ -258,7 +206,6 @@ class Settings:
         return max(1, self.max_pages)
 
     embedding_configured = bool(embedding_endpoint and embedding_key and embedding_deployment)
-    search_configured = bool(search_endpoint and search_api_key and search_index_name)
 
 
 settings = Settings()

@@ -9,7 +9,7 @@ import function_app as fa
 from services import local_index as li
 from services import search_service as ss
 from services.config import settings
-from test_local_index import AzureSession, azure_configured, conf, filled_store, index_of, make_doc, make_service  # noqa: F401
+from test_local_index import conf, filled_store, index_of, make_doc, make_service  # noqa: F401
 from test_local_rescoring import VectorEmbedder
 
 DIMS = 64
@@ -167,32 +167,6 @@ def test_the_service_applies_the_settings_and_reports_how_it_ranked(conf, monkey
     assert off["results"][0]["chunk_id"] != "page1-0" and off["ranking"]["question_concepts"] == {}
 
 
-def test_the_shadow_comparison_ranks_the_plain_way_so_it_still_measures_agreement(conf):
-    q, docs = week4_corpus()
-    svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
-    plain = svc._search_local(QUESTION, FILTER, DOMAINS, 5, concept_weights=OWN, parity=True)
-    assert plain["results"][0]["chunk_id"] != "page1-0" and plain["ranking"] == {"question_concepts": {}, "concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0, "unique_pages": True}
-
-
-def test_an_engine_can_be_forced_for_one_search_and_never_falls_back(conf, monkeypatch):
-    azure_configured(monkeypatch)
-    q, docs = week4_corpus()
-    session = AzureSession(hits=[{"id": "az-1", "title": "From Azure", "url": "https://sujeeth.org/a", "domain": "sujeeth.org",
-                                  "concepts": ["week_4"], "content": "x", "@search.score": 0.03}])
-    svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q), session=session)
-    assert settings.search_backend == "local"
-    forced = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, backend="azure")
-    assert forced["results"][0]["chunk_id"] == "az-1" and forced.get("backend") != "local"
-    monkeypatch.setattr(settings, "search_backend", "azure")
-    local = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, backend="local", concept_weights=OWN)
-    assert local["backend"] == "local" and local["results"][0]["chunk_id"] == "page1-0"
-    assert svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, backend="nonsense")["results"][0]["chunk_id"] == "az-1"
-    from test_local_index import new_store
-    empty = make_service(store=new_store(), session=session)
-    with pytest.raises(RuntimeError):
-        empty.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, backend="local")      # no quiet fallback when forced
-
-
 def test_kept_answers_are_separate_for_each_way_of_ranking(conf, monkeypatch):
     monkeypatch.setattr(settings, "local_phrase_boost", 0.0)          # the concept bonus alone decides here
     monkeypatch.setattr(settings, "search_cache_seconds", 60)
@@ -222,7 +196,7 @@ def test_only_the_concepts_the_question_named_get_a_weight():
     assert fa.question_concept_weights({}) == {} and fa.question_concept_weights({"concept_matches": [{"source": "query_match"}]}) == {}
 
 
-def test_the_search_route_passes_the_weights_and_an_engine_choice(conf, monkeypatch):
+def test_the_search_route_passes_the_questions_own_concepts_as_weights(conf, monkeypatch):
     seen = {}
 
     class Searcher:
@@ -233,15 +207,11 @@ def test_the_search_route_passes_the_weights_and_an_engine_choice(conf, monkeypa
     monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: dict(RESOLUTION))
     monkeypatch.setattr(fa, "add_best_bets", lambda *a, **k: None)
     monkeypatch.setattr(fa, "add_spotlights", lambda *a, **k: None)
-    post = func.HttpRequest("POST", "/api/search", params={}, headers={}, body=json.dumps({"query": "what does a mentor do in week 4", "backend": "LOCAL"}).encode())
+    post = func.HttpRequest("POST", "/api/search", params={}, headers={}, body=json.dumps({"query": "what does a mentor do in week 4"}).encode())
     assert fa.search_post._function._func(post).status_code == 200
-    assert seen["concept_weights"] == {"week_4": 1.2, "career_mentor": 1.0} and seen["backend"] == "local"
+    assert seen["concept_weights"] == {"week_4": 1.2, "career_mentor": 1.0} and "backend" not in seen
     get = func.HttpRequest("GET", "/api/search", params={"q": "week 4", "backend": "azure"}, headers={}, body=b"")
-    fa.search_get._function._func(get)
-    assert seen["backend"] == "azure"
-    plain = func.HttpRequest("GET", "/api/search", params={"q": "week 4", "backend": "other"}, headers={}, body=b"")
-    fa.search_get._function._func(plain)
-    assert seen["backend"] is None
+    assert fa.search_get._function._func(get).status_code == 200 and "backend" not in seen       # an old caller's parameter is ignored
 
 
 # ---- explaining a ranking
@@ -381,7 +351,7 @@ def test_one_request_can_try_other_ranking_settings(conf, monkeypatch):
     assert off["ranking"] == {"question_concepts": {}, "concept_boost": 1.0, "phrase_boost": 0.0, "max_per_page": 1, "unique_pages": True}
     bad = svc.search(WORDS_Q, concepts=["circle"], domains=["sujeeth.org"], limit=3, ranking={"phrase_boost": "lots", "concept_boost": -3})
     assert bad["ranking"]["phrase_boost"] == 1.0 and bad["ranking"]["concept_boost"] == 0.0     # not a number: kept; below zero: zero
-    assert ss.SearchService.ranking_settings({"phrase_boost": 9}, parity=True) == {"concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0, "unique_pages": True}
+    assert ss.SearchService.ranking_settings({"phrase_boost": 9, "unknown": 1})["phrase_boost"] == 9.0
 
 
 def test_tried_settings_are_kept_apart_from_normal_answers(conf, monkeypatch):

@@ -164,6 +164,9 @@ class FakeSearch:
         self.deleted.append(url)
         return 3
 
+    def delete_page(self, url, chunk_count=None):       # what the page worker calls (the real one deletes by id when it knows the count)
+        return self.delete_url(url)
+
 
 def make_worker(page_status, previous=None, robots=None):
     state, search = FakeState(previous), FakeSearch()

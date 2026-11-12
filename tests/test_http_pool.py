@@ -26,10 +26,9 @@ def test_the_pool_size_follows_the_setting(monkeypatch):
     assert pool_size(pooled_session()) == (7, 7)
 
 
-def test_the_ontology_search_and_embedding_clients_use_sized_pools():
+def test_the_ontology_and_embedding_clients_use_sized_pools():
     assert pool_size(OntologyClient().session)[0] == settings.http_pool_size
     assert pool_size(EmbeddingService().session)[0] == settings.http_pool_size
-    assert pool_size(SearchService(storage=None).session)[0] == settings.http_pool_size
 
 
 def test_a_session_keeps_its_headers():

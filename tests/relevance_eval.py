@@ -1,13 +1,12 @@
 """Score the search on questions whose right answer you know.
 
-    python tests/relevance_eval.py                    the engine that is live (SEARCH_BACKEND)
-    python tests/relevance_eval.py --backend local    one engine, whatever is live
-    python tests/relevance_eval.py --compare          Azure AI Search and the local index side by side
-    python tests/relevance_eval.py --compare --explain    ...and, for each question the local index does not answer first,
-                                                      why: where the right page stands in each part of the ranking
-    python tests/relevance_eval.py --compare --try phrase_boost=0
-                                                      ...and a third column: the local index with these ranking settings
-                                                      for this run only (concept_boost, phrase_boost, max_per_page)
+    python tests/relevance_eval.py                    the deployed app
+    python tests/relevance_eval.py --explain          ...and, for each question not answered first, why: where the right
+                                                      page stands in each part of the ranking
+    python tests/relevance_eval.py --try phrase_boost=0
+                                                      ...and a second column: the same app with these ranking settings
+                                                      for this run only (concept_boost, phrase_boost, max_per_page,
+                                                      unique_pages)
 
 The app's address is --url, else WEBSEARCH_URL, else the address crawl-helper.ps1 uses; "https://" is added when left off.
 The Function key is --key, else WEBSEARCH_KEY; with neither it is asked for (hidden), as crawl-helper.ps1 does.
@@ -17,7 +16,7 @@ answers a question when one of its results has a URL containing one of those pie
 the first such result is its rank. The file ships with a few questions as a start: replace them with questions your
 students and mentors really ask, and the page each should lead to. Thirty to fifty make the numbers worth reading.
 
-Reports, per engine: how many questions had the right page first, in the top three, in the top five, and the mean
+Reports, per column: how many questions had the right page first, in the top three, in the top five, and the mean
 reciprocal rank (1 for first place, 1/2 for second, ... 0 when missing; higher is better).
 """
 import argparse
@@ -63,7 +62,7 @@ def summarize(ranks):
 
 def parse_trial(pairs):
     """{'phrase_boost': 0.0, ...} from ['phrase_boost=0', ...]; raises ValueError on anything else."""
-    allowed = ("concept_boost", "phrase_boost", "max_per_page")
+    allowed = ("concept_boost", "phrase_boost", "max_per_page", "unique_pages")
     out = {}
     for pair in pairs or []:
         name, eq, value = str(pair).partition("=")
@@ -73,11 +72,9 @@ def parse_trial(pairs):
     return out
 
 
-def search(url, key, question, backend=None, limit=5, timeout=60, ranking=None):
+def search(url, key, question, limit=5, timeout=60, ranking=None):
     """(urls, note): the result URLs in order, and a short note when the search did not complete."""
     body = {"query": question, "limit": limit}
-    if backend:
-        body["backend"] = backend
     if ranking:
         body["ranking"] = ranking
     try:
@@ -90,8 +87,6 @@ def search(url, key, question, backend=None, limit=5, timeout=60, ranking=None):
     except Exception as exc:
         return [], f"unreachable: {exc.__class__.__name__}: {exc}"[:140]
     note = "" if payload.get("status") == "completed" else str(payload.get("status") or payload.get("error") or "no status")
-    if backend and payload.get("results") and backend == "local" and payload.get("backend") != "local":
-        note = (note + " answered by Azure, not local").strip()
     return [r.get("url") for r in payload.get("results") or []], note
 
 
@@ -186,13 +181,11 @@ def main(argv=None):
     ap.add_argument("--url", default=os.getenv("WEBSEARCH_URL", "") or DEFAULT_URL)
     ap.add_argument("--key", default=os.getenv("WEBSEARCH_KEY", ""))
     ap.add_argument("--gold", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "relevance_gold.json"))
-    ap.add_argument("--backend", choices=["local", "azure"], help="answer from this engine whatever SEARCH_BACKEND is")
-    ap.add_argument("--compare", action="store_true", help="run both engines and show them side by side")
     ap.add_argument("--explain", action="store_true",
-                    help="for each question the local index does not answer first, show where the right page stands and why")
+                    help="for each question not answered first, show where the right page stands and why")
     ap.add_argument("--try", dest="trial", nargs="+", metavar="NAME=VALUE",
-                    help="also run the local index with these ranking settings for this run only, "
-                         "for example --try phrase_boost=0 concept_boost=2 (names: concept_boost, phrase_boost, max_per_page)")
+                    help="also run the app with these ranking settings for this run only, for example "
+                         "--try phrase_boost=0 concept_boost=2 (names: concept_boost, phrase_boost, max_per_page, unique_pages)")
     ap.add_argument("--limit", type=int, default=5)
     args = ap.parse_args(argv)
     args.url = normalize_url(args.url)
@@ -205,7 +198,7 @@ def main(argv=None):
     with open(args.gold, encoding="utf-8") as handle:
         gold = json.load(handle)
     print(f"Searching {args.url}")
-    first_urls, first_note = search(args.url, args.key, gold[0]["question"], args.backend or ("azure" if args.compare else None), args.limit)
+    first_urls, first_note = search(args.url, args.key, gold[0]["question"], args.limit)
     if first_note.startswith(("HTTP 401", "HTTP 403")):
         print(f"The app rejected the key ({first_note}). Check the Function key and try again.")
         return 2
@@ -217,10 +210,9 @@ def main(argv=None):
     except ValueError as exc:
         print(exc)
         return 2
-    engines = ["azure", "local"] if args.compare else [args.backend]
-    runs = {e or "live": evaluate(gold, lambda q, e=e: search(args.url, args.key, q, e, args.limit)) for e in engines}
+    runs = {"live": evaluate(gold, lambda q: search(args.url, args.key, q, args.limit))}
     if trial:
-        runs["try"] = evaluate(gold, lambda q: search(args.url, args.key, q, "local", args.limit, ranking=trial))
+        runs["try"] = evaluate(gold, lambda q: search(args.url, args.key, q, args.limit, ranking=trial))
     names = list(runs)
     place = lambda r: str(r) if r else "-"
     print(f"{len(gold)} questions from {args.gold}\n")
@@ -238,7 +230,7 @@ def main(argv=None):
         print(f"{name:>6}: right page first {s['first']}/{s['questions']}   in the top 3 {s['top3']}/{s['questions']}   "
               f"in the top 5 {s['top5']}/{s['questions']}   mean reciprocal rank {s['mrr']:.3f}")
     if trial:
-        print("   try = the local index with " + ", ".join(f"{k}={v:g}" for k, v in trial.items()) + " for this run only")
+        print("   try = the app with " + ", ".join(f"{k}={v:g}" for k, v in trial.items()) + " for this run only")
     print()
     for first, second in zip(names, names[1:]):
         a, b = runs[first], runs[second]
@@ -246,10 +238,10 @@ def main(argv=None):
         worse = sum(1 for x, y in zip(a, b) if (y["rank"] or 99) > (x["rank"] or 99))
         print(f"{second} ranks the right page higher than {first} on {better} question(s), lower on {worse}, the same on {len(gold) - better - worse}.")
     if args.explain:
-        local_name = "try" if "try" in runs else ("local" if "local" in runs else names[-1])
+        local_name = "try" if "try" in runs else "live"
         misses = [(item, row) for item, row in zip(gold, runs[local_name]) if row["rank"] != 1]
-        print(f"\nWhy the local index does not put the right page first ({len(misses)} question(s)):" if misses
-              else "\nThe local index puts the right page first on every question; nothing to explain.")
+        print(f"\nWhy the right page is not first ({len(misses)} question(s)):" if misses
+              else "\nThe right page is first on every question; nothing to explain.")
         for item, row in misses:
             print(f"\n  {item['question']}   (right page at place {place(row['rank'])})")
             for line in explain_lines(explain(args.url, args.key, item["question"], item.get("expect"),

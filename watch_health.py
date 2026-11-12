@@ -1,6 +1,6 @@
 """Poll the websearch /api/health route and report which instance answered, how long it has been up, and what
-its chunk cache is doing. Use it during a load test to tell a cache that works from one that is off, and a
-restart (uptime drops, or the process id changes) from instances simply coming and going.
+its search result cache and local index are doing. Use it during a load test to tell a cache that works from one
+that is off, and a restart (uptime drops, or the process id changes) from instances simply coming and going.
 
     python watch_health.py --url https://<websearch-app>.azurewebsites.net/api/health --key <function key> --every 5 --duration 300
 
@@ -28,7 +28,7 @@ def short(name):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Watch websearch instances and cache.")
+    ap = argparse.ArgumentParser(description="Watch websearch instances, the result cache and the local index.")
     ap.add_argument("--url", required=True, help="the health route, ending in /api/health")
     ap.add_argument("--key", default=os.getenv("WEBSEARCH_FUNCTION_KEY", ""), help="function key (or set WEBSEARCH_FUNCTION_KEY)")
     ap.add_argument("--every", type=float, default=5.0, help="seconds between polls")
@@ -39,7 +39,7 @@ def main():
     seen = {}        # instance -> dict(first_poll_time, last_pid, last_uptime, polls, restarts)
     restarts = []    # (clock time, instance, why)
     started = time.time()
-    print("time      instance        pid   uptime  cache  entries     hits   misses  hit-rate  storage-reads")
+    print("time      instance        pid   uptime  cache  entries     hits   misses  hit-rate  index-chunks")
     try:
         while time.time() - started < args.duration:
             clock = time.strftime("%H:%M:%S")
@@ -49,7 +49,7 @@ def main():
                 print(f"{clock}  poll failed: {type(exc).__name__}")
                 time.sleep(args.every)
                 continue
-            proc, cache = body.get("process") or {}, body.get("blob_cache") or {}
+            proc, cache, index = body.get("process") or {}, body.get("query_cache") or {}, body.get("local_index") or {}
             if not proc:
                 sys.exit("This health route has no 'process' section. Deploy the version that reports it first.")
             name, pid, up = proc.get("instance"), proc.get("pid"), proc.get("uptime_seconds", 0)
@@ -67,7 +67,7 @@ def main():
                 record.update(pid=pid, uptime=up, polls=record["polls"] + 1)
             rate = cache.get("hit_rate")
             print(f"{clock}  {short(name):14s}  {pid!s:5s} {up:6d}s  {'on ' if cache.get('enabled') else 'off'}   {cache.get('entries', 0):7d} "
-                  f"{cache.get('hits', 0):8d} {cache.get('misses', 0):8d}  {('%.0f%%' % (rate * 100)) if rate is not None else '   -':>8s}  {cache.get('storage_reads', 0):10d}{flag}")
+                  f"{cache.get('hits', 0):8d} {cache.get('misses', 0):8d}  {('%.0f%%' % (rate * 100)) if rate is not None else '   -':>8s}  {index.get('chunks', 0):10d}{flag}")
             time.sleep(args.every)
     except KeyboardInterrupt:
         print("\nStopped.")

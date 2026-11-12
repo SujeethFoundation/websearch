@@ -284,8 +284,6 @@ def test_seeding_counts_failures_and_carries_on(conf):
 
 def test_the_search_path_uses_the_code_and_falls_back_to_keywords_when_embedding_fails(conf, monkeypatch):
     from test_local_index import make_service
-    monkeypatch.setattr(settings, "search_backend", "local")
-    monkeypatch.setattr(settings, "ai_search_writes", False)
     svc = make_service()
     calls = []
     embedder = es.EmbeddingService()

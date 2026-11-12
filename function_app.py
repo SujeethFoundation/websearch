@@ -12,7 +12,7 @@ from services.config import settings, VERSION
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
-from services.search_service import SearchService, FacetUnavailable, assemble_document, chunk_index, blob_cache_stats, compute_unit_stats, query_cache_stats
+from services.search_service import SearchService, assemble_document, chunk_index, query_cache_stats
 from services.urlutil import normalize_url
 from services.crawl_state import CrawlState
 from services.manual_page import build_page_documents
@@ -97,7 +97,7 @@ def question_concept_weights(resolution):
     return weights
 
 
-def run_search(query, concepts=None, domains=None, purpose="search", limit=5, backend=None, ranking=None):
+def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ranking=None):
     # Every search must resolve concepts and domains through the ontology.
     resolution = concept_resolver.resolve_query(
         query=query,
@@ -139,7 +139,6 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ba
         domains=selected_domains,
         limit=limit,
         concept_weights=question_concept_weights(resolution),
-        backend=backend if backend in ("local", "azure") else None,
         ranking=ranking if isinstance(ranking, dict) else None,
     )
     result.update({
@@ -177,7 +176,7 @@ def add_spotlights(result, query, resolution, selected_domains):
         domains = [d for d in selected_domains if d == "sujeeth.org"]
         if not domains:
             return
-        found = searcher.search(query, concepts=["spotlight"], domains=domains, limit=SPOTLIGHT_SLOTS * 3, label="spotlight")
+        found = searcher.search(query, concepts=["spotlight"], domains=domains, limit=SPOTLIGHT_SLOTS * 3)
         picked, seen = [], set()
         for item in found.get("results", []):
             key = _page_identity(item)
@@ -205,7 +204,7 @@ def add_best_bets(result, query, concepts, selected_domains):
     try:
         manual_domains = best_bet_domains(ontology.search_manifest(), selected_domains) if BEST_BETS_MAX else []
         if manual_domains:
-            manual = searcher.search(query, concepts=concepts, domains=manual_domains, limit=10, label="best_bets")
+            manual = searcher.search(query, concepts=concepts, domains=manual_domains, limit=10)
             merged = merge_best_bets(result.get("results", []), manual.get("results", []), BEST_BETS_MAX)
             count = sum(1 for x in merged if x.get("best_bet"))
             result["results"] = merged
@@ -226,8 +225,8 @@ def _embed_cache_stats():
 
 
 def index_available():
-    """True when there is an index to use: Azure AI Search is configured, or the table takes the writes."""
-    return bool(settings.search_configured or settings.local_index_write)
+    """True when the index table is configured (LOCAL_INDEX_CONNECTION_STRING, or the storage connection string)."""
+    return bool(searcher.local.enabled)
 
 
 @app.route(route="health", methods=["GET"])
@@ -238,8 +237,8 @@ def health(req):
         "version": VERSION,
         "storage_mode": storage.mode,
         "embedding_configured": settings.embedding_configured,
-        "ai_search_configured": settings.search_configured,
-        "ai_search_index": settings.search_index_name,
+        "index_table": settings.local_index_table,
+        "index_configured": index_available(),
         "ontology_configured": bool(settings.ontology_api_url),
         "concept_resolution_required": True,
         "crawler_version": VERSION,
@@ -247,21 +246,11 @@ def health(req):
         "crawl_queue": settings.crawl_queue,
         "max_pages_per_domain": settings.max_pages,
         "max_crawl_depth": settings.max_crawl_depth,
-        "search_mode": ("local_hybrid" if settings.search_backend == "local" else
-                        "azure_ai_search_hybrid" if settings.search_configured and settings.embedding_configured else "not_configured"),
-        "search_backend": settings.search_backend,
+        "search_mode": "local_hybrid" if index_available() and settings.embedding_configured else "not_configured",
         "local_index": searcher.local.describe(),
         "embed_cache": _embed_cache_stats(),
         "process": process_info(),
-        "blob_cache": blob_cache_stats(),
-        "ai_search_compute": compute_unit_stats(),
         "query_cache": query_cache_stats(),
-        "search_tuning": {
-            "max_text_recall": settings.search_max_text_recall or None,
-            "vector_k": settings.search_vector_k or None,
-            "count": settings.search_count,
-            "search_fields": settings.search_fields or None,
-        },
     })
 
 
@@ -274,7 +263,7 @@ def search_get(req):
         limit = min(max(int(req.params.get("limit", "5")), 1), 5)
         concepts = [x.strip() for x in (req.params.get("concepts") or "").split(",") if x.strip()]
         domains = [x.strip() for x in (req.params.get("domains") or "").split(",") if x.strip()]
-        return response(run_search(query, concepts, domains, "search", limit, backend=(req.params.get("backend") or "").strip().lower() or None))
+        return response(run_search(query, concepts, domains, "search", limit))
     except Exception as exc:
         log.exception("Search failed")
         return response({"error": str(exc), "stage": "concept_resolution_or_search"}, 502)
@@ -294,7 +283,6 @@ def search_post(req):
             domains=body.get("domains") or [],
             purpose=body.get("purpose", "search"),
             limit=limit,
-            backend=str(body.get("backend") or "").strip().lower() or None,
             ranking=body.get("ranking"),
         ))
     except Exception as exc:
@@ -307,7 +295,7 @@ def search_explain(req):
     """Why the local search answers a question as it does, and where the page it should have found stands.
 
     Body: {"query": "...", "expect": ["piece of the right page's URL", ...]} plus optional concepts and domains, as for a
-    search. Answers from the local index whatever SEARCH_BACKEND is. Reports the question's own concepts, the filters, each
+    search. Reports the question's own concepts, the filters, each
     result's place in the keyword and vector lists and its concept share, and for the expected page: whether it is in the
     index, whether the filters let it through (and why not), and how far down its best chunks rank."""
     body = read_body(req)
@@ -368,7 +356,7 @@ def sources(req):
 def index_status(req):
     try:
         count_blobs = str(req.params.get("count_blobs") or "").lower() in ("1", "true", "yes")
-        return response({"blob_storage": storage.status(count_blobs=count_blobs), "ai_search": searcher.status()})
+        return response({"blob_storage": storage.status(count_blobs=count_blobs), "index": searcher.status()})
     except Exception as exc:
         log.exception("Index status failed")
         return response({"error": str(exc)}, 502)
@@ -378,16 +366,13 @@ def index_status(req):
 def index_tags(req):
     """Which ontology tags (concepts) are on the indexed content.
 
-    No parameters: chunks per tag and per domain. When INDEX_CONCEPTS_FACETABLE is true they come from one facet
-    query (two queries in all). Otherwise, as in sf-knowledge-v2 where the concepts field is not facetable, they are
-    estimated from a sample of the stored chunks and scaled to the index size (?scan=3000, at most 5000; one count
-    query), with a margin of error in the answer.
+    No parameters: exact chunk counts per tag and per domain, from the in-memory index.
       ?domain=www.themuse.com    one domain only
       ?tag=salary_negotiation    the pages that carry that tag (add &limit=50)
       ?url=https://...           the tags on each chunk of one page
     """
     if not index_available():
-        return response({"error": "Azure AI Search is not configured, and the local index table is not in use."}, 503)
+        return response({"error": "The local index table is not configured."}, 503)
     try:
         domain = (req.params.get("domain") or "").strip().lower() or None
         tag = (req.params.get("tag") or "").strip()
@@ -397,16 +382,7 @@ def index_tags(req):
         if tag:
             limit = min(max(int(req.params.get("limit", "50")), 1), 500)
             return response(searcher.pages_with_tag(tag, domain, limit))
-        if settings.concepts_facetable or searcher.uses_local_admin():
-            try:
-                return response(searcher.tag_counts(domain))
-            except FacetUnavailable:
-                pass  # the setting says facetable but the index disagrees: fall back to the sample
-        scan = int(req.params.get("scan", "3000"))
-        if domain:
-            scan = 5000  # a domain is only part of the sample, so read as much as allowed
-        population = searcher.count_chunks(domain)
-        return response(searcher.sample_tag_counts(domain, scan, population))
+        return response(searcher.tag_counts(domain))
     except ValueError as exc:
         return response({"error": str(exc)}, 400)
     except Exception as exc:
@@ -416,26 +392,24 @@ def index_tags(req):
 
 @app.route(route="index/backfill", methods=["POST"])
 def index_backfill(req):
-    """Start a queue-driven, resumable backfill of existing Blob documents.
+    """Start a queue-driven, resumable copy of the stored Blob documents into the index table.
 
-    Body (optional): {"mode": "missing"} indexes only chunks that are not in the index yet (the default);
-    {"mode": "all"} re-sends every chunk. Stored vectors are reused either way.
-    {"domains": ["sujeeth.org"]} limits the pass to chunks from those domains.
+    Body (optional): {"mode": "missing"} writes only the chunks the table does not hold yet (the default);
+    {"mode": "all"} rewrites every chunk (to add the 8-bit vectors, or after a change to how chunks are analysed).
+    "local" is accepted as a name for "all". Stored vectors are reused either way, so only chunks with no stored
+    vector are embedded. {"domains": ["sujeeth.org"]} limits the pass to chunks from those domains.
     """
     body = read_body(req)
     domains = _domains(body)
     mode = str(body.get("mode") or "missing").strip().lower()
-    if mode not in ("missing", "all", "local"):
-        return response({"error": "mode must be 'missing', 'all' or 'local'"}, 400)
+    if mode == "local":
+        mode = "all"
+    if mode not in ("missing", "all"):
+        return response({"error": "mode must be 'missing' or 'all'"}, 400)
     if not settings.azure_storage_connection or not storage.container or not queue_processor:
         return response({"error": "Azure Blob Storage and AzureWebJobsStorage must be configured."}, 503)
-    if mode == "local":
-        if not settings.local_index_write:
-            return response({"error": "Set LOCAL_INDEX_WRITE=true first, so new chunks reach the local table as well."}, 409)
-        if not settings.embedding_configured:
-            return response({"error": "Configure Foundry embeddings before the backfill (chunks without a stored vector are embedded)."}, 503)
-    elif not index_available() or not settings.embedding_configured:
-        return response({"error": "Configure Azure AI Search (or the local index table) and Foundry embeddings before backfill."}, 503)
+    if not index_available() or not settings.embedding_configured:
+        return response({"error": "Configure the index table (LOCAL_INDEX_CONNECTION_STRING) and Foundry embeddings before the backfill."}, 503)
     try:
         _enqueue({
             "task_type": "index_backfill_page",
@@ -450,16 +424,13 @@ def index_backfill(req):
             "domains": domains or "all",
             "source_prefix": "documents/",
             "batch_size": settings.index_backfill_batch_size,
-            "message": (f"The queue worker will page through Blob Storage and copy every chunk to the local index table ({settings.local_index_table}); Azure AI Search is not touched."
-                        if mode == "local" else
-                        f"The queue worker will page through Blob Storage and index only the chunks that are not in {settings.search_index_name} yet."
+            "message": (f"The queue worker will page through Blob Storage and write only the chunks that {settings.local_index_table} does not hold yet."
                         if mode == "missing" else
-                        f"The queue worker will page through Blob Storage and re-send every chunk to {settings.search_index_name}."),
+                        f"The queue worker will page through Blob Storage and rewrite every chunk in {settings.local_index_table}."),
         }, 202)
     except Exception as exc:
-        log.exception("AI Search backfill enqueue failed")
+        log.exception("Backfill enqueue failed")
         return response({"error": str(exc)}, 500)
-
 
 
 @app.route(route="index/page", methods=["POST"])
@@ -478,7 +449,7 @@ def index_page(req):
     """
     body = read_body(req)
     if not index_available() or not settings.embedding_configured:
-        return response({"error": "Configure Azure AI Search (or the local index table) and Foundry embeddings before adding pages."}, 503)
+        return response({"error": "Configure the index table (LOCAL_INDEX_CONNECTION_STRING) and Foundry embeddings before adding pages."}, 503)
     try:
         url = normalize_url(str(body.get("url") or "").strip())
         host = (urlparse(url).hostname or "").lower()
@@ -558,7 +529,7 @@ def index_retag(req):
     if not settings.azure_storage_connection or not storage.container or not queue_processor:
         return response({"error": "Azure Blob Storage and AzureWebJobsStorage must be configured."}, 503)
     if not index_available():
-        return response({"error": "Configure Azure AI Search (or the local index table) before re-tagging."}, 503)
+        return response({"error": "Configure the index table (LOCAL_INDEX_CONNECTION_STRING) before re-tagging."}, 503)
     body = read_body(req)
     domains = _domains(body)
     try:
@@ -646,8 +617,8 @@ def document(req):
     chunk_id = str(body.get("chunk_id") or "").strip()
     if not url and not chunk_id:
         return response({"error": "JSON body requires url or chunk_id"}, 400)
-    if not settings.search_configured and settings.search_backend != "local":
-        return response({"error": "Azure AI Search is not configured."}, 503)
+    if not index_available():
+        return response({"error": "The local index table is not configured."}, 503)
     try:
         neighbors = int(body.get("neighbors", 1))
         max_chars = max(500, min(int(body.get("max_chars", 6000)), 20000))
@@ -957,7 +928,7 @@ def crawl_page_poison(msg: func.QueueMessage):
             crawl_state.fail_page(task.get("job_id"), task.get("url"),
                 "Queue retry limit exceeded; inspect poison queue message and function logs.")
         else:
-            log.error("AI Search queue task moved to poison queue: task_type=%s payload=%s",
+            log.error("Index queue task moved to poison queue: task_type=%s payload=%s",
                       task.get("task_type"), task)
     except Exception:
         log.exception("Could not record poison crawl message")
@@ -1086,9 +1057,9 @@ def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
         if waiting > limit:
             log.warning("Nightly index reconcile skipped: the queue holds %d messages (limit %d)", waiting, limit)
             return
-        # A "missing" backfill asks the index about every stored chunk, one query per few chunks, so a clean
-        # index still cost tens of thousands of queries a night. Compare two totals first (one count on each
-        # side) and run the backfill only when the index holds clearly fewer chunks than Blob Storage.
+        # A "missing" backfill reads the table's keys for every stored chunk, so a clean index would still cost tens
+        # of thousands of reads a night. Compare two totals first (one count on each side) and run the backfill only
+        # when the table holds clearly fewer chunks than Blob Storage.
         stored = storage.status(count_blobs=True).get("document_count")
         indexed = searcher.status().get("document_count")
         if stored is not None and indexed is not None:
@@ -1138,19 +1109,6 @@ def local_index_status(req):
     return response(out)
 
 
-@app.route(route="local-index/shadow-diffs", methods=["GET"])
-def local_index_shadow_diffs(req):
-    """The latest shadow comparisons whose top pages differed: the question and what Azure AI Search and the local index
-    each returned (top five). Held in memory on the instance that answers, so a different instance has different ones, and
-    gone on restart. These are visitors' questions, which is why the route needs the function key. ?limit= (default 10)."""
-    try:
-        limit = max(1, min(int(req.params.get("limit") or 10), 25))
-    except ValueError:
-        limit = 10
-    diffs = searcher.local.shadow_diffs(limit)
-    return response({"count": len(diffs), "diffs": diffs, "shadow": searcher.local.describe()["shadow"]})
-
-
 @app.route(route="embed-cache/seed", methods=["POST"])
 def embed_cache_seed(req):
     """Embed questions ahead of time and store their codes in the shared question cache, so visitors never wait for them.
@@ -1187,5 +1145,5 @@ def _preload_local_index():
         log.warning("Local index preload did not finish; the first search will try again", exc_info=True)
 
 
-if settings.search_backend in ("local", "shadow") and settings.local_index_preload and searcher.local.enabled:
+if settings.local_index_preload and searcher.local.enabled:
     threading.Thread(target=_preload_local_index, name="local-index-preload", daemon=True).start()

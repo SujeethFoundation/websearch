@@ -1,7 +1,7 @@
 """In-process hybrid search over chunks kept in Azure Table Storage.
 
 Every instance loads the chunks from one Table Storage table into memory and answers searches itself, so a search
-costs CPU on the instance it runs on instead of a metered query to Azure AI Search.
+costs CPU on the instance it runs on and nothing per query.
 
 What is stored, one table row per chunk (PartitionKey = the page id, RowKey = the chunk number, zero padded):
   title, url, domain, concepts   what the filters and the results need
@@ -10,11 +10,12 @@ What is stored, one table row per chunk (PartitionKey = the page id, RowKey = th
   tid, tcnt                      the chunk's words, as 64-bit hashes and counts, worked out once when the chunk is
                                  written so that loading an instance does not have to read and tokenize every text
 
-How a search works (the same shape as the Azure AI Search hybrid query it replaces):
+How a search works (a hybrid of keywords and vectors):
   1. keep the chunks whose domain is in the list and that carry at least one of the concepts
-  2. keyword half: BM25 over the question's words (any word may match), best 50
-  3. vector half: Hamming distance between the question's bit vector and each chunk's, nearest 50
-  4. merge the two lists by reciprocal rank fusion (1 / (60 + rank)) and return the best few
+  2. keyword half: BM25 over the question's words (any word may match), the best 1,000
+  3. vector half: the nearest 50 by the 1-bit codes, re-ranked by cosine similarity on the 8-bit vectors
+  4. merge the two lists by reciprocal rank fusion (1 / (60 + rank)), add the concept and phrase bonuses, and
+     return the best few, one per page
 
 A separate small table holds one row with a random version token. Writers change it after they change chunks, and
 every instance checks it now and then; a changed token makes the instance rebuild its index in the background and
@@ -27,7 +28,6 @@ import re
 import threading
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 from functools import lru_cache
 
@@ -38,7 +38,7 @@ from services.config import settings
 log = logging.getLogger("sujeeth-web-search.local-index")
 
 FORMAT_VERSION = 1
-SHADOW_DIFFS_KEPT = 25
+VECTOR_FIELD = "contentVector"  # the key that carries a chunk's embedding in the documents built by SearchService._search_doc
 BM25_K1 = 1.2
 BM25_B = 0.75
 RRF_K = 60
@@ -84,7 +84,7 @@ def term_hash(token):
 
 def query_terms(text):
     """The distinct words of a question, as an array of hashes. Common words are searched for like any other (as the
-    Azure index does) unless LOCAL_INDEX_STOPWORDS=english."""
+    standard analyzer does) unless LOCAL_INDEX_STOPWORDS=english."""
     seen = sorted({term_hash(t) for t in tokens(text, settings.local_index_stopwords == "english")})
     return np.array(seen, dtype=np.uint64)
 
@@ -93,7 +93,7 @@ def analyze(title, content, title_weight=3):
     """(hashes, counts) for one chunk as raw bytes: the word hashes in ascending order and how often each occurs.
 
     Words in the title count title_weight times, like the title boost in the wiki search. Counts stop at 255.
-    Every word is kept, common ones too, as the Azure index (default Standard Lucene analyzer) keeps them: whether a
+    Every word is kept, common ones too: whether a
     question searches for them is decided when it is asked (LOCAL_INDEX_STOPWORDS), so no rewrite is needed to change it."""
     counts = {}
     for token in tokens(content, False):
@@ -196,7 +196,7 @@ def entity_from_search_doc(item):
     """The table row for a document built by SearchService._search_doc (it carries the vector)."""
     return build_entity(
         item["id"], item.get("title"), item.get("url"), item.get("domain"), item.get("concepts"),
-        item.get("content"), item[settings.search_vector_field],
+        item.get("content"), item[VECTOR_FIELD],
     )
 
 
@@ -496,8 +496,7 @@ class LocalIndex:
         """(hits, matching) where hits is [(row, score), ...] best first and matching counts the chunks that passed
         the filters. qcode may be None, which leaves out the vector half (keyword only). qvec is the question's 8-bit
         vector; with it (and vectors in the index) the vector half is re-ranked by cosine similarity. `candidates` is how
-        many vector results enter the rank fusion, `text_candidates` (default the same) how many keyword results do: Azure
-        AI Search feeds up to 1,000 keyword results and the nearest k vectors, which the caller can mirror.
+        many vector results enter the rank fusion, `text_candidates` (default the same) how many keyword results do.
 
         Two things go beyond that fusion, both off by default here. concept_weights ({concept: weight}, the concepts the
         question itself named) with concept_boost adds to each candidate concept_boost * (share of those concepts the
@@ -909,10 +908,7 @@ class LocalIndexManager:
         self._checking = threading.Lock()
         self.on_swap = None  # called after a rebuilt index replaces the old one (the search service clears its answers)
         self.stats = {"loads": 0, "load_seconds": None, "build_seconds": None, "last_error": None, "searches": 0,
-                      "fallbacks": 0, "embed_ms_total": 0.0, "search_ms_total": 0.0, "keyword_only": 0, "rescored": 0,
-                      "shadow": {"compared": 0, "overlap_sum": 0.0, "top1_same": 0, "failed": 0,
-                                 "page_overlap_sum": 0.0, "top1_page_same": 0}}
-        self._shadow_diffs = deque(maxlen=SHADOW_DIFFS_KEPT)
+                      "embed_ms_total": 0.0, "search_ms_total": 0.0, "keyword_only": 0, "rescored": 0}
         self._stats_lock = threading.Lock()
 
     @property
@@ -1021,41 +1017,11 @@ class LocalIndexManager:
             if keyword_only:
                 self.stats["keyword_only"] += 1
 
-    def record_fallback(self):
-        with self._stats_lock:
-            self.stats["fallbacks"] += 1
-
-    def record_shadow(self, overlap, top1_same, page_overlap=None, top1_page_same=None, example=None):
-        """One shadow comparison. overlap and top1_same compare chunk ids; page_overlap and top1_page_same compare
-        pages (a different chunk of the same page is the same answer to a visitor). example, kept when the top
-        pages differ, is what each engine returned, so the difference can be looked at."""
-        with self._stats_lock:
-            s = self.stats["shadow"]
-            s["compared"] += 1
-            s["overlap_sum"] += overlap
-            s["top1_same"] += 1 if top1_same else 0
-            s["page_overlap_sum"] += overlap if page_overlap is None else page_overlap
-            s["top1_page_same"] += 1 if (top1_same if top1_page_same is None else top1_page_same) else 0
-            if example is not None:
-                self._shadow_diffs.append(example)
-
-    def shadow_diffs(self, limit=10):
-        """The latest comparisons whose top pages differed, newest first."""
-        with self._stats_lock:
-            return list(self._shadow_diffs)[::-1][:max(1, int(limit))]
-
-    def record_shadow_failure(self):
-        with self._stats_lock:
-            self.stats["shadow"]["failed"] += 1
-
     def describe(self):
         index = self._index
         s = self.stats
         n = max(1, s["searches"])
-        shadow = s["shadow"]
-        compared = shadow["compared"]
         return {
-            "backend": settings.search_backend,
             "enabled": self.enabled,
             "loaded": index is not None,
             "chunks": index.n if index else 0,
@@ -1064,7 +1030,6 @@ class LocalIndexManager:
             "memory_mb": round(index.memory_bytes() / 1e6, 1) if index else 0,
             "process_memory_mb": process_memory_mb(),
             "text_in_memory": settings.local_index_text_in_memory,
-            "writes": {"local_index_write": settings.local_index_write, "ai_search_writes": settings.ai_search_writes},
             "version": self._version,
             "age_seconds": round(time.monotonic() - self._loaded_at) if index else None,
             "loads": s["loads"],
@@ -1081,14 +1046,5 @@ class LocalIndexManager:
                 "pool": settings.local_rescore_pool,
                 "rescored_searches": s["rescored"],
             },
-            "fallbacks_to_ai_search": s["fallbacks"],
             "last_error": s["last_error"],
-            "shadow": {
-                "compared": compared,
-                "failed": shadow["failed"],
-                "average_overlap": round(shadow["overlap_sum"] / compared, 3) if compared else None,
-                "top_result_agrees": round(shadow["top1_same"] / compared, 3) if compared else None,
-                "average_page_overlap": round(shadow["page_overlap_sum"] / compared, 3) if compared else None,
-                "top_page_agrees": round(shadow["top1_page_same"] / compared, 3) if compared else None,
-            },
         }

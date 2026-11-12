@@ -37,33 +37,32 @@ class App(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         App.seen.append((self.headers.get("x-functions-key"), body))
-        local = body.get("backend") == "local"
+        tried = bool(body.get("ranking"))                       # the app ranks the right page higher with these settings
         if "broken" in body["query"]:
             data, code = json.dumps({"error": "boom"}).encode(), 502
         else:
-            urls = ["https://sujeeth.org/circle", "https://x.org/b"] if local else ["https://x.org/b", "https://x.org/c", "https://sujeeth.org/circle"]
-            data, code = json.dumps({"status": "completed", "backend": "local" if local else None,
-                                     "results": [{"url": u} for u in urls]}).encode(), 200
+            urls = ["https://sujeeth.org/circle", "https://x.org/b"] if tried else ["https://x.org/b", "https://x.org/c", "https://sujeeth.org/circle"]
+            data, code = json.dumps({"status": "completed", "results": [{"url": u} for u in urls]}).encode(), 200
         self.send_response(code)
         self.send_header("content-length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
 
-def test_a_comparison_run_against_a_stand_in_app(tmp_path, capsys):
+def test_a_run_with_a_trial_column_against_a_stand_in_app(tmp_path, capsys):
     server = HTTPServer(("127.0.0.1", 0), App)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     gold = tmp_path / "gold.json"
     gold.write_text(json.dumps([{"question": "what does a mentor do in week 4", "expect": ["sujeeth.org/circle"]},
                                 {"question": "a broken one", "expect": ["x"]}]))
     try:
-        code = ev.main(["--url", f"http://127.0.0.1:{server.server_port}", "--key", "k", "--gold", str(gold), "--compare"])
+        code = ev.main(["--url", f"http://127.0.0.1:{server.server_port}", "--key", "k", "--gold", str(gold), "--try", "phrase_boost=0"])
     finally:
         server.shutdown()
     out = capsys.readouterr().out
-    assert code == 0 and App.seen[0][0] == "k" and {b.get("backend") for _, b in App.seen} == {"azure", "local"}
-    assert " azure: right page first 0/2   in the top 3 1/2" in out and " local: right page first 1/2" in out
-    assert "local ranks the right page higher than azure on 1 question(s), lower on 0, the same on 1." in out
+    assert code == 0 and App.seen[0][0] == "k" and any(b.get("ranking") == {"phrase_boost": 0.0} for _, b in App.seen)
+    assert " live: right page first 0/2   in the top 3 1/2" in out and "  try: right page first 1/2" in out
+    assert "try ranks the right page higher than live on 1 question(s), lower on 0, the same on 1." in out
     assert "HTTP 502" in out and "did not complete normally" in out
 
 
@@ -89,7 +88,7 @@ def test_the_key_is_asked_for_hidden_when_a_person_is_there(tmp_path, capsys, mo
     asked = []
     monkeypatch.setattr(ev.getpass, "getpass", lambda prompt: asked.append(prompt) or "secret")
     sent = []
-    monkeypatch.setattr(ev, "search", lambda url, key, q, backend=None, limit=5, timeout=60: sent.append((url, key)) or (["https://sujeeth.org/circle"], ""))
+    monkeypatch.setattr(ev, "search", lambda url, key, q, limit=5, timeout=60, ranking=None: sent.append((url, key)) or (["https://sujeeth.org/circle"], ""))
     gold = tmp_path / "g.json"
     gold.write_text(json.dumps([{"question": "q", "expect": ["circle"]}]))
     assert ev.main(["--url", "host.net", "--gold", str(gold)]) == 0
@@ -114,7 +113,7 @@ def test_a_wrong_key_stops_at_the_first_question_with_a_clear_message(tmp_path, 
     gold = tmp_path / "g.json"
     gold.write_text(json.dumps([{"question": f"q{i}", "expect": ["x"]} for i in range(5)]))
     try:
-        code = ev.main(["--url", f"http://127.0.0.1:{server.server_port}", "--key", "wrong", "--gold", str(gold), "--compare"])
+        code = ev.main(["--url", f"http://127.0.0.1:{server.server_port}", "--key", "wrong", "--gold", str(gold)])
     finally:
         server.shutdown()
     assert code == 2 and "rejected the key" in capsys.readouterr().out and Rejecting.count == 1
@@ -161,20 +160,21 @@ def test_an_explanation_says_plainly_when_the_page_is_missing_or_filtered_out():
     assert ev.explain_lines({"error": "HTTP 404: no such route"}) == ["    could not explain: HTTP 404: no such route"]
 
 
-def test_explain_is_asked_only_for_questions_the_local_index_does_not_answer_first(tmp_path, capsys, monkeypatch):
+def test_explain_is_asked_only_for_questions_not_answered_first(tmp_path, capsys, monkeypatch):
     answers = {"first": ["https://a.org/right"], "second": ["https://a.org/wrong", "https://a.org/right"]}
-    monkeypatch.setattr(ev, "search", lambda url, key, q, backend=None, limit=5, timeout=60: (answers[q], ""))
+    monkeypatch.setattr(ev, "search", lambda url, key, q, limit=5, timeout=60, ranking=None: (answers[q], ""))
     asked = []
     monkeypatch.setattr(ev, "explain", lambda url, key, q, expect, timeout=120, ranking=None: asked.append((q, list(expect))) or EXPLANATION)
     gold = tmp_path / "g.json"
     gold.write_text(json.dumps([{"question": "first", "expect": ["right"]}, {"question": "second", "expect": ["right"]}]))
-    assert ev.main(["--url", "h", "--key", "k", "--gold", str(gold), "--backend", "local", "--explain"]) == 0
+    assert ev.main(["--url", "h", "--key", "k", "--gold", str(gold), "--explain"]) == 0
     out = capsys.readouterr().out
     assert asked == [("second", ["right"])] and "second   (right page at place 2)" in out and "place 14:" in out
 
 
 def test_tried_settings_are_parsed_strictly():
-    assert ev.parse_trial(["phrase_boost=0", "concept_boost=2.5", "max_per_page=1"]) == {"phrase_boost": 0.0, "concept_boost": 2.5, "max_per_page": 1.0}
+    assert ev.parse_trial(["phrase_boost=0", "concept_boost=2.5", "max_per_page=1", "unique_pages=0"]) == {
+        "phrase_boost": 0.0, "concept_boost": 2.5, "max_per_page": 1.0, "unique_pages": 0.0}
     assert ev.parse_trial(None) == {}
     for bad in (["phrase_boost"], ["unknown=1"], ["phrase_boost=lots"]):
         try:
@@ -184,21 +184,21 @@ def test_tried_settings_are_parsed_strictly():
         raise AssertionError(f"{bad} should be refused")
 
 
-def test_a_trial_adds_a_column_run_on_the_local_index_with_those_settings(tmp_path, capsys, monkeypatch):
+def test_a_trial_adds_a_column_run_with_those_settings(tmp_path, capsys, monkeypatch):
     calls = []
 
-    def fake(url, key, q, backend=None, limit=5, timeout=60, ranking=None):
-        calls.append((backend, ranking))
+    def fake(url, key, q, limit=5, timeout=60, ranking=None):
+        calls.append(ranking)
         return (["https://a.org/right"] if ranking else ["https://a.org/wrong", "https://a.org/right"]), ""
     monkeypatch.setattr(ev, "search", fake)
     explained = []
     monkeypatch.setattr(ev, "explain", lambda url, key, q, expect, timeout=120, ranking=None: explained.append(ranking) or EXPLANATION)
     gold = tmp_path / "g.json"
     gold.write_text(json.dumps([{"question": "q", "expect": ["right"]}]))
-    assert ev.main(["--url", "h", "--key", "k", "--gold", str(gold), "--compare", "--try", "phrase_boost=0"]) == 0
+    assert ev.main(["--url", "h", "--key", "k", "--gold", str(gold), "--try", "phrase_boost=0"]) == 0
     out = capsys.readouterr().out
-    assert ("local", {"phrase_boost": 0.0}) in calls and "try = the local index with phrase_boost=0 for this run only" in out
-    assert "   try: right page first 1/1" in out and "try ranks the right page higher than local on 1 question(s)" in out
+    assert {"phrase_boost": 0.0} in calls and "try = the app with phrase_boost=0 for this run only" in out
+    assert "   try: right page first 1/1" in out and "try ranks the right page higher than live on 1 question(s)" in out
     assert ev.main(["--url", "h", "--key", "k", "--gold", str(gold), "--try", "bogus=1"]) == 2
 
 

@@ -3,35 +3,41 @@ import json
 import types
 
 import pytest
-import requests
 
+from services import local_index as li
 from services import queue_worker as qw
 from services import search_service as ss
+from test_local_index import new_store
 
 
-class Resp:
-    def __init__(self, code, body=None, headers=None):
-        self.status_code, self._body, self.headers = code, body or {}, headers or {}
-
-    def json(self):
-        return self._body
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise requests.HTTPError(str(self.status_code), response=self)
+class Throttled(Exception):
+    status_code = 503
 
 
-class Session:
-    def __init__(self):
-        self.mode, self.index_calls = "ok", 0
+class Table:
+    """Wraps the index table so writes can be made to fail the way a throttled table does, and counted."""
 
-    def post(self, url, json=None, timeout=None):
-        if "/docs/index" in url:
-            self.index_calls += 1
-            if self.mode == "busy":
-                return Resp(429, headers={"Retry-After": "0"})
-            return Resp(200, {"value": [{"key": a["id"], "status": True, "statusCode": 200} for a in json["value"]]})
-        return Resp(200, {"value": []})
+    def __init__(self, store):
+        self.mode, self.write_calls, self.read_calls = "ok", 0, 0
+        chunks = store.chunks
+        write, single = chunks.submit_transaction, chunks.upsert_entity
+
+        def guard(call):
+            def wrapped(*args, **kwargs):
+                self.write_calls += 1
+                if self.mode == "busy":
+                    raise Throttled("the table is busy")
+                return call(*args, **kwargs)
+            return wrapped
+        chunks.submit_transaction, chunks.upsert_entity = guard(write), guard(single)
+        keys = store.existing_ids
+
+        def existing(ids):
+            self.read_calls += 1
+            if self.mode == "check_busy":
+                raise Throttled("the table is busy")
+            return keys(ids)
+        store.existing_ids = existing
 
 
 class Store:
@@ -63,14 +69,11 @@ def service(monkeypatch):
     monkeypatch.setattr(ss.settings, "embedding_configured", True, raising=False)
     monkeypatch.setattr(ss.settings, "embedding_deployment", "sf-embeddings", raising=False)
     monkeypatch.setattr(ss.settings, "embedding_dimensions", 4, raising=False)
-    monkeypatch.setattr(ss.settings, "search_endpoint", "https://x", raising=False)
-    monkeypatch.setattr(ss.settings, "search_index_name", "sf", raising=False)
-    monkeypatch.setattr(ss.settings, "search_api_version", "v", raising=False)
-    monkeypatch.setattr(ss.settings, "search_batch_size", 100, raising=False)
-    monkeypatch.setattr(ss.SearchService, "configured", property(lambda self: True))
     ss._breaker_clear()
     svc = object.__new__(ss.SearchService)
-    svc.session, svc.storage, svc.embedder = Session(), Store(), Embedder()
+    store = new_store()
+    svc.table = Table(store)
+    svc.storage, svc.embedder, svc.local = Store(), Embedder(), li.LocalIndexManager(store=store)
     yield svc
     ss._breaker_clear()
 
@@ -106,25 +109,25 @@ def test_embedding_requests_are_batched(service):
 
 
 def test_busy_index_defers_without_raising_and_keeps_everything(service):
-    service.session.mode = "busy"
+    service.table.mode = "busy"
     count, deferred = service.upsert_or_defer(docs(2))
     assert count == 0 and deferred == ["documents/p-0.json", "documents/p-1.json"]
     assert "vectors/p-0.json" in service.storage.blobs and "documents/p-0.json" in service.storage.blobs
-    posts = service.session.index_calls
+    writes = service.table.write_calls
     _, again = service.upsert_or_defer(docs(2, prefix="q"))
-    assert len(again) == 2 and service.session.index_calls == posts  # breaker open: no retries
+    assert len(again) == 2 and service.table.write_calls == writes  # breaker open: no retries
 
 
 def test_upsert_many_raises_when_busy(service):
-    service.session.mode = "busy"
+    service.table.mode = "busy"
     with pytest.raises(ss.IndexBusyError):
         service.upsert_many(docs(1))
 
 
 def test_recovery_indexes_without_embedding_again(service):
-    service.session.mode = "busy"
+    service.table.mode = "busy"
     _, deferred = service.upsert_or_defer(docs(5))
-    service.session.mode = "ok"
+    service.table.mode = "ok"
     ss._breaker_clear()
     assert service.index_existing_blobs(deferred) == 5
     assert service.embedder.calls == [5]
@@ -201,68 +204,51 @@ def test_purge_waits_for_a_busy_index_and_removes_nothing_meanwhile():
     assert sorted(store.blobs) == ["documents/p0-0.json", "vectors/p0-0.json"]  # nothing removed yet
 
 
-class LookupSession(Session):
-    """Answers id lookups: filter queries can be refused (400), and direct lookups use GET."""
-
-    def __init__(self, present, filterable=True, busy=False):
-        super().__init__()
-        self.present, self.filterable, self.busy, self.gets = set(present), filterable, busy, 0
-
-    def post(self, url, json=None, timeout=None):
-        if "/docs/search" in url and "search.in(id" in (json or {}).get("filter", ""):
-            if self.busy:
-                return Resp(429, headers={"Retry-After": "0"})
-            if not self.filterable:
-                return Resp(400, {"error": {"message": "id is not filterable"}})
-            asked = json["filter"].split("'")[1].split(",")
-            return Resp(200, {"value": [{"id": i} for i in asked if i in self.present]})
-        return super().post(url, json, timeout)
-
-    def get(self, url, timeout=None):
-        self.gets += 1
-        doc_id = url.split("docs('")[1].split("')")[0]
-        return Resp(200, {"id": doc_id}) if doc_id in self.present else Resp(404)
-
-
 def stored(service, count):
     for doc in docs(count):
         service.storage.put("documents/" + doc["id"] + ".json", doc)
     return ["documents/" + d["id"] + ".json" for d in docs(count)]
 
 
-def test_missing_mode_indexes_only_what_the_index_lacks(service):
+def written(service, count):
+    """Put the first `count` test chunks in the table, as if an earlier run had indexed them."""
+    service.upsert_or_defer(docs(count))
+    service.embedder.calls.clear()
+    service.table.write_calls = service.table.read_calls = 0
+
+
+def test_missing_mode_indexes_only_what_the_table_lacks(service):
     names = stored(service, 5)
-    service.session = LookupSession(present={"p-0", "p-1", "p-2"})
+    written(service, 3)
     outcome = service.index_blobs(names, only_missing=True)
     assert outcome == {"read": 5, "already_indexed": 3, "indexed": 2}
-    assert service.embedder.calls == [2]  # only the two missing chunks needed vectors
-    assert service.session.index_calls == 1
+    assert service.embedder.calls == [2]                                      # only the two missing chunks needed vectors
+    assert len(service.local.store().chunks.rows) == 5
 
 
-def test_all_mode_resends_everything(service):
+def test_all_mode_rewrites_everything(service):
     names = stored(service, 3)
-    service.session = LookupSession(present={"p-0", "p-1", "p-2"})
+    written(service, 3)
     assert service.index_blobs(names)["indexed"] == 3
+    assert service.table.write_calls >= 1
 
 
 def test_missing_mode_with_nothing_missing_writes_nothing(service):
     names = stored(service, 3)
-    service.session = LookupSession(present={"p-0", "p-1", "p-2"})
+    written(service, 3)
     assert service.index_blobs(names, only_missing=True) == {"read": 3, "already_indexed": 3, "indexed": 0}
-    assert service.session.index_calls == 0 and service.embedder.calls == []
+    assert service.table.write_calls == 0 and service.embedder.calls == []
 
 
-def test_missing_mode_falls_back_to_lookups_when_id_is_not_filterable(service):
+def test_missing_mode_asks_the_table_once_for_the_whole_batch(service):
     names = stored(service, 4)
-    service.session = LookupSession(present={"p-1"}, filterable=False)
-    outcome = service.index_blobs(names, only_missing=True)
-    assert outcome == {"read": 4, "already_indexed": 1, "indexed": 3}
-    assert service.session.gets == 4
+    service.index_blobs(names, only_missing=True)
+    assert service.table.read_calls == 1
 
 
 def test_missing_mode_defers_when_the_existence_check_is_throttled(service):
     names = stored(service, 2)
-    service.session = LookupSession(present=set(), busy=True)
+    service.table.mode = "check_busy"
     with pytest.raises(ss.IndexBusyError):
         service.index_blobs(names, only_missing=True)
 

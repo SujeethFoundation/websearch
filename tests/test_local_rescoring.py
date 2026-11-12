@@ -1,11 +1,6 @@
-"""Rescoring: the 1-bit codes pick a shortlist, 8-bit vectors rank it. And page-level shadow comparison."""
-import json
-import time
-
-import azure.functions as func
+"""Rescoring: the 1-bit codes pick a shortlist, 8-bit vectors rank it."""
 import numpy as np
 
-import function_app as fa
 from services import local_index as li
 from services.config import settings
 from test_local_index import conf, filled_store, index_of, make_doc, make_service  # noqa: F401  (conf is a fixture)
@@ -162,103 +157,16 @@ def test_status_says_rescoring_is_inactive_when_rows_lack_vectors(conf):
     assert r["enabled"] is True and r["active"] is False and r["rows_without_vectors"] == 4 and r["rescored_searches"] == 0
 
 
-# ---- shadow comparison at page level
-
-def wait_compared(svc, count, seconds=5.0):
-    end = time.time() + seconds
-    while time.time() < end:
-        if svc.local.describe()["shadow"]["compared"] >= count:
-            return
-        time.sleep(0.02)
-    raise AssertionError("the shadow comparison did not finish")
-
-
-def azure_answer(*pairs):
-    return {"results": [{"chunk_id": c, "url": u, "title": f"Title {u[-2:]}", "score": 1.0 / (i + 1)} for i, (c, u) in enumerate(pairs)]}
-
-
-def test_a_different_chunk_of_the_same_page_agrees_at_page_level_and_leaves_no_example(conf, monkeypatch):
-    monkeypatch.setattr(settings, "local_shadow_sample", 1.0)
-    svc = make_service()
-    local = svc._search_local("mentor", ["circle"], ["sujeeth.org"], 5)
-    top_url = local["results"][0]["url"]
-    svc._maybe_shadow("mentor", ["circle"], ["sujeeth.org"], 5, azure_answer(("other-9", top_url)))
-    wait_compared(svc, 1)
-    s = svc.local.describe()["shadow"]
-    assert s["top_result_agrees"] == 0.0 and s["top_page_agrees"] == 1.0 and s["average_page_overlap"] == 1.0
-    assert svc.local.shadow_diffs() == []
-
-
-def test_a_different_top_page_is_kept_as_an_example_with_both_answers(conf, monkeypatch):
-    monkeypatch.setattr(settings, "local_shadow_sample", 1.0)
-    svc = make_service()
-    svc._maybe_shadow("mentor", ["circle"], ["sujeeth.org"], 5, azure_answer(("x-1", "https://elsewhere.org/a1"), ("x-2", "https://elsewhere.org/a2")))
-    wait_compared(svc, 1)
-    s = svc.local.describe()["shadow"]
-    assert s["top_page_agrees"] == 0.0 and s["average_page_overlap"] == 0.0
-    (diff,) = svc.local.shadow_diffs()
-    assert diff["query"] == "mentor" and [r["rank"] for r in diff["azure"]] == [1, 2]
-    assert diff["azure"][0]["url"] == "https://elsewhere.org/a1" and diff["local"] and diff["local"][0]["url"].startswith("https://sujeeth.org/")
-
-
-def test_only_the_latest_examples_are_kept_newest_first(conf):
-    manager = li.LocalIndexManager(store=filled_store())
-    for n in range(li.SHADOW_DIFFS_KEPT + 7):
-        manager.record_shadow(0.0, False, page_overlap=0.0, top1_page_same=False, example={"query": f"q{n}"})
-    diffs = manager.shadow_diffs(100)
-    assert len(diffs) == li.SHADOW_DIFFS_KEPT and diffs[0]["query"] == f"q{li.SHADOW_DIFFS_KEPT + 6}"
-    assert [d["query"] for d in manager.shadow_diffs(2)] == [f"q{li.SHADOW_DIFFS_KEPT + 6}", f"q{li.SHADOW_DIFFS_KEPT + 5}"]
-
-
-def test_old_style_shadow_records_still_count(conf):
-    manager = li.LocalIndexManager(store=filled_store())
-    manager.record_shadow(0.5, True)
-    s = manager.describe()["shadow"]
-    assert s["average_overlap"] == 0.5 and s["average_page_overlap"] == 0.5 and s["top_page_agrees"] == 1.0
-
-
-def test_the_shadow_diffs_route(conf, monkeypatch):
-    svc = make_service()
-    svc.local.record_shadow(0.0, False, page_overlap=0.0, top1_page_same=False, example={"query": "how do i volunteer", "azure": [], "local": []})
-    monkeypatch.setattr(fa, "searcher", svc)
-    req = func.HttpRequest("GET", "/api/local-index/shadow-diffs", params={"limit": "5"}, headers={}, body=b"")
-    body = json.loads(fa.local_index_shadow_diffs._function._func(req).get_body())
-    assert body["count"] == 1 and body["diffs"][0]["query"] == "how do i volunteer" and body["shadow"]["compared"] == 1
-    bad = func.HttpRequest("GET", "/api/local-index/shadow-diffs", params={"limit": "x"}, headers={}, body=b"")
-    assert json.loads(fa.local_index_shadow_diffs._function._func(bad).get_body())["count"] == 1
-
-
-def test_the_full_table_read_asks_for_the_vector_column_only_when_rescoring_is_on(conf, monkeypatch):
-    seen = []
-
-    class Spy:
-        def list_entities(self, select=None, results_per_page=None):
-            seen.append(list(select))
-            return iter(())
-    store = li.LocalIndexStore(chunks=Spy(), meta=object())
-    list(store.scan())
-    monkeypatch.setattr(settings, "local_rescore", False)
-    list(store.scan())
-    assert "v8" in seen[0] and "v8" not in seen[1]
-
-
-def test_a_table_round_trip_keeps_the_vectors_so_a_loaded_index_rescores(conf):
-    q, a, b = trap_vectors()
-    store = filled_store([make_doc(1, 0, vector=a, content="alpha"), make_doc(2, 0, vector=b, content="beta")])
-    index = li.LocalIndexManager(store=store).current()
-    assert index.vec8 is not None and index.vec_dims == 64
-
-
 def test_running_the_local_backfill_writes_the_8_bit_vectors_so_the_index_can_rescore(conf, monkeypatch):
     from test_local_index import backfill_service
     svc, store, names = backfill_service()
     monkeypatch.setattr(settings, "embedding_configured", True, raising=False)
     # rows written before vectors were kept: take them out, then run the backfill again
-    svc.local_backfill(names)
+    svc.index_blobs(names)
     for row in store.chunks.rows.values():
         row.pop("v8", None)
     assert li.LocalIndexManager(store=store).current().vec8 is None
-    svc.local_backfill(names)
+    svc.index_blobs(names)
     index = li.LocalIndexManager(store=store).current()
     assert index.vec8 is not None and index.rows_without_vectors == 0 and index.vec8.shape == (index.n, 64)
 
@@ -268,7 +176,7 @@ def test_a_question_made_of_common_words_still_finds_chunks_unless_they_are_turn
             make_doc(2, 0, content="mentor guide and resume tips", title="Guide")]
     index = index_of(docs)
     hits, matching = index.search(li.query_terms("what is the"), None, ["sujeeth.org"], ["circle"], candidates=5, limit=5)
-    assert [index.ids[r] for r, _ in hits] == ["page1-0"]                      # indexed words match, like Azure's standard analyzer
+    assert [index.ids[r] for r, _ in hits] == ["page1-0"]                      # indexed words match
     monkeypatch.setattr(settings, "local_index_stopwords", "english")
     hits, _ = index.search(li.query_terms("what is the"), None, ["sujeeth.org"], ["circle"], candidates=5, limit=5)
     assert [index.ids[r] for r, _ in hits] == ["page1-0"]                      # "what" is not on the list, so it still matches

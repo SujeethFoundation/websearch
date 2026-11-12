@@ -158,7 +158,7 @@ def test_writing_chunks_on_this_instance_clears_the_cache(cache_on):
     svc.search("w5 w60", **ASK)
     assert ss.query_cache_stats()["entries"] == 1
     docs = corpus(pages=1)
-    svc._local_write([{**d, settings.search_vector_field: [0.5] * DIMS} for d in docs])
+    svc._local_write([{**d, "contentVector": [0.5] * DIMS} for d in docs])
     assert ss.query_cache_stats()["entries"] == 0
 
 

@@ -10,7 +10,7 @@ from services import local_index as li
 from services import search_service as ss
 from services.config import settings
 from test_local_index import (  # the fakes and helpers the main local-index tests use
-    AzureSession, Blobs, Embedder, conf, entities, filled_store, make_doc, make_service, new_store,
+    Blobs, Embedder, conf, entities, filled_store, make_doc, make_service, new_store,
 )
 
 
@@ -24,19 +24,6 @@ def tagged_service(**kw):
         make_doc(3, 1, domain="themuse.com", concepts=("resume",), content="f"),
     ]
     return make_service(store=filled_store(docs), **kw)
-
-
-def test_the_table_is_the_index_of_record_when_the_backend_is_local_or_azure_writes_are_off(conf, monkeypatch):
-    svc = tagged_service()
-    assert svc.uses_local_admin() is True
-    monkeypatch.setattr(settings, "search_backend", "azure")
-    assert svc.uses_local_admin() is True                       # Azure AI Search no longer takes the writes
-    monkeypatch.setattr(settings, "ai_search_writes", True)
-    assert svc.uses_local_admin() is False
-    monkeypatch.setattr(settings, "search_backend", "shadow")
-    assert svc.uses_local_admin() is False
-    monkeypatch.setattr(settings, "search_backend", "local")
-    assert svc.uses_local_admin() is True
 
 
 def test_tag_counts_are_exact_and_have_the_shape_of_the_facet_answer(conf):
@@ -85,7 +72,7 @@ def test_the_tags_on_each_chunk_of_a_page_are_listed_in_page_order(conf):
 
 def test_status_counts_what_the_table_holds_now(conf):
     out = tagged_service().status()
-    assert out["document_count"] == 6 and out["source"] == "local_index_table" and out["local_index"]["backend"] == "local"
+    assert out["document_count"] == 6 and out["source"] == "local_index_table" and out["local_index"]["enabled"] is True
 
 
 def test_status_reports_a_failed_count_instead_of_raising(conf):
@@ -93,19 +80,6 @@ def test_status_reports_a_failed_count_instead_of_raising(conf):
     svc.local._store.chunks.list_entities = lambda **kw: (_ for _ in ()).throw(RuntimeError("storage down"))
     out = svc.status()
     assert out["document_count"] is None and "storage down" in out["error"]
-
-
-def test_azure_admin_reads_are_unchanged_while_azure_ai_search_takes_the_writes(conf, monkeypatch):
-    monkeypatch.setattr(settings, "search_backend", "azure")
-    monkeypatch.setattr(settings, "ai_search_writes", True)
-    monkeypatch.setattr(ss.SearchService, "configured", property(lambda self: True))
-    monkeypatch.setattr(settings, "search_endpoint", "https://x", raising=False)
-    monkeypatch.setattr(settings, "search_index_name", "sf", raising=False)
-    monkeypatch.setattr(settings, "search_api_version", "v", raising=False)
-    session = AzureSession()
-    svc = make_service(session=session)
-    svc.count_chunks()
-    assert len(session.posts) == 1 and svc.local.describe()["loaded"] is False
 
 
 # ---- existing chunks and the missing-only backfill
@@ -134,10 +108,10 @@ def test_a_missing_only_backfill_writes_only_what_the_table_lacks(conf, monkeypa
                                                    "v": svc._pack_vector(d["contentVector"])})
     out = svc.index_blobs([f"documents/page1-{n}.json" for n in range(4)], only_missing=True)
     assert out == {"read": 4, "already_indexed": 2, "indexed": 2}
-    assert store.count() == 4 and svc.session.posts == []
+    assert store.count() == 4
 
 
-def test_a_retag_updates_the_table_without_azure_ai_search(conf):
+def test_a_retag_updates_the_table(conf):
     store = filled_store([make_doc(1, 0, concepts=("circle",), content="mentor guide")])
     svc = make_service(store=store)
     doc = {k: v for k, v in make_doc(1, 0, concepts=("circle",), content="mentor guide").items() if k != "contentVector"}
@@ -161,11 +135,10 @@ def request(method, route, params=None, body=None):
 def routes(conf, monkeypatch):
     svc = tagged_service()
     monkeypatch.setattr(fa, "searcher", svc)
-    monkeypatch.setattr(settings, "search_configured", False)
     return svc
 
 
-def test_the_tags_route_works_with_only_the_local_index(routes):
+def test_the_tags_route_reads_the_local_index(routes):
     body = json.loads(fa.index_tags._function._func(request("GET", "index/tags")).get_body())
     assert body["source"] == "local_index" and body["total_chunks"] == 6
     body = json.loads(fa.index_tags._function._func(request("GET", "index/tags", {"domain": "sujeeth.org"})).get_body())
@@ -176,38 +149,34 @@ def test_the_tags_route_works_with_only_the_local_index(routes):
     assert len(body["chunks"]) == 3
 
 
-def test_the_tags_route_still_needs_an_index_of_some_kind(conf, monkeypatch):
-    monkeypatch.setattr(settings, "search_configured", False)
-    monkeypatch.setattr(settings, "local_index_write", False)
-    assert fa.index_tags._function._func(request("GET", "index/tags")).status_code == 503
-
-
-def test_index_available_is_true_for_either_index(conf, monkeypatch):
-    monkeypatch.setattr(settings, "search_configured", False)
-    monkeypatch.setattr(settings, "local_index_write", False)
+def test_the_tags_route_and_index_available_need_the_table(conf, monkeypatch):
+    monkeypatch.setattr(fa, "searcher", types.SimpleNamespace(local=types.SimpleNamespace(enabled=False)))
     assert fa.index_available() is False
-    monkeypatch.setattr(settings, "local_index_write", True)
-    assert fa.index_available() is True
-    monkeypatch.setattr(settings, "local_index_write", False)
-    monkeypatch.setattr(settings, "search_configured", True)
+    assert fa.index_tags._function._func(request("GET", "index/tags")).status_code == 503
+    monkeypatch.setattr(fa, "searcher", tagged_service())
     assert fa.index_available() is True
 
 
-def test_the_backfill_route_accepts_local_mode_only_when_the_table_takes_writes(conf, monkeypatch):
+def test_the_backfill_route_takes_missing_or_all_and_the_old_name_local(conf, monkeypatch):
     sent = []
     monkeypatch.setattr(fa, "_enqueue", lambda message: sent.append(message))
+    monkeypatch.setattr(fa, "searcher", tagged_service())
     monkeypatch.setattr(settings, "azure_storage_connection", "x", raising=False)
     monkeypatch.setattr(settings, "embedding_configured", True, raising=False)
     monkeypatch.setattr(fa.storage, "container", object(), raising=False)
     monkeypatch.setattr(fa, "queue_processor", types.SimpleNamespace(queue=None))
-    monkeypatch.setattr(settings, "local_index_write", False)
-    assert fa.index_backfill._function._func(request("POST", "index/backfill", body={"mode": "local"})).status_code == 409
-    monkeypatch.setattr(settings, "local_index_write", True)
-    reply = fa.index_backfill._function._func(request("POST", "index/backfill", body={"mode": "local"}))
-    assert reply.status_code == 202 and sent[-1]["mode"] == "local" and sent[-1]["task_type"] == "index_backfill_page"
-    assert fa.index_backfill._function._func(request("POST", "index/backfill", body={"mode": "bogus"})).status_code == 400
-    monkeypatch.setattr(settings, "search_configured", False)           # missing mode works with the table as the index
-    assert fa.index_backfill._function._func(request("POST", "index/backfill", body={"mode": "missing"})).status_code == 202
+    post = lambda body: fa.index_backfill._function._func(request("POST", "index/backfill", body=body))
+    assert post({}).status_code == 202 and sent[-1]["mode"] == "missing" and sent[-1]["task_type"] == "index_backfill_page"
+    assert post({"mode": "all"}).status_code == 202 and sent[-1]["mode"] == "all"
+    reply = post({"mode": "local", "domains": ["Sujeeth.org"]})
+    assert reply.status_code == 202 and sent[-1]["mode"] == "all" and sent[-1]["domains"] == ["sujeeth.org"]   # the old name for "all"
+    assert json.loads(reply.get_body())["mode"] == "all"
+    assert post({"mode": "bogus"}).status_code == 400
+    monkeypatch.setattr(settings, "embedding_configured", False, raising=False)
+    assert post({}).status_code == 503
+    monkeypatch.setattr(settings, "embedding_configured", True, raising=False)
+    monkeypatch.setattr(fa, "searcher", types.SimpleNamespace(local=types.SimpleNamespace(enabled=False)))
+    assert post({}).status_code == 503                                                     # no table, nothing to fill
 
 
 # ---- the status route the helper script reads
@@ -223,8 +192,7 @@ def test_the_status_route_reports_the_loaded_index_the_table_rows_and_the_queue(
     queue = types.SimpleNamespace(get_queue_properties=lambda: types.SimpleNamespace(approximate_message_count=7))
     monkeypatch.setattr(fa, "queue_processor", types.SimpleNamespace(queue=queue))
     plain = json.loads(fa.local_index_status._function._func(request("GET", "local-index/status")).get_body())
-    assert plain["backend"] == "local" and "table_rows" not in plain
-    assert plain["writes"] == {"local_index_write": True, "ai_search_writes": False}
+    assert plain["enabled"] is True and "table_rows" not in plain and "writes" not in plain and "backend" not in plain
     counted = json.loads(fa.local_index_status._function._func(request("GET", "local-index/status", {"count": "true"})).get_body())
     assert counted["table_rows"] == 6 and counted["queue_messages"] == 7
     assert counted["table_by_domain"] == [{"domain": "sujeeth.org", "chunks": 3}, {"domain": "themuse.com", "chunks": 3}]

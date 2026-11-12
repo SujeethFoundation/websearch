@@ -307,5 +307,5 @@ class EmbeddingService:
         if len(vectors) != len(texts):
             raise RuntimeError(f"Embedding service returned {len(vectors)} vectors for {len(texts)} inputs.")
         if any(len(v) != settings.embedding_dimensions for v in vectors):
-            raise RuntimeError("Embedding dimensions do not match the Azure AI Search index.")
+            raise RuntimeError("Embedding dimensions do not match AZURE_OPENAI_EMBEDDING_DIMENSIONS.")
         return vectors
