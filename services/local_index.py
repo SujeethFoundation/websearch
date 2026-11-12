@@ -614,7 +614,18 @@ class LocalIndex:
         only the ones that entered the fusion."""
         rows, ordered, parts = self._rank(terms, qcode, domains, concepts, candidates, qvec, text_candidates,
                                           concept_weights, concept_boost, question, phrase_boost, phrase_pool)
-        position = {row: i for i, (row, _) in enumerate(ordered)}
+        by_chunk = {row: i for i, (row, _) in enumerate(ordered)}     # place among all candidate chunks
+        if unique_pages:
+            # Places among pages, as in the answer: only a page's best chunk has one, the page's other chunks sit behind it.
+            position, page_place = {}, {}
+            for row, _ in ordered:
+                page = int(self.page_codes[row])
+                if page not in page_place:
+                    page_place[page] = len(page_place)
+                    position[row] = page_place[page]
+        else:
+            position = dict(by_chunk)
+            page_place = {}
         phrases = parts["phrases"] or (self.question_phrases(question) if question and self.texts is not None else [])
         score = dict(ordered)
         share_all = {}
@@ -626,6 +637,8 @@ class LocalIndex:
             out = {"chunk": self.ids[row], "title": self.titles[row], "url": self.urls[row],
                    "domain": self.domain_names[self.domain_codes[row]], "tags": list(self.concepts[row]),
                    "position": position[row] + 1 if row in position else None,
+                   "page_position": (page_place[int(self.page_codes[row])] + 1 if int(self.page_codes[row]) in page_place else None)
+                   if unique_pages else (position[row] + 1 if row in position else None),
                    "score": round(score[row], 6) if row in score else None,
                    "keyword_rank": parts["keyword"][row] + 1 if row in parts["keyword"] else None,
                    "vector_rank": parts["vector"][row] + 1 if row in parts["vector"] else None,
@@ -660,7 +673,19 @@ class LocalIndex:
                 pos = where[i]
                 deep[i] = {"keyword_rank_all": int(kplace[pos]) + 1 if kscores[pos] > 0 else None,
                            "vector_rank_all": vplace[i] + 1 if vplace is not None and i in vplace else None}
-        inside.sort(key=lambda i: (position.get(i, 10 ** 9), deep.get(i, {}).get("vector_rank_all") or 10 ** 9))
+        inside.sort(key=lambda i: (by_chunk.get(i, 10 ** 9), deep.get(i, {}).get("vector_rank_all") or 10 ** 9))
+        chunks_inside, pages_in_index = len(inside), len({int(self.page_codes[i]) for i in wanted})
+        pages_inside = len({int(self.page_codes[i]) for i in inside})
+        others = {}
+        if unique_pages:
+            # Each expected page once, as its best chunk, with how many more chunks of it there are.
+            best_of, count_of = {}, {}
+            for i in inside:
+                page = int(self.page_codes[i])
+                count_of[page] = count_of.get(page, 0) + 1
+                best_of.setdefault(page, i)
+            inside = list(best_of.values())
+            others = {best_of[page]: count_of[page] - 1 for page in best_of}
         want_domains = {str(d).lower() for d in domains or []}
         want_concepts = {str(c).lower() for c in concepts or []}
 
@@ -677,8 +702,9 @@ class LocalIndex:
         return {
             "passing_filters": int(len(rows)), "candidates": len(ordered), "answer": answer,
             "phrases": [{"phrase": p, "weight": round(w, 2)} for p, w in sorted(phrases, key=lambda pw: -pw[1])],
-            "expected": {"pieces": pieces, "chunks_in_index": len(wanted), "chunks_passing_filters": len(inside),
-                         "best": [describe(i, deep) for i in inside[:max_chunks]],
+            "expected": {"pieces": pieces, "chunks_in_index": len(wanted), "chunks_passing_filters": chunks_inside,
+                         "pages_in_index": pages_in_index, "pages_passing_filters": pages_inside,
+                         "best": [{**describe(i, deep), "other_chunks": others.get(i, 0)} for i in inside[:max_chunks]],
                          "filtered_out": [why_not(i) for i in outside[:max_chunks]]},
         }
 

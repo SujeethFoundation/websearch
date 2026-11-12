@@ -125,6 +125,8 @@ def explain_lines(e):
         text += f', vector {place(c.get("vector_rank"))}'
         if deep and c.get("vector_rank") is None and c.get("vector_rank_all"):
             text += f' (place {c["vector_rank_all"]} of all, outside the nearest that count)'
+        more = c.get("other_chunks") or 0
+        text += f" (+{more} more chunk{'s' if more != 1 else ''} of this page, behind it)" if more else ""
         return text + (f', concept share {c.get("concept_share", 0):.2f}, word pairs {c.get("phrase_share", 0):.2f}'
                        + ("" if c.get("phrase_counted", True) or not c.get("phrase_share") else " (not counted: too far down)")
                        + f', score {place(c.get("score"))}')
@@ -136,8 +138,9 @@ def explain_lines(e):
              f"{len(e.get('filter_domains') or [])} domains); {e.get('candidates', 0):,} entered the ranking"]
     s = e.get("settings") or {}
     if s:
-        lines.append(f"    ranking: concept boost {s.get('concept_boost', 0):g}, phrase boost {s.get('phrase_boost', 0):g}, at most "
-                     f"{s.get('max_per_page', 0)} per page, rescoring {'on' if s.get('rescoring') else 'OFF'}"
+        lines.append(f"    ranking: concept boost {s.get('concept_boost', 0):g}, phrase boost {s.get('phrase_boost', 0):g}, "
+                     + ("each page once" if s.get("unique_pages") else f"at most {s.get('max_per_page', 0)} chunks per page")
+                     + f", rescoring {'on' if s.get('rescoring') else 'OFF'}"
                      + ("" if s.get("text_in_memory", True) else ", text not in memory (no phrase bonus)"))
     pairs = e.get("phrases") or []
     if pairs:
@@ -152,8 +155,11 @@ def explain_lines(e):
         for c in (x.get("filtered_out") or [])[:2]:
             lines.append(f'      <{short(c.get("url"), 46)}> tags [{", ".join(c.get("tags") or [])}]: {c.get("why")}')
     else:
-        lines.append(f"    the expected page: {x['chunks_in_index']} chunks in the index, {x['chunks_passing_filters']} pass the filters; its best:")
-        for c in (x.get("best") or [])[:2]:
+        pages = x.get("pages_in_index")
+        what = (f"the expected page{'s' if pages and pages > 1 else ''}: " + (f"{pages} page{'s' if pages != 1 else ''}, " if pages else "")
+                + f"{x['chunks_in_index']} chunks in the index, {x['chunks_passing_filters']} pass the filters;")
+        lines.append(f"    {what} " + ("where each stands among the answer's pages:" if s.get("unique_pages") else "its best chunks:"))
+        for c in (x.get("best") or [])[:3]:
             lines.append(f"      place {place(c.get('position'))}: " + chunk(c, deep=True))
     for i, c in enumerate((e.get("answer") or [])[:2], 1):
         lines.append(f"    answer {i}: " + chunk(c))

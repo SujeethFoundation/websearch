@@ -207,5 +207,17 @@ def test_the_explanation_shows_the_ranking_settings_and_the_word_pairs():
              phrases=[{"phrase": "students completed", "weight": 3.1}, {"phrase": "how many", "weight": 0.4}])
     e["answer"] = [dict(EXPLANATION["answer"][0], phrase_share=0.6, phrase_counted=True)]
     text = "\n".join(ev.explain_lines(e))
-    assert "ranking: concept boost 1, phrase boost 1, at most 2 per page, rescoring OFF" in text
+    assert "ranking: concept boost 1, phrase boost 1, at most 2 chunks per page, rescoring OFF" in text
     assert 'word pairs it looks for side by side: "students completed" 3.1, "how many" 0.4' in text and "word pairs 0.60" in text
+
+
+def test_the_explanation_says_each_page_is_once_and_how_many_more_chunks_sit_behind_it():
+    e = dict(EXPLANATION, settings={"concept_boost": 1.0, "phrase_boost": 1.0, "max_per_page": 2, "unique_pages": True, "rescoring": True, "text_in_memory": True})
+    e["expected"] = dict(EXPLANATION["expected"], pages_in_index=1, chunks_in_index=9, chunks_passing_filters=9,
+                         best=[dict(EXPLANATION["expected"]["best"][0], other_chunks=8)])
+    text = "\n".join(ev.explain_lines(e))
+    assert "ranking: concept boost 1, phrase boost 1, each page once, rescoring on" in text
+    assert "the expected page: 1 page, 9 chunks in the index, 9 pass the filters; where each stands among the answer's pages:" in text
+    assert "place 14:" in text and "(+8 more chunks of this page, behind it)" in text
+    one = dict(e, expected=dict(e["expected"], best=[dict(e["expected"]["best"][0], other_chunks=1)]))
+    assert "(+1 more chunk of this page, behind it)" in "\n".join(ev.explain_lines(one))

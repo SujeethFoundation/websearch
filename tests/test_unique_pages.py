@@ -201,3 +201,32 @@ def test_the_final_answer_has_each_page_once_whatever_was_added_to_it(conf, monk
     assert [r["url"] for r in out["results"]] == ["https://www.sujeeth.org/spotlight/x", "https://sujeeth.org/a"] and out["count"] == 2
     assert out["results"][0]["spotlight"] is True                                      # the curated copy is the one that stays
     assert len(run(monkeypatch, rows, unique=False)["results"]) == 4
+
+
+# ---- the explanation counts pages, like the answer
+
+def test_the_explanation_places_a_page_where_the_answer_does_and_lists_it_once(conf):
+    q, docs = crowded()
+    svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
+    answer = svc.search("alpha beta gamma", concepts=["circle"], domains=DOMAINS, limit=5)
+    order = [page_of(r["url"]) for r in answer["results"]]
+    for expect, page in (("sujeeth.org/p1", "sujeeth.org/p1"), ("sujeeth.org/p3", "sujeeth.org/p3"), ("sujeeth.org/p5", "sujeeth.org/p5")):
+        out = svc.explain_local("alpha beta gamma", ["circle"], DOMAINS, [expect])
+        best = out["expected"]["best"]
+        assert len(best) == 1 and best[0]["position"] == order.index(page) + 1 == best[0]["page_position"]      # the answer's place, not the chunk's
+    one = svc.explain_local("alpha beta gamma", ["circle"], DOMAINS, ["sujeeth.org/p1"])["expected"]
+    assert one["chunks_passing_filters"] == 4 and one["pages_passing_filters"] == 1 and one["pages_in_index"] == 1
+    assert one["best"][0]["chunk"] == "page1-0" and one["best"][0]["other_chunks"] == 3
+
+
+def test_a_page_behind_its_better_chunk_has_no_place_of_its_own(conf):
+    q, docs = crowded()
+    index = index_of(docs)
+    out = index.explain(li.query_terms("alpha beta gamma"), li.binary_code(q), DOMAINS, ["circle"], ["sujeeth.org/p1"], limit=5,
+                        qvec=li.quantize_int8(q), unique_pages=True, max_chunks=6)
+    assert [a["page_position"] for a in out["answer"]] == [1, 2, 3, 4, 5] and [a["position"] for a in out["answer"]] == [1, 2, 3, 4, 5]
+    chunk_level = index.explain(li.query_terms("alpha beta gamma"), li.binary_code(q), DOMAINS, ["circle"], ["sujeeth.org/p1"], limit=5,
+                                qvec=li.quantize_int8(q), unique_pages=False)
+    assert [a["position"] for a in chunk_level["answer"]] == [1, 2, 3, 4, 5]                      # unchanged when not unique
+    assert [e["chunk"] for e in chunk_level["expected"]["best"]] == ["page1-0", "page1-1", "page1-2", "page1-3"]
+    assert chunk_level["expected"]["best"][0]["other_chunks"] == 0
