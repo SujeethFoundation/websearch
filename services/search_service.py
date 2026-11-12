@@ -126,6 +126,9 @@ _shadow_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="local-shado
 _query_cache = {}  # key -> (expires, result, compute_units or None)
 _query_stats = {"hits": 0, "misses": 0, "saved": 0.0}
 _query_lock = threading.Lock()
+# Bumped every time the cache is cleared. A search remembers the number it started under and stores its answer only if
+# the number is unchanged, so an answer computed from an index that has since been replaced is never kept.
+_query_generation = [0]
 
 
 def normalize_query(query):
@@ -137,6 +140,7 @@ def normalize_query(query):
 def _query_cache_clear():
     with _query_lock:
         _query_cache.clear()
+        _query_generation[0] += 1
 
 
 def query_cache_stats():
@@ -219,6 +223,7 @@ class SearchService:
         self.session = pooled_session()
         self.session.headers.update({"api-key": settings.search_api_key})
         self.local = LocalIndexManager()
+        self.local.on_swap = _query_cache_clear  # a rebuilt in-memory index makes kept answers out of date
 
     @property
     def configured(self):
@@ -325,6 +330,7 @@ class SearchService:
             store = self.local.store()
             store.upsert_entities(entities)
             store.bump_version()
+            _query_cache_clear()
         except Exception:
             if strict or not settings.ai_search_writes:
                 raise
@@ -338,6 +344,7 @@ class SearchService:
             store = self.local.store()
             store.delete_ids(ids)
             store.bump_version()
+            _query_cache_clear()
         except Exception:
             if not settings.ai_search_writes:
                 raise
@@ -784,20 +791,28 @@ class SearchService:
         backend = settings.search_backend
         if backend != "local" and not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
-        cache_key = None
+        cache_key, generation = None, 0
+        if backend == "local" and settings.search_cache_seconds > 0:
+            try:
+                # A first load swaps the index in, and a swap clears the kept answers. Let that happen before this search
+                # notes the cache generation, so its own answer (from the new index) can still be kept.
+                self.local.current()
+            except LocalIndexUnavailable:
+                pass  # the search below reports it, or falls back to Azure AI Search
         if settings.search_cache_seconds > 0:
             cache_key = (normalize_query(query), tuple(concepts), tuple(domains), int(limit))
             now = time.monotonic()
             with _query_lock:
+                generation = _query_generation[0]
                 entry = _query_cache.get(cache_key)
                 if entry and entry[0] > now:
                     _query_stats["hits"] += 1
                     _query_stats["saved"] += entry[2] or 0.0
-                    cached = copy.deepcopy(entry[1])
                 else:
-                    cached = None
+                    entry = None
                     _query_stats["misses"] += 1
-            if cached is not None:
+            if entry is not None:
+                cached = copy.deepcopy(entry[1])  # entries are never changed once stored, so copy outside the lock
                 cached["query"] = query  # the caller's own wording, not the first asker's
                 return cached
         answer, units = None, None
@@ -813,13 +828,16 @@ class SearchService:
             answer, units = self._search_azure(query, concepts, domains, limit, label)
             if backend == "shadow":
                 self._maybe_shadow(query, concepts, domains, limit, answer)
-        if cache_key is not None and answer.get("results"):
+        # A keyword-only answer (the question could not be embedded) is a degraded one: it must not be kept for minutes.
+        if cache_key is not None and answer.get("results") and answer.get("search_mode") != "keyword":
+            snapshot = copy.deepcopy(answer)  # copied outside the lock
             with _query_lock:
-                _query_cache[cache_key] = (time.monotonic() + settings.search_cache_seconds, copy.deepcopy(answer), units)
-                limit_entries = settings.search_cache_max_entries
-                if len(_query_cache) > limit_entries:
-                    for old in list(_query_cache)[: max(1, limit_entries // 10)]:
-                        _query_cache.pop(old, None)
+                if generation == _query_generation[0]:  # the index did not change while this search ran
+                    _query_cache[cache_key] = (time.monotonic() + settings.search_cache_seconds, snapshot, units)
+                    limit_entries = settings.search_cache_max_entries
+                    if len(_query_cache) > limit_entries:
+                        for old in list(_query_cache)[: max(1, limit_entries // 10)]:
+                            _query_cache.pop(old, None)
         return answer
 
     def _search_azure(self, query, concepts, domains, limit, label):

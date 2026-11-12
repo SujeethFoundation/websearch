@@ -265,6 +265,10 @@ class LocalIndex:
             self.post_weights = np.zeros(0, dtype=np.float32)
             self.post_ptr = np.zeros(1, dtype=np.int64)
 
+        # Which rows pass a given set of domains and concepts. The same sets come back all the time (the ontology picks
+        # them), and a snapshot never changes, so each answer is kept for the life of the snapshot. Bounded.
+        self._rows_cache = {}
+
         # lookups for reading pages and single chunks
         self.by_id = {cid: i for i, cid in enumerate(self.ids)}
         pages = {}
@@ -303,6 +307,18 @@ class LocalIndex:
             return np.zeros(self.n, dtype=bool)
         return mask & ((self.concept_bits & query) != 0).any(axis=1)
 
+    ROWS_CACHE_MAX = 64
+
+    def _rows(self, domains, concepts):
+        """The positions of the chunks that pass the filters, as int32 (kept per snapshot)."""
+        key = (frozenset(str(d).lower() for d in domains or []), frozenset(str(c).lower() for c in concepts or []))
+        rows = self._rows_cache.get(key)
+        if rows is None:
+            rows = np.flatnonzero(self._mask(domains, concepts)).astype(np.int32)
+            if len(self._rows_cache) < self.ROWS_CACHE_MAX:
+                self._rows_cache[key] = rows
+        return rows
+
     # -- the two halves ----------------------------------------------------------------------------------------
     @staticmethod
     def _top(values, count, largest):
@@ -338,7 +354,7 @@ class LocalIndex:
         the filters. qcode may be None, which leaves out the vector half (keyword only)."""
         if not self.n:
             return [], 0
-        rows = np.flatnonzero(self._mask(domains, concepts))
+        rows = self._rows(domains, concepts)
         if not len(rows):
             return [], 0
         fused = {}
@@ -554,6 +570,7 @@ class LocalIndexManager:
         self._failed_at = 0.0
         self._load_lock = threading.Lock()
         self._checking = threading.Lock()
+        self.on_swap = None  # called after a rebuilt index replaces the old one (the search service clears its answers)
         self.stats = {"loads": 0, "load_seconds": None, "build_seconds": None, "last_error": None, "searches": 0,
                       "fallbacks": 0, "embed_ms_total": 0.0, "search_ms_total": 0.0, "keyword_only": 0,
                       "shadow": {"compared": 0, "overlap_sum": 0.0, "top1_same": 0, "failed": 0}}
@@ -612,6 +629,11 @@ class LocalIndexManager:
             raise LocalIndexUnavailable("the local index table is empty; run the backfill first")
         now = time.perf_counter()
         self._index, self._version, self._loaded_at = index, version, time.monotonic()
+        if self.on_swap:
+            try:
+                self.on_swap()
+            except Exception:
+                log.warning("on_swap callback failed", exc_info=True)
         del rows
         release_memory()
         self.stats["loads"] += 1

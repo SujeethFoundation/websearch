@@ -116,6 +116,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `LOCAL_INDEX_PRELOAD` | `true` | Load the index when the worker starts (only when the backend is `local` or `shadow`) |
 | `LOCAL_SEARCH_FALLBACK` | `true` | When the local index is not ready, answer from Azure AI Search instead of failing |
 | `LOCAL_SHADOW_SAMPLE` | `0` | Share of searches (0 to 1) that shadow mode also runs locally and compares |
+| `EMBED_QUERY_COOLDOWN_SECONDS` | `20` | After a search question fails to embed, skip the embedding endpoint for this long and search by keywords only, so an outage costs one timeout, not one per search. `0` turns it off. Answers found by keywords alone are never kept in the result cache |
 
 ## Search inside the app (Table Storage)
 

@@ -44,6 +44,8 @@ class EmbeddingService:
         self.session.headers.update({"api-key": settings.embedding_key})
         self._query_cache = OrderedDict()
         self._query_lock = threading.Lock()
+        self._inflight = {}      # question key -> {"event": Event, "error": exception or None}
+        self._down_until = 0.0   # while time.monotonic() is below this, search questions skip the endpoint
 
     def _post_with_retry(self, url, payload, throttled=True, attempts=MAX_ATTEMPTS, timeout=90, fail_fast_over=None):
         """POST with exponential backoff on throttling and transient server errors.
@@ -92,17 +94,8 @@ class EmbeddingService:
         response.raise_for_status()
         return response
 
-    def embed_query(self, text):
-        """The vector for one search question. Unlike embed(), this is not slowed down by the indexing throttle, gives up
-        sooner, and remembers recent questions, since the same question often arrives again."""
-        key = " ".join(str(text or "").lower().split())
-        if not key:
-            raise ValueError("A question is required.")
-        with self._query_lock:
-            cached = self._query_cache.get(key)
-            if cached is not None:
-                self._query_cache.move_to_end(key)
-                return cached
+    def _request_query_vector(self, text):
+        """One embedding request for a search question, bounded by the EMBED_QUERY_* settings."""
         url = f"{settings.embedding_endpoint}/openai/v1/embeddings"
         response = self._post_with_retry(url, {
             "model": settings.embedding_deployment,
@@ -113,12 +106,52 @@ class EmbeddingService:
         data = response.json().get("data", [])
         if len(data) != 1 or len(data[0]["embedding"]) != settings.embedding_dimensions:
             raise RuntimeError("The embedding service returned an unexpected answer for a search question.")
-        vector = data[0]["embedding"]
+        return data[0]["embedding"]
+
+    def embed_query(self, text):
+        """The vector for one search question. Unlike embed(), this is not slowed down by the indexing throttle, gives up
+        sooner, and remembers recent questions, since the same question often arrives again.
+
+        Concurrent requests for the same new question share one embedding call (single flight). After a failure the
+        endpoint is skipped for EMBED_QUERY_COOLDOWN_SECONDS, so searches fall back to keywords at once instead of each
+        waiting out the timeout and retries while the endpoint is down."""
+        key = " ".join(str(text or "").lower().split()).strip(" \"'?!.,;:")
+        if not key:
+            raise ValueError("A question is required.")
         with self._query_lock:
-            self._query_cache[key] = vector
-            while len(self._query_cache) > QUERY_CACHE_ENTRIES:
-                self._query_cache.popitem(last=False)
-        return vector
+            cached = self._query_cache.get(key)
+            if cached is not None:
+                self._query_cache.move_to_end(key)
+                return cached
+            flight = self._inflight.get(key)
+            leader = flight is None
+            if leader:
+                if time.monotonic() < self._down_until:
+                    raise RuntimeError("Search question embedding is paused after a recent failure.")
+                flight = self._inflight[key] = {"event": threading.Event(), "error": None}
+        if not leader:
+            flight["event"].wait(settings.embed_query_timeout * settings.embed_query_attempts + 1)
+            with self._query_lock:
+                cached = self._query_cache.get(key)
+            if cached is not None:
+                return cached
+            raise flight["error"] or RuntimeError("The embedding request for this search question did not finish.")
+        try:
+            vector = self._request_query_vector(text)
+            with self._query_lock:
+                self._query_cache[key] = vector
+                while len(self._query_cache) > QUERY_CACHE_ENTRIES:
+                    self._query_cache.popitem(last=False)
+            return vector
+        except Exception as exc:
+            flight["error"] = exc
+            if settings.embed_query_cooldown > 0:
+                self._down_until = time.monotonic() + settings.embed_query_cooldown
+            raise
+        finally:
+            with self._query_lock:
+                self._inflight.pop(key, None)
+            flight["event"].set()
 
     def embed(self, texts):
         texts = [str(x or "").strip() for x in (texts or [])]

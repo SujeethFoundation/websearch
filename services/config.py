@@ -184,6 +184,9 @@ class Settings:
     embed_query_timeout = max(1.0, _float("EMBED_QUERY_TIMEOUT_SECONDS", 8))
     embed_query_attempts = _int("EMBED_QUERY_ATTEMPTS", 2, 1, 6)
     embed_query_max_wait = max(0.0, _float("EMBED_QUERY_MAX_WAIT_SECONDS", 2))
+    # After a search question fails to embed, skip the endpoint for this many seconds and search by keywords only, so an
+    # outage costs one timeout rather than one per search. 0 turns it off.
+    embed_query_cooldown = max(0.0, _float("EMBED_QUERY_COOLDOWN_SECONDS", 20))
     index_max_deferrals = _int("INDEX_MAX_DEFERRALS", 12, 0)
 
     # How long the ontology client keeps a successful manifest or domain-concept answer.

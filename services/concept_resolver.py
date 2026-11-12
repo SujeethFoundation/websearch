@@ -1,4 +1,5 @@
 import re
+import threading
 import time
 from services.config import settings
 
@@ -44,21 +45,29 @@ class ConceptResolver:
         self.ttl = ttl_seconds
         self._catalog = None
         self._loaded_at = None
+        self._build_lock = threading.Lock()
 
     def _load_catalog(self):
-        # Reload after the TTL so ontology changes (new aliases, new classes) reach a running
-        # instance without a restart. If the reload fails, keep serving the previous catalog.
-        if self._catalog is not None and self._loaded_at is not None \
-                and time.monotonic() - self._loaded_at < self.ttl:
-            return self._catalog
-        previous = self._catalog
-        try:
-            return self._build_catalog()
-        except Exception:
-            if previous is not None:
-                self._loaded_at = time.monotonic() - self.ttl + 60
-                return previous
-            raise
+        # Reload after the TTL so ontology changes (new aliases, new classes) reach a running instance without a
+        # restart. Only the very first load makes a request wait. After that an out-of-date catalog is served as it is
+        # while one background thread rebuilds it, so no search waits for three calls to the ontology app. If a rebuild
+        # fails, the previous catalog stays in use and the rebuild is tried again in a minute.
+        catalog = self._catalog
+        if catalog is not None and self._loaded_at is not None and time.monotonic() - self._loaded_at < self.ttl:
+            return catalog
+        if catalog is None:
+            with self._build_lock:  # first load: one builder, the others wait for it
+                return self._catalog or self._build_catalog()
+        if self._build_lock.acquire(blocking=False):
+            def rebuild():
+                try:
+                    self._build_catalog()
+                except Exception:
+                    self._loaded_at = time.monotonic() - self.ttl + 60
+                finally:
+                    self._build_lock.release()
+            threading.Thread(target=rebuild, name="ontology-catalog-refresh", daemon=True).start()
+        return catalog
 
     def _build_catalog(self):
 
@@ -77,14 +86,92 @@ class ConceptResolver:
             relationships_payload, ("relationships", "ontology_relationships")
         )
 
-        self._catalog = {
+        # Everything a search or a tagging pass needs from the aliases is worked out here, once per catalog: the
+        # normalized text and word set of each alias. Before, every search rebuilt each class's alias list (reading the
+        # whole terminology list for each class) and normalized every alias again.
+        terms_by_concept = {}
+        for term in terminology:
+            if not isinstance(term, dict):
+                continue
+            target = str(term.get("concept_id") or term.get("class_id") or term.get("concept") or term.get("id")).lower()
+            values = terms_by_concept.setdefault(target, [])
+            for field in ("preferred", "preferred_term", "term", "label"):
+                if term.get(field):
+                    values.append(term[field])
+            for field in ("aliases", "synonyms", "alternative_terms"):
+                v = term.get(field, [])
+                values.extend([v] if isinstance(v, str) else v if isinstance(v, list) else [])
+        query_index, tag_index, by_id = [], {}, {}
+        for item in classes:
+            cid = self._class_id(item) if isinstance(item, dict) else ""
+            if not cid:
+                continue
+            by_id[cid.lower()] = item
+            query_index.append((cid, self._index_aliases(self._query_alias_values(item) + terms_by_concept.get(cid.lower(), []))))
+            tag_index[cid.lower()] = self._index_aliases(self._tag_alias_values(item), keep_tokens=True)
+        catalog = {
             "ontology": ontology_doc if isinstance(ontology_doc, dict) else {},
             "classes": classes,
             "terminology": terminology,
             "relationships": relationships,
+            "query_index": query_index,
+            "tag_index": tag_index,
+            "by_id": by_id,
         }
-        self._loaded_at = time.monotonic()
-        return self._catalog
+        self._catalog, self._loaded_at = catalog, time.monotonic()
+        return catalog
+
+    @staticmethod
+    def _alias_list(item, fields):
+        values = []
+        for field in fields:
+            value = item.get(field, [])
+            if isinstance(value, str):
+                values.append(value)
+            elif isinstance(value, list):
+                values.extend(value)
+        return values
+
+    def _query_alias_values(self, item):
+        return [item.get("name", ""), item.get("id", ""), item.get("definition", "")] + self._alias_list(
+            item, ("aliases", "synonyms", "alternative_terms", "alternate_names", "query_phrases"))
+
+    def _tag_alias_values(self, item):
+        # tag_document skips query_phrases and the terminology list, so broad intent phrases never tag page content.
+        return [item.get("name", ""), str(item.get("id", "")).replace("_", " ")] + self._alias_list(
+            item, ("aliases", "synonyms", "alternative_terms", "alternate_names"))
+
+    @staticmethod
+    def _index_aliases(values, keep_tokens=True):
+        """[(normalized alias, its word set, the alias as written)] without repeats, first spelling kept."""
+        seen, out = set(), []
+        for value in values:
+            if not value:
+                continue
+            text = str(value)
+            norm = normalize(text)
+            if norm and norm not in seen:
+                seen.add(norm)
+                out.append((norm, frozenset(norm.split()), text))
+        return out
+
+    @staticmethod
+    def _score_indexed(query_norm, query_tokens, aliases):
+        """The same scoring as _score_class, over aliases that were normalized in advance."""
+        best, matched = 0.0, None
+        for alias_norm, alias_tokens, alias in aliases:
+            n = len(alias_tokens)
+            if alias_norm in query_norm:
+                score = 1.0 + min(n, 4) * 0.1
+            else:
+                overlap = len(query_tokens & alias_tokens)
+                score = overlap / max(1, n) * 0.65
+                # Do not let a single generic token match a long definition.
+                if overlap == 1 and n > 2:
+                    score *= 0.45
+            if score > best:
+                best, matched = score, alias
+        return best, matched
 
     @staticmethod
     def _class_id(item):
@@ -172,10 +259,11 @@ class ConceptResolver:
             )
 
         scores = []
-        by_id = {self._class_id(c).lower(): c for c in classes if self._class_id(c)}
-        for item in classes:
-            cid = self._class_id(item)
-            score, matched_term = self._score_class(query, item)
+        by_id = catalog["by_id"]
+        query_norm = normalize(query)
+        query_tokens = set(query_norm.split())
+        for cid, aliases in catalog["query_index"]:
+            score, matched_term = self._score_indexed(query_norm, query_tokens, aliases)
             if score >= 0.28:
                 scores.append((score, cid, matched_term))
 
@@ -283,40 +371,22 @@ class ConceptResolver:
         if not allowed:
             return []
 
-        classes = {
-            self._class_id(item).lower(): item
-            for item in catalog["classes"]
-            if isinstance(item, dict) and self._class_id(item)
-        }
+        tag_index = catalog["tag_index"]
         text = normalize(f"{title or ''} {content or ''}")
         text_tokens = set(text.split())
+        padded = f" {text} "
         matches = []
 
         for concept_id in allowed:
-            item = classes.get(concept_id)
-            if not item:
+            aliases = tag_index.get(concept_id)
+            if not aliases:
                 continue
-            aliases = [
-                item.get("name", ""),
-                item.get("id", "").replace("_", " "),
-            ]
-            for field in ("aliases", "synonyms", "alternative_terms", "alternate_names"):
-                values = item.get(field, [])
-                if isinstance(values, str):
-                    aliases.append(values)
-                elif isinstance(values, list):
-                    aliases.extend(values)
-
             best = 0.0
-            for alias in aliases:
-                alias_norm = normalize(alias)
-                if not alias_norm:
-                    continue
-                alias_tokens = set(alias_norm.split())
+            for alias_norm, alias_tokens, _ in aliases:
                 if len(alias_tokens) == 1:
                     # Single-word labels must occur as a complete token and be reasonably distinctive.
                     score = 1.0 if alias_norm in text_tokens else 0.0
-                elif f" {alias_norm} " in f" {text} ":
+                elif f" {alias_norm} " in padded:
                     score = 1.0
                 else:
                     overlap = len(alias_tokens & text_tokens)

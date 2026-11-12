@@ -17,25 +17,54 @@ class OntologyClient:
             self.session.headers["x-functions-key"] = settings.ontology_function_key
         self._cache = {}  # key -> (expires, value); only successful answers are kept
         self._cache_lock = threading.Lock()
+        self._locks = {}  # key -> Lock, one fetch at a time per key
+
+    def _store(self, key, value, ttl):
+        with self._cache_lock:
+            self._cache[key] = (time.monotonic() + ttl, value)
+            limit = settings.ontology_cache_max_entries
+            if len(self._cache) > limit:
+                for old in list(self._cache)[: max(1, limit // 10)]:
+                    self._cache.pop(old, None)
+
+    def _lock_for(self, key):
+        with self._cache_lock:
+            return self._locks.setdefault(key, threading.Lock())
 
     def _cached(self, key, fetch):
-        """A successful answer, reused for ONTOLOGY_CACHE_SECONDS. A failure is raised and never cached."""
+        """A successful answer, reused for ONTOLOGY_CACHE_SECONDS. A failure is raised and never cached.
+
+        Once an answer has been fetched, a request never waits for the ontology app again: an expired answer is served
+        as it is while one background thread fetches the new one (a failed refresh keeps the old answer and is tried
+        again next time). The first request for a key waits, and requests that arrive meanwhile wait for that same
+        fetch instead of each making their own."""
         ttl = settings.ontology_cache_seconds
-        now = time.monotonic()
-        if ttl > 0:
+        if ttl <= 0:
+            return fetch()
+        with self._cache_lock:
+            hit = self._cache.get(key)
+        if hit and hit[0] > time.monotonic():
+            return hit[1]
+        lock = self._lock_for(key)
+        if hit:  # expired: serve it, refresh in the background
+            if lock.acquire(blocking=False):
+                def refresh():
+                    try:
+                        self._store(key, fetch(), ttl)
+                    except Exception:
+                        pass  # keep serving the old answer
+                    finally:
+                        lock.release()
+                threading.Thread(target=refresh, name="ontology-refresh", daemon=True).start()
+            return hit[1]
+        with lock:  # nothing kept yet: one caller fetches, the others wait for it
             with self._cache_lock:
                 hit = self._cache.get(key)
-            if hit and hit[0] > now:
+            if hit and hit[0] > time.monotonic():
                 return hit[1]
-        value = fetch()
-        if ttl > 0:
-            with self._cache_lock:
-                self._cache[key] = (now + ttl, value)
-                limit = settings.ontology_cache_max_entries
-                if len(self._cache) > limit:
-                    for old in list(self._cache)[: max(1, limit // 10)]:
-                        self._cache.pop(old, None)
-        return value
+            value = fetch()
+            self._store(key, value, ttl)
+            return value
 
     def _url(self, path):
         if not self.base:
