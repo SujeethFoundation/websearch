@@ -1084,6 +1084,19 @@ def local_index_status(req):
     return response(out)
 
 
+@app.route(route="local-index/shadow-diffs", methods=["GET"])
+def local_index_shadow_diffs(req):
+    """The latest shadow comparisons whose top pages differed: the question and what Azure AI Search and the local index
+    each returned (top five). Held in memory on the instance that answers, so a different instance has different ones, and
+    gone on restart. These are visitors' questions, which is why the route needs the function key. ?limit= (default 10)."""
+    try:
+        limit = max(1, min(int(req.params.get("limit") or 10), 25))
+    except ValueError:
+        limit = 10
+    diffs = searcher.local.shadow_diffs(limit)
+    return response({"count": len(diffs), "diffs": diffs, "shadow": searcher.local.describe()["shadow"]})
+
+
 @app.route(route="embed-cache/seed", methods=["POST"])
 def embed_cache_seed(req):
     """Embed questions ahead of time and store their codes in the shared question cache, so visitors never wait for them.

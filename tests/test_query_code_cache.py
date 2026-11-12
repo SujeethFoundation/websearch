@@ -107,9 +107,9 @@ def test_rows_hold_the_code_and_a_timestamp_but_never_the_question(conf):
     svc.embed_query_code("My name is Jane Doe and I need a reference letter")
     flush(svc)
     (row,) = table.rows.values()
-    assert set(row) == {"PartitionKey", "RowKey", "code", "ts"}
+    assert set(row) == {"PartitionKey", "RowKey", "code", "q8", "ts"}
     assert "jane" not in " ".join(str(v).lower() for v in row.values())
-    assert len(row["code"]) == DIMS // 8 and len(row["PartitionKey"]) == 2
+    assert len(row["code"]) == DIMS // 8 and len(row["q8"]) == DIMS and len(row["PartitionKey"]) == 2
 
 
 def test_a_different_model_or_size_does_not_see_the_old_codes(conf, monkeypatch):
@@ -236,7 +236,7 @@ def test_the_cache_runs_without_a_table_when_shared_is_off_or_there_is_no_connec
     assert es.EmbeddingService()._shared is None
     off = qc.QueryCodeCache(connection_string="", table=None)
     assert off.enabled is False and off.get("x") is None
-    off.put("x", b"\x00" * 8)
+    off.put("x", b"\x00" * 8, b"\x00" * 64)
     calls = []
     svc = es.EmbeddingService()
     svc._request_query_vector = lambda t: calls.append(t) or [1.0] * DIMS
@@ -258,7 +258,7 @@ def test_a_write_backlog_is_dropped_not_queued_forever(conf, monkeypatch):
     original = table.upsert_entity
     table.upsert_entity = lambda e, mode="merge": (gate.wait(2), original(e, mode))
     for n in range(6):
-        cache.put(f"q{n}", b"\x00" * (DIMS // 8))
+        cache.put(f"q{n}", b"\x00" * (DIMS // 8), b"\x00" * DIMS)
     assert cache.stats["writes_dropped"] >= 3
     gate.set()
     cache._writer.shutdown(wait=True)
@@ -363,3 +363,26 @@ def test_the_code_path_does_not_fill_the_vector_cache_but_embed_query_still_does
     assert len(calls) == 2
     svc.embed_query("third question", remember=False)
     assert len(svc._query_cache) == 1 and len(calls) == 3
+
+
+# ---- the 8-bit vector travels with the code
+
+def test_a_question_comes_back_as_a_code_and_an_8_bit_vector(conf):
+    table, calls = FakeTable(), []
+    a = service(table, calls)
+    code, vec8 = a.embed_query_vectors("How do I volunteer?")
+    flush(a)
+    assert len(code) == DIMS // 8 and len(vec8) == DIMS
+    assert a.embed_query_code("how do i volunteer") == code
+    b = service(table, [])
+    assert b.embed_query_vectors("HOW DO I VOLUNTEER") == (code, vec8) and b.cache_stats()["shared_hits"] == 1
+
+
+def test_a_row_from_before_the_vector_was_kept_is_replaced_not_used(conf):
+    table, calls = FakeTable(), []
+    partition, row = qc.row_key_for(qc.normalize_question("old row"), "emb-a", DIMS)
+    table.rows[(partition, row)] = {"code": b"\x01" * (DIMS // 8), "ts": int(time.time())}      # no q8
+    svc = service(table, calls)
+    code, vec8 = svc.embed_query_vectors("old row")
+    flush(svc)
+    assert len(calls) == 1 and len(vec8) == DIMS and "q8" in table.rows[(partition, row)]

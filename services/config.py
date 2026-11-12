@@ -110,13 +110,19 @@ class Settings:
     local_index_min_reload_seconds = _int("LOCAL_INDEX_MIN_RELOAD_SECONDS", 600, 0)
     local_index_title_weight = _int("LOCAL_INDEX_TITLE_WEIGHT", 3, 1, 20)
     local_index_preload = _flag("LOCAL_INDEX_PRELOAD", True)
+    # The 1-bit codes find a shortlist of close chunks quickly, but they rank poorly among close neighbours. Each chunk
+    # also keeps its vector at 8 bits a dimension (about 1.5 KB), and the best LOCAL_RESCORE_POOL chunks by code are
+    # re-ranked by cosine similarity on those. Needs the table rows to carry the vectors (run the local backfill again
+    # after upgrading); until every row has one, the search quietly uses the codes alone.
+    local_rescore = _flag("LOCAL_RESCORE", True)
+    local_rescore_pool = _int("LOCAL_RESCORE_POOL", 300, 20, 5000)
     # Search-question embeddings are remembered so a question is embedded once, not once per instance. Only the 1-bit
     # code the local search uses is kept (192 bytes for 1536 dimensions), never the question's text. Memory first, then a
     # table shared by every instance, then the embedding call.
     embed_cache_shared = _flag("EMBED_CACHE_SHARED", True)
     embed_cache_table = ("".join(ch for ch in os.getenv("EMBED_CACHE_TABLE", "").strip() if ch.isalnum())
                          or (local_index_table + "qcache"))
-    embed_cache_memory_entries = _int("EMBED_CACHE_MEMORY_ENTRIES", 20000, 100)
+    embed_cache_memory_entries = _int("EMBED_CACHE_MEMORY_ENTRIES", 10000, 100)
     embed_cache_ttl_days = _float("EMBED_CACHE_TTL_DAYS", 30)                     # 0 keeps entries until the model changes
     embed_cache_read_timeout = max(0.2, _float("EMBED_CACHE_TIMEOUT_SECONDS", 2))  # one table read or write
     embed_cache_cooldown = max(1.0, _float("EMBED_CACHE_COOLDOWN_SECONDS", 30))   # after a failure, skip the table this long

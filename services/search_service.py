@@ -929,17 +929,21 @@ class SearchService:
         index = self.local.current()
         terms = query_terms(query)
         began = time.perf_counter()
-        qcode, keyword_only = None, False
+        qcode, qvec, keyword_only = None, None, False
         try:
-            get_code = getattr(self.embedder, "embed_query_code", None)
-            qcode = get_code(query) if get_code else binary_code(self.embedder.embed_query(query))
+            get_vectors = getattr(self.embedder, "embed_query_vectors", None)
+            if get_vectors:
+                qcode, qvec = get_vectors(query)
+            else:
+                get_code = getattr(self.embedder, "embed_query_code", None)
+                qcode = get_code(query) if get_code else binary_code(self.embedder.embed_query(query))
         except Exception as exc:
             keyword_only = True
             log.warning("Search question could not be embedded (%s); searching by keywords only", type(exc).__name__)
         embed_ms = (time.perf_counter() - began) * 1000
         began = time.perf_counter()
         candidates = max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10)
-        hits, matching = index.search(terms, qcode, domains, concepts, candidates=candidates, limit=limit)
+        hits, matching = index.search(terms, qcode, domains, concepts, candidates=candidates, limit=limit, qvec=qvec)
         texts = self._local_texts(index, [row for row, _ in hits])
         results = []
         for row, score in hits:
@@ -954,7 +958,8 @@ class SearchService:
                 "source": "website",
                 "chunk_id": data["id"],
             })
-        self.local.record_search(embed_ms, (time.perf_counter() - began) * 1000, keyword_only)
+        self.local.record_search(embed_ms, (time.perf_counter() - began) * 1000, keyword_only,
+                                 rescored=bool(qvec is not None and index.vec8 is not None and not keyword_only))
         return {
             "query": query,
             "count": len(results),
@@ -976,7 +981,19 @@ class SearchService:
                 local = self._search_local(query, concepts, domains, limit)
                 a = [r["chunk_id"] for r in azure_answer["results"]]
                 b = [r["chunk_id"] for r in local["results"]]
-                self.local.record_shadow(len(set(a) & set(b)) / max(1, len(a)), bool(a and b and a[0] == b[0]))
+                pa = list(dict.fromkeys(r["url"] for r in azure_answer["results"]))
+                pb = list(dict.fromkeys(r["url"] for r in local["results"]))
+                same_page = bool(pa and pb and pa[0] == pb[0])
+                example = None
+                if not same_page:
+                    def brief(results):
+                        return [{"rank": i + 1, "title": r.get("title"), "url": r.get("url"), "score": r.get("score"),
+                                 "chunk": r.get("chunk_id")} for i, r in enumerate(results[:5])]
+                    example = {"time": time.strftime("%H:%M:%S", time.gmtime()), "query": query[:300],
+                               "azure": brief(azure_answer["results"]), "local": brief(local["results"])}
+                self.local.record_shadow(len(set(a) & set(b)) / max(1, len(a)), bool(a and b and a[0] == b[0]),
+                                         page_overlap=len(set(pa) & set(pb)) / max(1, len(pa)),
+                                         top1_page_same=same_page, example=example)
             except Exception:
                 self.local.record_shadow_failure()
 

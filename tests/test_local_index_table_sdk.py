@@ -112,10 +112,10 @@ def test_question_codes_round_trip_through_the_real_sdk(monkeypatch):
     from services import query_code_cache as qc
     monkeypatch.setattr(li.settings, "embed_cache_ttl_days", 30, raising=False)
     cache = qc.QueryCodeCache(connection_string=CONNECTION, table_name="qcachetest" + uuid.uuid4().hex[:8])
-    code = bytes(range(192))
+    code, vec8 = bytes(range(192)), bytes(range(256)) * 6
     assert cache.get("how do i volunteer", "m", 1536) is None                     # a clean miss, not an error
-    cache.put("how do i volunteer", code, "m", 1536, wait=True)
-    assert cache.get("how do i volunteer", "m", 1536) == code                      # bytes survive the table
+    cache.put("how do i volunteer", code, vec8, "m", 1536, wait=True)
+    assert cache.get("how do i volunteer", "m", 1536) == (code, vec8)              # bytes survive the table
     assert cache.get("how do i volunteer", "other-model", 1536) is None
     assert cache.stats["errors"] == 0 and cache.stats["hits"] == 1
     monkeypatch.setattr(li.settings, "embed_cache_ttl_days", 1e-9, raising=False)

@@ -30,6 +30,7 @@
 #     Start-LocalBackfill        copy every stored chunk into the table; asks first (Start-LocalBackfill muse for one domain; -Follow watches it fill)
 #     Watch-LocalBackfill        follow a backfill: rows, rows added, rows per minute, queue backlog (-CountBlobs for a progress bar and ETA)
 #     Watch-Websearch            health watcher: per instance uptime and restarts, index loaded and size, memory, searches and timings, shadow comparison, cache; a summary with checks on Ctrl+C
+#     Show-ShadowDiffs           the latest shadow comparisons whose top pages differed: the question, then Azure AI Search's and the local index's top five (-Count 10)
 #     Seed-EmbedCache            embed common questions ahead of time into the shared question cache (Seed-EmbedCache "How do I volunteer?"; or -Path file.txt, one per line)
 #     Watch-Websearch -Every 5 -Polls 120 -InstanceMb 2048 -MinCompared 300 -MinOverlap 0.6 -MinTop 0.5     (the bars for the checks are yours to choose)
 
@@ -533,6 +534,12 @@ function Show-LocalIndex([switch]$Count, [switch]$CountBlobs) {
         Write-Host "This instance has not loaded the index yet." -ForegroundColor Yellow
     }
     if ($r.last_error) { Write-Host "Last error: $($r.last_error)" -ForegroundColor Red }
+    $rs = $r.rescoring
+    if ($rs) {
+        if ($rs.active) { Write-Host ("Rescoring: active (the 1-bit codes pick {0} candidates, 8-bit vectors rank them); {1:N0} searches rescored on this instance" -f $rs.pool, $rs.rescored_searches) }
+        elseif (-not $rs.enabled) { Write-Host "Rescoring: turned off (LOCAL_RESCORE=false)" -ForegroundColor Yellow }
+        elseif ($r.loaded) { Write-Host ("Rescoring: OFF. {0:N0} rows have no 8-bit vector, so the codes alone rank results. Run Start-LocalBackfill to write the vectors; instances reload on their own within about 10 minutes of the last batch (or POST /api/local-index/reload)." -f [int]$rs.rows_without_vectors) -ForegroundColor Yellow }
+    }
     $e = $r.embed_cache
     if ($e -and [int]$e.lookups -gt 0) {
         Write-Host ("Question cache (this instance): {0:N0} lookups, {1:P0} answered without an embedding call (memory {2:N0}, shared table {3:N0}); {4:N0} embedding calls averaging {5} ms; {6:N0} questions in memory" -f `
@@ -647,6 +654,29 @@ function Start-LocalBackfill([string]$Domain, [switch]$Follow, [switch]$CountBlo
     else { Write-Host "Follow it with: Watch-LocalBackfill   (add -CountBlobs for a progress bar)" }
 }
 
+function Show-ShadowDiffs([int]$Count = 10) {
+    # The latest shadow comparisons whose top pages differed: the question, then what Azure AI Search and the local index
+    # each returned (top five). Held in memory on the instance that answers, so repeat the call to see other instances'.
+    # These are visitors' questions.
+    $r = Call GET "/api/local-index/shadow-diffs?limit=$Count"
+    if (-not $r -or $r -is [string] -or $null -eq $r.diffs) { Write-Warning "No usable answer from /api/local-index/shadow-diffs. Is the websearch app deployed with it? Response: $r"; return }
+    $s = $r.shadow
+    Write-Host ("This instance: {0:N0} shadow comparisons; top page agrees {1}, page overlap {2}; chunk-level top agrees {3}" -f $s.compared, (Format-Cell $s.top_page_agrees "N2"), (Format-Cell $s.average_page_overlap "N2"), (Format-Cell $s.top_result_agrees "N2"))
+    if (-not [int]$r.count) { Write-Host "No disagreements kept on this instance: every compared search had the same top page, or none were compared yet (needs SEARCH_BACKEND=shadow and LOCAL_SHADOW_SAMPLE above 0)."; return }
+    $line = {
+        param($x)
+        $title = "$($x.title)"; if ($title.Length -gt 44) { $title = $title.Substring(0, 44) + "..." }
+        $url = "$($x.url)" -replace '^https?://(www\.)?', ''; if ($url.Length -gt 60) { $url = $url.Substring(0, 60) + "..." }
+        "{0}. {1}  <{2}>" -f $x.rank, $title, $url
+    }
+    foreach ($d in @($r.diffs)) {
+        Write-Host ""
+        Write-Host ("[{0} UTC] {1}" -f $d.time, $d.query) -ForegroundColor Cyan
+        foreach ($x in @($d.azure)) { Write-Host ("  Azure  " + (& $line $x)) }
+        foreach ($x in @($d.local)) { Write-Host ("  Local  " + (& $line $x)) }
+    }
+}
+
 function Seed-EmbedCache([string[]]$Question, [string]$Path) {
     # Embeds questions ahead of time and stores their codes in the shared question cache, so visitors never wait for them.
     # Already remembered questions are skipped. Up to 500 per call (this sends them in batches of 100).
@@ -703,7 +733,17 @@ function Show-WatchSummary($seen, [int]$InstanceMb, [int]$MinCompared, [double]$
     if ($shadowN -gt 0) {
         $overlap = ($list | ForEach-Object { (Get-Num $_.Overlap) * (Get-Num $_.ShadowN) } | Measure-Object -Sum).Sum / $shadowN
         $top = ($list | ForEach-Object { (Get-Num $_.Top1) * (Get-Num $_.ShadowN) } | Measure-Object -Sum).Sum / $shadowN
-        Write-Host ("Shadow comparison against Azure AI Search: {0:N0} searches   average overlap of the top results {1:N3}   top result agrees {2:N3}" -f $shadowN, $overlap, $top)
+        Write-Host ("Shadow comparison against Azure AI Search: {0:N0} searches" -f $shadowN)
+        $pgOverlap = ($list | ForEach-Object { (Get-Num $_.PgOverlap) * (Get-Num $_.ShadowN) } | Measure-Object -Sum).Sum / $shadowN
+        $pgTop = ($list | ForEach-Object { (Get-Num $_.PgTop1) * (Get-Num $_.ShadowN) } | Measure-Object -Sum).Sum / $shadowN
+        $havePages = [bool]($list | Where-Object { $null -ne $_.PgTop1 })
+        if ($havePages) {
+            Write-Host ("  pages:  average overlap of the top results {0:N3}   top page agrees {1:N3}   (a different chunk of the same page is not a miss)" -f $pgOverlap, $pgTop)
+            Write-Host ("  chunks: average overlap of the top results {0:N3}   top chunk agrees {1:N3}   (stricter)" -f $overlap, $top)
+            $overlap = $pgOverlap; $top = $pgTop
+        } else {
+            Write-Host ("  chunks: average overlap of the top results {0:N3}   top result agrees {1:N3}" -f $overlap, $top)
+        }
         $failed = & $sum "ShadowFailed"
         if ($failed -gt 0) { Write-Host ("  {0:N0} comparison(s) failed to run locally." -f $failed) -ForegroundColor Yellow }
     }
@@ -718,10 +758,15 @@ function Show-WatchSummary($seen, [int]$InstanceMb, [int]$MinCompared, [double]$
     & $mark ($restarts -eq 0) $(if ($restarts) { "no restarts while watching: $restarts seen (" + (($restartLog | Select-Object -Last 3) -join "; ") + ")" } else { "no restarts while watching" })
     $maxProc = [double](($list | ForEach-Object { Get-Num $_.MaxProc } | Measure-Object -Maximum).Maximum)
     if ($maxProc -gt 0 -and $InstanceMb -gt 0) { & $mark (($maxProc / $InstanceMb) -lt 0.75) ("highest process memory {0:N0} MB of {1:N0} MB ({2:P0}); under 75% leaves room for a rebuild" -f $maxProc, $InstanceMb, ($maxProc / $InstanceMb)) }
+    $known = @($list | Where-Object { $_.RescKnown })
+    if ($known.Count) {
+        $off = @($known | Where-Object { -not $_.Resc })
+        & $mark (-not $off.Count) $(if ($off.Count) { "rescoring is OFF on $($off.Count) instance(s): " + (($off | ForEach-Object { "{0} ({1:N0} rows without a vector)" -f (Short-Instance $_.Name), $_.RescMissing }) -join "; ") + ". Run Start-LocalBackfill to write the vectors; instances reload on their own within about 10 minutes of the last batch." } else { "rescoring is active on every instance seen (the codes pick a shortlist, 8-bit vectors rank it)" })
+    }
     if ($backend -eq "shadow") {
         & $mark ($shadowN -ge $MinCompared) ("at least {0:N0} shadow comparisons (have {1:N0})" -f $MinCompared, $shadowN)
-        if ($MinOverlap -gt 0 -and $null -ne $overlap) { & $mark ($overlap -ge $MinOverlap) ("average overlap at least {0:N2} (is {1:N3})" -f $MinOverlap, $overlap) }
-        if ($MinTop -gt 0 -and $null -ne $top) { & $mark ($top -ge $MinTop) ("top result agrees at least {0:N2} (is {1:N3})" -f $MinTop, $top) }
+        if ($MinOverlap -gt 0 -and $null -ne $overlap) { & $mark ($overlap -ge $MinOverlap) ("average overlap at least {0:N2} (is {1:N3}{2})" -f $MinOverlap, $overlap, $(if ($havePages) { ", pages" } else { ", chunks" })) }
+        if ($MinTop -gt 0 -and $null -ne $top) { & $mark ($top -ge $MinTop) ("top result agrees at least {0:N2} (is {1:N3}{2})" -f $MinTop, $top, $(if ($havePages) { ", pages" } else { ", chunks" })) }
         if (-not $MinOverlap -and $null -ne $overlap) { Write-Host "  [ - ] overlap and top-result agreement are shown above; add -MinOverlap and -MinTop to check them against your own bar" }
     }
     if ($backend -eq "local") {
@@ -741,8 +786,8 @@ function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2
     #   Watch-Websearch -InstanceMb 2048 -MinCompared 300 -MinOverlap 0.6 -MinTop 0.5   the bars for the checks (you choose them)
     $seen = @{}; $n = 0; $attempts = 0; $rows = 0; $restarts = 0; $restartLog = @(); $backend = ""
     Write-Host "Watching $script:AzureUrl every $Every s. Ctrl+C stops and prints a summary."
-    $header = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,8} {6,6} {7,6} {8,6} {9,6} {10,4} {11,4} {12,7} {13,7} {14,5} {15,6} {16,6}  {17}" -f `
-        "Time", "Instance", "Pid", "Up(s)", "Loaded", "Chunks", "ProcMB", "Srch", "EmbMs", "IdxMs", "Fall", "Kw", "ShadowN", "Overlap", "Top1", "QCache", "EmbHit", "Notes")
+    $header = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,-4} {6,8} {7,6} {8,6} {9,6} {10,6} {11,4} {12,4} {13,7} {14,6} {15,6} {16,6} {17,6}  {18}" -f `
+        "Time", "Instance", "Pid", "Up(s)", "Loaded", "Resc", "Chunks", "ProcMB", "Srch", "EmbMs", "IdxMs", "Fall", "Kw", "ShadowN", "PgOvl", "PgTop1", "QCache", "EmbHit", "Notes")
     try {
         while ($true) {
             $attempts++
@@ -779,6 +824,9 @@ function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2
                 $rec.EmbErr = [int](Get-Num $ec.shared.errors) + [int](Get-Num $ec.shared.write_errors)
                 $rec.ShadowN = [int](Get-Num $sh.compared); $rec.ShadowFailed = [int](Get-Num $sh.failed)
                 $rec.Overlap = $sh.average_overlap; $rec.Top1 = $sh.top_result_agrees
+                $rec.PgOverlap = $sh.average_page_overlap; $rec.PgTop1 = $sh.top_page_agrees
+                $rec.RescKnown = ($null -ne $l.rescoring); $rec.Resc = [bool]$l.rescoring.active
+                $rec.RescMissing = [int](Get-Num $l.rescoring.rows_without_vectors); $rec.Rescored = [int](Get-Num $l.rescoring.rescored_searches)
                 $rec.Err = "$($l.last_error)"
                 $rec.AzReq = [int](Get-Num $az.requests); $rec.AzTotal = Get-Num $az.total
                 $rec.QHits = [int](Get-Num $qc.hits); $rec.QMiss = [int](Get-Num $qc.misses)
@@ -787,10 +835,11 @@ function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2
                 $rows++
                 $qrate = if ($null -ne $qc.hit_rate) { "{0:P0}" -f [double]$qc.hit_rate } else { "-" }
                 $erate = if ($null -ne $ec.hit_rate) { "{0:P0}" -f [double]$ec.hit_rate } else { "-" }
-                $line = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,8} {6,6} {7,6} {8,6} {9,6} {10,4} {11,4} {12,7} {13,7} {14,5} {15,6} {16,6}  {17}" -f `
-                    (Get-Date).ToUniversalTime().ToString("HH:mm:ss"), (Short-Instance $name), $p.pid, (Format-Cell $p.uptime_seconds), $(if ($l.loaded) { "yes" } else { "no" }),
+                $resc = if ($null -eq $l.rescoring) { "-" } elseif ($l.rescoring.active) { "yes" } else { "no" }
+                $line = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,-4} {6,8} {7,6} {8,6} {9,6} {10,6} {11,4} {12,4} {13,7} {14,6} {15,6} {16,6} {17,6}  {18}" -f `
+                    (Get-Date).ToUniversalTime().ToString("HH:mm:ss"), (Short-Instance $name), $p.pid, (Format-Cell $p.uptime_seconds), $(if ($l.loaded) { "yes" } else { "no" }), $resc,
                     (Format-Cell $l.chunks), (Format-Cell $l.process_memory_mb), (Format-Cell $l.searches), (Format-Cell $l.avg_embed_ms), (Format-Cell $l.avg_search_ms "N2"),
-                    (Format-Cell $l.fallbacks_to_ai_search), (Format-Cell $l.keyword_only_searches), (Format-Cell $sh.compared), (Format-Cell $sh.average_overlap "N2"), (Format-Cell $sh.top_result_agrees "N2"), $qrate, $erate, ($notes -join "; "))
+                    (Format-Cell $l.fallbacks_to_ai_search), (Format-Cell $l.keyword_only_searches), (Format-Cell $sh.compared), (Format-Cell $sh.average_page_overlap "N2"), (Format-Cell $sh.top_page_agrees "N2"), $qrate, $erate, ($notes -join "; "))
                 if ($notes -match "RESTART|ERROR") { Write-Host $line -ForegroundColor Red } else { Write-Host $line }
             }
             if ($Polls -gt 0 -and $attempts -ge $Polls) { break }
@@ -801,4 +850,4 @@ function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2
     }
 }
 
-Write-Host "Loaded. Try: Show-Crawl | Show-CrawlHours | Show-CrawlTags | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain> | Show-LocalIndex -Count | Start-LocalBackfill -Follow | Seed-EmbedCache | Watch-Websearch"
+Write-Host "Loaded. Try: Show-Crawl | Show-CrawlHours | Show-CrawlTags | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain> | Show-LocalIndex -Count | Start-LocalBackfill -Follow | Seed-EmbedCache | Show-ShadowDiffs | Watch-Websearch"

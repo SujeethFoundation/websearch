@@ -9,7 +9,7 @@ import requests
 
 from services.config import settings
 from services.http_pool import pooled_session
-from services.local_index import binary_code
+from services.local_index import binary_code, quantize_int8
 from services.query_code_cache import QueryCodeCache, normalize_question
 
 log = logging.getLogger("sujeeth-web-search.embeddings")
@@ -176,9 +176,9 @@ class EmbeddingService:
                 self._codes.move_to_end(key)
             return code
 
-    def _memory_put(self, key, code):
+    def _memory_put(self, key, got):
         with self._query_lock:
-            self._codes[key] = code
+            self._codes[key] = got
             while len(self._codes) > settings.embed_cache_memory_entries:
                 self._codes.popitem(last=False)
 
@@ -187,7 +187,12 @@ class EmbeddingService:
             self._code_stats[name] += amount
 
     def embed_query_code(self, text):
-        """The 1-bit code of one search question, which is all the local search uses.
+        """The 1-bit code of one search question (see embed_query_vectors)."""
+        return self.embed_query_vectors(text)[0]
+
+    def embed_query_vectors(self, text):
+        """(1-bit code, 8-bit vector) of one search question: what the local search uses (the code finds a shortlist, the
+        vector re-ranks it).
 
         Looks in memory, then in the table every instance shares, and only then calls the embedding service (and
         remembers the answer in both). Several searches for the same new question at once share one call."""
@@ -195,10 +200,10 @@ class EmbeddingService:
         if not key:
             raise ValueError("A question is required.")
         self._bump("lookups")
-        code = self._memory_get(key)
-        if code is not None:
+        got = self._memory_get(key)
+        if got is not None:
             self._bump("memory_hits")
-            return code
+            return got
         with self._query_lock:
             waiting = self._code_inflight.get(key)
             if waiting is None:
@@ -207,13 +212,14 @@ class EmbeddingService:
             self._bump("coalesced")
             return waiting.result(timeout=settings.embed_query_timeout * settings.embed_query_attempts + 5)
         try:
-            code = self._shared.get(key) if self._shared else None
-            if code is not None:
+            got = self._shared.get(key) if self._shared else None
+            if got is not None:
                 self._bump("shared_hits")
             else:
                 began = time.perf_counter()
                 try:
-                    code = binary_code(self.embed_query(text, remember=False))
+                    vector = self.embed_query(text, remember=False)
+                    got = (binary_code(vector), quantize_int8(vector))
                 except BaseException:
                     self._bump("embed_failures")
                     raise
@@ -221,10 +227,10 @@ class EmbeddingService:
                     self._bump("embed_calls")
                     self._bump("remote_ms", (time.perf_counter() - began) * 1000)
                 if self._shared:
-                    self._shared.put(key, code)
-            self._memory_put(key, code)
-            mine.set_result(code)
-            return code
+                    self._shared.put(key, *got)
+            self._memory_put(key, got)
+            mine.set_result(got)
+            return got
         except BaseException as exc:
             mine.set_exception(exc)
             raise
@@ -250,10 +256,11 @@ class EmbeddingService:
                     with lock:
                         out["already_cached"] += 1
                     return
-                code = binary_code(self.embed_query(text, remember=False))
-                self._memory_put(key, code)
+                vector = self.embed_query(text, remember=False)
+                got = (binary_code(vector), quantize_int8(vector))
+                self._memory_put(key, got)
                 if self._shared:
-                    self._shared.put(key, code, wait=True)
+                    self._shared.put(key, *got, wait=True)
                 with lock:
                     out["embedded"] += 1
                 self._bump("seeded")

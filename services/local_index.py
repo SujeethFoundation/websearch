@@ -27,6 +27,7 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from functools import lru_cache
 
@@ -37,6 +38,7 @@ from services.config import settings
 log = logging.getLogger("sujeeth-web-search.local-index")
 
 FORMAT_VERSION = 1
+SHADOW_DIFFS_KEPT = 25
 BM25_K1 = 1.2
 BM25_B = 0.75
 RRF_K = 60
@@ -94,6 +96,16 @@ def analyze(title, content, title_weight=3):
     return hashes.tobytes(), values.tobytes()
 
 
+def quantize_int8(vector):
+    """The vector at 8 bits a dimension: scaled so its largest value is 127. Cosine similarity does not depend on a
+    vector's overall scale, so the scale is not kept."""
+    v = np.asarray(vector, dtype=np.float32)
+    peak = float(np.abs(v).max()) if v.size else 0.0
+    if peak == 0.0:
+        return np.zeros(v.shape, dtype=np.int8).tobytes()
+    return np.round(v * (127.0 / peak)).astype(np.int8).tobytes()
+
+
 def binary_code(vector):
     """One bit per dimension (set when the value is above zero), packed into bytes."""
     return np.packbits(np.asarray(vector, dtype=np.float32) > 0).tobytes()
@@ -141,6 +153,7 @@ def build_entity(doc_id, title, url, domain, concepts, content, vector, title_we
         "concepts": ",".join(str(c) for c in (concepts or [])),
         "text": str(content or "")[:MAX_TEXT_CHARS],
         "vec": binary_code(vector),
+        "v8": quantize_int8(vector),
         "tid": tid,
         "tcnt": tcnt,
         "fmt": FORMAT_VERSION,
@@ -170,6 +183,7 @@ def row_from_entity(entity):
         "concepts": concepts,
         "text": entity.get("text"),
         "vec": raw(entity.get("vec")),
+        "v8": raw(entity.get("v8")),
         "tid": raw(entity.get("tid")),
         "tcnt": raw(entity.get("tcnt")),
     }
@@ -224,6 +238,22 @@ class LocalIndex:
         # vectors
         self.code_bytes = width
         self.codes = _words([r["vec"] for r in usable], width) if n else np.zeros((0, 1), dtype=np.uint64)
+
+        # Each vector at 8 bits a dimension, to re-rank the shortlist the codes pick. All or nothing: a mix of rows with
+        # and without vectors would rank some chunks on a different scale from the rest.
+        self.vec8, self.norm8, self.vec_dims = None, None, 0
+        dims = len(usable[0].get("v8") or b"") if n else 0
+        self.rows_without_vectors = n - sum(1 for r in usable if dims and len(r.get("v8") or b"") == dims)
+        if n and dims and not self.rows_without_vectors and settings.local_rescore:
+            vec8 = np.empty((n, dims), dtype=np.int8)
+            for i, r in enumerate(usable):
+                vec8[i] = np.frombuffer(r["v8"], dtype=np.int8)
+            norm8 = np.empty(n, dtype=np.float32)
+            for start in range(0, n, 4096):
+                block = vec8[start:start + 4096].astype(np.float32)
+                norm8[start:start + 4096] = np.sqrt((block * block).sum(axis=1))
+            norm8[norm8 == 0] = 1.0
+            self.vec8, self.norm8, self.vec_dims = vec8, norm8, dims
 
         # keyword postings, as a column-compressed matrix: for each word, the chunks that contain it and their weights
         arrays = [np.frombuffer(r["tid"], dtype="<u8") for r in usable]
@@ -286,6 +316,7 @@ class LocalIndex:
     def memory_bytes(self):
         arrays = (self.codes, self.concept_bits, self.domain_codes, self.vocab, self.post_docs, self.post_weights, self.post_ptr)
         total = sum(a.nbytes for a in arrays)
+        total += (self.vec8.nbytes + self.norm8.nbytes) if self.vec8 is not None else 0
         total += sum(len(s) * 2 for s in (self.texts or [])) + sum(len(s) for s in self.ids) + sum(len(s) for s in self.urls)
         total += sum(len(s) for s in self.titles)
         return total
@@ -349,9 +380,30 @@ class LocalIndex:
                 scores[self.post_docs[a:z]] += self.post_weights[a:z]
         return scores
 
-    def search(self, terms, qcode, domains, concepts, candidates=50, limit=5):
+    def vector_ranking(self, rows, qcode, qvec, count, pool=None):
+        """The `count` best of `rows` for a question, best first, as row numbers.
+
+        The 1-bit codes pick a shortlist of `pool` chunks (all of them when fewer pass the filters); the shortlist is
+        then ranked by cosine similarity on the 8-bit vectors. Without a question vector, or without vectors in the
+        index, the codes alone rank (Hamming distance, which has many ties and ranks close neighbours poorly)."""
+        pool = pool or settings.local_rescore_pool
+        query = _words([qcode[: self.code_bytes].ljust(self.code_bytes, b"\0")], self.code_bytes)[0]
+        if qvec is not None and self.vec8 is not None and len(qvec) == self.vec_dims:
+            if len(rows) > max(pool, count):
+                shortlist = rows[self._top(_popcount_rows(self.codes[rows] ^ query), max(pool, count), False)]
+            else:
+                shortlist = rows
+            q = np.frombuffer(qvec, dtype=np.int8).astype(np.float32)
+            norm = float(np.sqrt((q * q).sum())) or 1.0
+            similarity = (self.vec8[shortlist].astype(np.float32) @ q) / (self.norm8[shortlist] * norm)
+            return [int(shortlist[i]) for i in self._top(similarity, count, True)]
+        distance = _popcount_rows(self.codes[rows] ^ query)
+        return [int(rows[pos]) for pos in self._top(distance, count, False)]
+
+    def search(self, terms, qcode, domains, concepts, candidates=50, limit=5, qvec=None):
         """(hits, matching) where hits is [(row, score), ...] best first and matching counts the chunks that passed
-        the filters. qcode may be None, which leaves out the vector half (keyword only)."""
+        the filters. qcode may be None, which leaves out the vector half (keyword only). qvec is the question's 8-bit
+        vector; with it (and vectors in the index) the vector half is re-ranked by cosine similarity."""
         if not self.n:
             return [], 0
         rows = self._rows(domains, concepts)
@@ -364,10 +416,7 @@ class LocalIndex:
             row = int(rows[hit[pos]])
             fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
         if qcode is not None and self.code_bytes:
-            query = _words([qcode[: self.code_bytes].ljust(self.code_bytes, b"\0")], self.code_bytes)[0]
-            distance = _popcount_rows(self.codes[rows] ^ query)
-            for rank, pos in enumerate(self._top(distance, candidates, False)):
-                row = int(rows[pos])
+            for rank, row in enumerate(self.vector_ranking(rows, qcode, qvec, candidates)):
                 fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
         ordered = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
         return ordered, int(len(rows))
@@ -525,7 +574,8 @@ class LocalIndexStore:
 
     # -- reading everything ----------------------------------------------------------------------------------
     def scan(self, keep_text=True):
-        select = ["id", "title", "url", "domain", "concepts", "vec", "tid", "tcnt"] + (["text"] if keep_text else [])
+        select = (["id", "title", "url", "domain", "concepts", "vec", "tid", "tcnt"]
+                  + (["v8"] if settings.local_rescore else []) + (["text"] if keep_text else []))
         for entity in self.chunks.list_entities(select=select, results_per_page=1000):
             yield entity
 
@@ -572,8 +622,10 @@ class LocalIndexManager:
         self._checking = threading.Lock()
         self.on_swap = None  # called after a rebuilt index replaces the old one (the search service clears its answers)
         self.stats = {"loads": 0, "load_seconds": None, "build_seconds": None, "last_error": None, "searches": 0,
-                      "fallbacks": 0, "embed_ms_total": 0.0, "search_ms_total": 0.0, "keyword_only": 0,
-                      "shadow": {"compared": 0, "overlap_sum": 0.0, "top1_same": 0, "failed": 0}}
+                      "fallbacks": 0, "embed_ms_total": 0.0, "search_ms_total": 0.0, "keyword_only": 0, "rescored": 0,
+                      "shadow": {"compared": 0, "overlap_sum": 0.0, "top1_same": 0, "failed": 0,
+                                 "page_overlap_sum": 0.0, "top1_page_same": 0}}
+        self._shadow_diffs = deque(maxlen=SHADOW_DIFFS_KEPT)
         self._stats_lock = threading.Lock()
 
     @property
@@ -672,9 +724,11 @@ class LocalIndexManager:
         threading.Thread(target=work, name="local-index-refresh", daemon=True).start()
 
     # -- numbers for /health -----------------------------------------------------------------------------------
-    def record_search(self, embed_ms, search_ms, keyword_only=False):
+    def record_search(self, embed_ms, search_ms, keyword_only=False, rescored=False):
         with self._stats_lock:
             self.stats["searches"] += 1
+            if rescored:
+                self.stats["rescored"] += 1
             self.stats["embed_ms_total"] += embed_ms
             self.stats["search_ms_total"] += search_ms
             if keyword_only:
@@ -684,12 +738,24 @@ class LocalIndexManager:
         with self._stats_lock:
             self.stats["fallbacks"] += 1
 
-    def record_shadow(self, overlap, top1_same):
+    def record_shadow(self, overlap, top1_same, page_overlap=None, top1_page_same=None, example=None):
+        """One shadow comparison. overlap and top1_same compare chunk ids; page_overlap and top1_page_same compare
+        pages (a different chunk of the same page is the same answer to a visitor). example, kept when the top
+        pages differ, is what each engine returned, so the difference can be looked at."""
         with self._stats_lock:
             s = self.stats["shadow"]
             s["compared"] += 1
             s["overlap_sum"] += overlap
             s["top1_same"] += 1 if top1_same else 0
+            s["page_overlap_sum"] += overlap if page_overlap is None else page_overlap
+            s["top1_page_same"] += 1 if (top1_same if top1_page_same is None else top1_page_same) else 0
+            if example is not None:
+                self._shadow_diffs.append(example)
+
+    def shadow_diffs(self, limit=10):
+        """The latest comparisons whose top pages differed, newest first."""
+        with self._stats_lock:
+            return list(self._shadow_diffs)[::-1][:max(1, int(limit))]
 
     def record_shadow_failure(self):
         with self._stats_lock:
@@ -721,6 +787,13 @@ class LocalIndexManager:
             "avg_embed_ms": round(s["embed_ms_total"] / n, 1) if s["searches"] else None,
             "avg_search_ms": round(s["search_ms_total"] / n, 2) if s["searches"] else None,
             "keyword_only_searches": s["keyword_only"],
+            "rescoring": {
+                "enabled": settings.local_rescore,
+                "active": bool(index is not None and index.vec8 is not None),
+                "rows_without_vectors": index.rows_without_vectors if index else None,
+                "pool": settings.local_rescore_pool,
+                "rescored_searches": s["rescored"],
+            },
             "fallbacks_to_ai_search": s["fallbacks"],
             "last_error": s["last_error"],
             "shadow": {
@@ -728,5 +801,7 @@ class LocalIndexManager:
                 "failed": shadow["failed"],
                 "average_overlap": round(shadow["overlap_sum"] / compared, 3) if compared else None,
                 "top_result_agrees": round(shadow["top1_same"] / compared, 3) if compared else None,
+                "average_page_overlap": round(shadow["page_overlap_sum"] / compared, 3) if compared else None,
+                "top_page_agrees": round(shadow["top1_page_same"] / compared, 3) if compared else None,
             },
         }

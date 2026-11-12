@@ -151,11 +151,25 @@ questions. If it fails, the search falls back to keywords only (`search_mode` is
 (in all and per domain, a keys-and-domains read that takes a few seconds on a large table) and the messages waiting on the
 queue, which is how a backfill is followed.
 
+**Rescoring.** The 1-bit codes find a shortlist of close chunks quickly but rank close neighbours poorly (many equal
+distances), which showed up as the local search returning a different top result from Azure AI Search. Each table row now
+also holds the chunk's vector at 8 bits a dimension (`v8`, 1,536 bytes), and the search re-ranks the best
+`LOCAL_RESCORE_POOL` (300) chunks by cosine similarity on those vectors before the two halves are fused. On 86,500 chunks of
+1,536 dimensions this adds about 0.3 ms to a search and 133 MB of memory per instance; the table read at load grows by about the
+same again. Turn it off with `LOCAL_RESCORE=false`. It needs the vectors in the table: **run the local backfill again after
+upgrading** (`Start-LocalBackfill` rewrites every row, reusing the stored vectors, so it embeds nothing), and instances reload
+on their own within about 10 minutes of the last batch. Until every row has a vector the search quietly uses the codes alone;
+`/api/health` and `Show-LocalIndex` say which (`rescoring.active`, `rows_without_vectors`), and `Watch-Websearch` shows a
+`Resc` column and checks it. The shadow comparison now also counts agreement by page (a different chunk of the same page is
+the same answer to a visitor) next to the stricter chunk-level numbers, and keeps the latest 25 searches whose top pages
+differed, with what each engine returned: `GET /api/local-index/shadow-diffs` or `Show-ShadowDiffs`. Those are visitors'
+questions, held in memory only, and the route needs the function key.
+
 **Question cache.** Turning a question into a vector is a network call (often 150 ms or more) and the only slow step of a local
-search. Each question is now embedded once, not once per instance: an instance looks in its own memory (20,000 questions,
+search. Each question is now embedded once, not once per instance: an instance looks in its own memory (10,000 questions,
 `EMBED_CACHE_MEMORY_ENTRIES`), then in a table every instance shares (`EMBED_CACHE_TABLE`, default the index table's name
 plus `qcache`), and only then calls the embedding service (with its single flight and cooldown, `EMBED_QUERY_*`). Only the
-question's 1-bit code is kept, 192 bytes for 1536 dimensions, never the question's text; the row key is a hash that
+question's 1-bit code (192 bytes for 1536 dimensions) and its 8-bit vector (1,536 bytes) are kept, never the question's text; the row key is a hash that
 includes the embedding model and its size, so changing the model misses by itself. Questions are matched ignoring case,
 punctuation and extra spaces ("How do I volunteer?" is "how do i volunteer"). Entries older than `EMBED_CACHE_TTL_DAYS` (30;
 0 keeps them) are ignored and replaced. If the table is slow or failing, it is skipped for `EMBED_CACHE_COOLDOWN_SECONDS` (30)
@@ -164,16 +178,16 @@ table off with `EMBED_CACHE_SHARED=false` (memory only). Questions already remem
 endpoint is paused after a failure. `/api/health` and `/api/local-index/status` report `embed_cache`: lookups, the share answered
 without an embedding call, where each was answered, embedding calls and their average time, and the table's errors.
 `POST /api/embed-cache/seed` with `{"questions": [...]}` (up to 500) embeds questions ahead of time, so common ones are never
-waited for. The table grows by about 200 bytes per distinct question and is not purged; delete it any time.
+waited for. The table grows by about 1.8 KB per distinct question and is not purged; delete it any time.
 
 **From PowerShell** (`. .\crawl-helper.ps1`): `Show-LocalIndex -Count` shows the settings in force, what one instance has
 loaded, and the table's rows per domain (`-CountBlobs` adds the stored chunks, slowly, to show how much is copied).
 `Start-LocalBackfill` (or `Start-LocalBackfill muse` for one domain) asks first, queues the copy and refuses to run if
 `LOCAL_INDEX_WRITE` is off; `-Follow` hands over to `Watch-LocalBackfill`, which shows rows, rows added, rows per minute and
-the queue backlog, and stops by itself once the table stops growing and the queue is empty. `Seed-EmbedCache` seeds the question cache from a list or a file (one question per line). `Watch-Websearch` is a health
+the queue backlog, and stops by itself once the table stops growing and the queue is empty. `Seed-EmbedCache` seeds the question cache from a list or a file (one question per line). `Show-ShadowDiffs` lists the latest searches where Azure AI Search and the local index disagreed on the top page. `Watch-Websearch` is a health
 watcher: every poll shows the instance's uptime and process id (a restart is flagged), whether the index is loaded and its
 size, process memory, searches with the average embedding and in-memory search time, fallbacks to Azure AI Search, the
-shadow comparison, the result cache hit rate, keyword-only searches and the question cache hit rate; on Ctrl+C (or after `-Polls N`) it prints a summary with checks. The bars for the
+shadow comparison by page, whether rescoring is active, the result cache hit rate, keyword-only searches and the question cache hit rate; on Ctrl+C (or after `-Polls N`) it prints a summary with checks. The bars for the
 checks (`-InstanceMb`, `-MinCompared`, `-MinOverlap`, `-MinTop`) are yours to choose.
 
 **Memory (measured on synthetic chunks, per 40,000 chunks).** Steady: about 230 MB with text in memory, about 90 MB without.
