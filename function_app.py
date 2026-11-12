@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+import socket
 import time
 from datetime import datetime, timezone
 import azure.functions as func
@@ -9,7 +11,7 @@ from services.config import settings, VERSION
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
-from services.search_service import SearchService, FacetUnavailable, assemble_document, chunk_index
+from services.search_service import SearchService, FacetUnavailable, assemble_document, chunk_index, blob_cache_stats
 from services.urlutil import normalize_url
 from services.crawl_state import CrawlState
 from services.manual_page import build_page_documents
@@ -38,6 +40,20 @@ try:
         queue_processor = QueueProcessor(ontology, storage, searcher, concept_resolver)
 except Exception:
     log.exception("Persistent crawl infrastructure could not initialize")
+
+
+_PROCESS_STARTED = time.time()
+
+
+def process_info():
+    """Who is answering and for how long, so a restart can be seen: uptime drops back to zero and started_at
+    changes. Poll /health and group by instance to tell one instance restarting from instances coming and going."""
+    return {
+        "pid": os.getpid(),
+        "instance": os.getenv("WEBSITE_INSTANCE_ID") or socket.gethostname(),
+        "started_at": datetime.fromtimestamp(_PROCESS_STARTED, timezone.utc).isoformat(),
+        "uptime_seconds": int(time.time() - _PROCESS_STARTED),
+    }
 
 
 def response(data, status=200):
@@ -197,6 +213,8 @@ def health(req):
         "max_pages_per_domain": settings.max_pages,
         "max_crawl_depth": settings.max_crawl_depth,
         "search_mode": "azure_ai_search_hybrid" if settings.search_configured and settings.embedding_configured else "not_configured",
+        "process": process_info(),
+        "blob_cache": blob_cache_stats(),
     })
 
 

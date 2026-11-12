@@ -38,6 +38,33 @@ BLOB_CACHE_SECONDS = int(os.getenv("BLOB_CACHE_SECONDS", "0") or 0)
 BLOB_CACHE_MAX = max(100, int(os.getenv("BLOB_CACHE_MAX_ENTRIES", "1000") or 1000))
 _blob_cache = {}  # blob name -> (expires, text)
 _blob_cache_lock = threading.Lock()
+# Counts for this process, so the cache can be checked from outside (see blob_cache_stats and the /health route).
+# hits: reads answered from memory. misses: cache on, not found or expired. storage_reads: every actual
+# download from Blob Storage, whether or not the cache is on.
+_blob_stats = {"hits": 0, "misses": 0, "storage_reads": 0}
+
+
+def _blob_stat(name):
+    with _blob_cache_lock:
+        _blob_stats[name] += 1
+
+
+def blob_cache_stats():
+    """What the chunk-text cache is doing in this process. Cleared when the process restarts."""
+    with _blob_cache_lock:
+        hits, misses, reads = _blob_stats["hits"], _blob_stats["misses"], _blob_stats["storage_reads"]
+        entries = len(_blob_cache)
+    lookups = hits + misses
+    return {
+        "enabled": BLOB_CACHE_SECONDS > 0,
+        "seconds": BLOB_CACHE_SECONDS,
+        "max_entries": BLOB_CACHE_MAX,
+        "entries": entries,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": round(hits / lookups, 3) if lookups else None,
+        "storage_reads": reads,
+    }
 
 
 def _blob_cache_get(name):
@@ -199,7 +226,11 @@ class SearchService:
         name = "documents/" + str(doc_id) + ".json"
         cached = _blob_cache_get(name)
         if cached is not None:
+            _blob_stat("hits")
             return cached
+        if BLOB_CACHE_SECONDS > 0:
+            _blob_stat("misses")
+        _blob_stat("storage_reads")
         doc = self.storage.get(name)
         if not doc:
             return None
