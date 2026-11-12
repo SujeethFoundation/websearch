@@ -69,6 +69,24 @@ class Settings:
     search_api_key = os.getenv("AZURE_SEARCH_API_KEY", "")
     search_index_name = os.getenv("AZURE_SEARCH_INDEX_NAME", "sf-knowledge-v2")
     search_api_version = os.getenv("AZURE_SEARCH_API_VERSION", "2025-09-01")
+    # Query tuning for cost on the Serverless tier, where each query uses Compute Units. Every default keeps
+    # the behavior the app had before these settings existed. Change one at a time and compare the Compute
+    # Units per search that /health reports (ai_search_compute) and the relevance of the results.
+    #   SEARCH_MAX_TEXT_RECALL: hybridSearch.maxTextRecallSize, how many keyword matches feed the rank fusion.
+    #     The service default is 1,000 and compute scales roughly with it. 0 sends nothing (service default).
+    #   SEARCH_VECTOR_K: nearest neighbours the vector query fetches. 0 keeps max(50, limit * 10).
+    #   SEARCH_COUNT: false stops asking the service to count every match (total_matches is then null).
+    #   SEARCH_FIELDS: comma-separated fields the keyword half searches. Blank searches every searchable field.
+    search_max_text_recall = _int("SEARCH_MAX_TEXT_RECALL", 0, 0, 10000)
+    search_vector_k = _int("SEARCH_VECTOR_K", 0, 0, 1000)
+    search_count = os.getenv("SEARCH_COUNT", "true").strip().lower() in ("1", "true", "yes", "on")
+    search_fields = os.getenv("SEARCH_FIELDS", "").strip()
+    # A search that repeats within SEARCH_CACHE_SECONDS (same question once case, spacing and trailing punctuation
+    # are ignored, same concepts, domains and limit) is answered from memory instead of querying the index again.
+    # 0 turns it off. The index only changes when pages are crawled, so a few minutes of reuse is safe; another
+    # instance can serve an older answer for up to this long after a crawl. Each entry is roughly 10 KB.
+    search_cache_seconds = _int("SEARCH_CACHE_SECONDS", 0, 0, 86400)
+    search_cache_max_entries = _int("SEARCH_CACHE_MAX_ENTRIES", 500, 10, 100000)
     search_batch_size = max(1, min(int(os.getenv("AZURE_SEARCH_BATCH_SIZE", "100")), 500))
     # The vector field that receives chunk vectors and is searched. To move to a compressed field in the same
     # index, add that field to the index definition, point AZURE_SEARCH_VECTOR_FIELD at it, and list the old field

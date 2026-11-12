@@ -1,5 +1,6 @@
 """Azure AI Search indexing and hybrid retrieval; Blob Storage remains canonical."""
 import base64
+import copy
 import hashlib
 import logging
 import os
@@ -65,6 +66,85 @@ def blob_cache_stats():
         "misses": misses,
         "hit_rate": round(hits / lookups, 3) if lookups else None,
         "storage_reads": reads,
+    }
+
+
+# Compute Units the service reports for each request (the x-ms-azs-compute-units-consumed header, present on the
+# Serverless tier). Counted per label for this process so the cost of one kind of request can be read from
+# /health without a log query. Every response counts, including the ones that are retried.
+_cu_stats = {}
+_cu_lock = threading.Lock()
+
+
+def _record_compute_units(label, response):
+    raw = None
+    try:
+        raw = response.headers.get("x-ms-azs-compute-units-consumed")
+    except Exception:
+        pass
+    with _cu_lock:
+        row = _cu_stats.setdefault(label, {"requests": 0, "with_header": 0, "total": 0.0, "max": 0.0})
+        row["requests"] += 1
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return
+        row["with_header"] += 1
+        row["total"] += value
+        row["max"] = max(row["max"], value)
+
+
+def compute_unit_stats():
+    """Compute Units per kind of request since this process started. average is per request that reported one."""
+    with _cu_lock:
+        out = {}
+        for label, row in sorted(_cu_stats.items()):
+            counted = row["with_header"]
+            out[label] = {
+                "requests": row["requests"],
+                "reported": counted,
+                "total": round(row["total"], 3),
+                "average": round(row["total"] / counted, 3) if counted else None,
+                "max": round(row["max"], 3) if counted else None,
+            }
+        return out
+
+
+# Set when the service rejects the hybridSearch option, so later searches stop sending it.
+_hybrid_option_rejected = [False]
+
+# Search results kept for SEARCH_CACHE_SECONDS (off by default). Keyed on the normalized question, the concepts, the
+# domains and the limit. Each entry remembers the Compute Units its query used, so /health can say how many a hit
+# saved. Failed searches and searches that found nothing are never kept.
+_query_cache = {}  # key -> (expires, result, compute_units or None)
+_query_stats = {"hits": 0, "misses": 0, "saved": 0.0}
+_query_lock = threading.Lock()
+
+
+def normalize_query(query):
+    """Case, spacing and trailing punctuation do not change what is asked. Digits and words always do."""
+    text = " ".join(str(query or "").lower().split())
+    return text.strip(" \"'?!.,;:")
+
+
+def _query_cache_clear():
+    with _query_lock:
+        _query_cache.clear()
+
+
+def query_cache_stats():
+    with _query_lock:
+        hits, misses, saved, entries = _query_stats["hits"], _query_stats["misses"], _query_stats["saved"], len(_query_cache)
+    lookups = hits + misses
+    return {
+        "enabled": settings.search_cache_seconds > 0,
+        "seconds": settings.search_cache_seconds,
+        "max_entries": settings.search_cache_max_entries,
+        "entries": entries,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": round(hits / lookups, 3) if lookups else None,
+        "compute_units_saved": round(saved, 3),
     }
 
 
@@ -140,7 +220,7 @@ class SearchService:
         return (f"{settings.search_endpoint}/indexes/{settings.search_index_name}/docs/"
                 f"{suffix}?api-version={settings.search_api_version}")
 
-    def _post(self, kind, payload, timeout, attempts=6, max_wait=60):
+    def _post(self, kind, payload, timeout, attempts=6, max_wait=60, label=None):
         """POST to the index with backoff when the service is busy (429, 502, 503, 504) or the
         connection drops. Honors Retry-After. Returns the final response; callers check it."""
         response = None
@@ -152,6 +232,7 @@ class SearchService:
                     raise
                 time.sleep(min(2 ** attempt, max_wait))
                 continue
+            _record_compute_units(label or ("write" if kind == "index" else "other"), response)
             if response.status_code in (429, 502, 503, 504) and attempt < attempts - 1:
                 try:
                     wait = float(response.headers.get("Retry-After", 2 ** (attempt + 1)))
@@ -180,6 +261,7 @@ class SearchService:
                 final[item.get("key")] = item
                 if not item.get("status") and item.get("statusCode") in (429, 503):
                     retry_ids.add(item.get("key"))
+            _query_cache_clear()  # the index changed: answers kept on this instance may be out of date
             if not retry_ids or round_number == rounds - 1:
                 break
             pending = [a for a in pending if str(a.get("id")) in retry_ids]
@@ -349,7 +431,7 @@ class SearchService:
         began = time.perf_counter()
         response = self._post("search", {
             "search": "*", "filter": filter_expr, "top": 1000, "select": select,
-        }, 45, attempts=3, max_wait=5)
+        }, 45, attempts=3, max_wait=5, label="page_chunks")
         response.raise_for_status()
         rows = response.json().get("value", [])
         found = len(rows)
@@ -574,13 +656,29 @@ class SearchService:
         safe = [str(x).replace("'", "''") for x in values if str(x)]
         return ",".join(safe)
 
-    def search(self, query, concepts=None, domains=None, limit=5):
+    def search(self, query, concepts=None, domains=None, limit=5, label="query"):
         concepts = sorted({str(x).lower() for x in (concepts or [])})
         domains = sorted({str(x).lower() for x in (domains or [])})
         if not concepts or not domains:
             raise ValueError("Search requires ontology-resolved concepts and domains.")
         if not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
+        cache_key = None
+        if settings.search_cache_seconds > 0:
+            cache_key = (normalize_query(query), tuple(concepts), tuple(domains), int(limit))
+            now = time.monotonic()
+            with _query_lock:
+                entry = _query_cache.get(cache_key)
+                if entry and entry[0] > now:
+                    _query_stats["hits"] += 1
+                    _query_stats["saved"] += entry[2] or 0.0
+                    cached = copy.deepcopy(entry[1])
+                else:
+                    cached = None
+                    _query_stats["misses"] += 1
+            if cached is not None:
+                cached["query"] = query  # the caller's own wording, not the first asker's
+                return cached
         domain_values = self._odata_values(domains)
         concept_values = self._odata_values(concepts)
         filter_expr = (
@@ -595,13 +693,24 @@ class SearchService:
                 "kind": "text",
                 "text": query,
                 "fields": settings.search_vector_field,
-                "k": max(50, limit * 10),
+                "k": max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10),
             }],
             "select": "id,title,url,domain,concepts" if settings.search_blob_backed else "id,title,url,domain,concepts,content",
             "top": limit,
-            "count": True,
         }
-        response = self._post("search", body, 45, attempts=3, max_wait=5)
+        if settings.search_count:
+            body["count"] = True
+        if settings.search_fields:
+            body["searchFields"] = settings.search_fields
+        if settings.search_max_text_recall and not _hybrid_option_rejected[0]:
+            body["hybridSearch"] = {"maxTextRecallSize": settings.search_max_text_recall}
+        response = self._post("search", body, 45, attempts=3, max_wait=5, label=label)
+        if response.status_code == 400 and "hybridSearch" in body:
+            # An API version or service that does not accept the option must not break search.
+            log.warning("Azure AI Search rejected hybridSearch.maxTextRecallSize; searching without it")
+            _hybrid_option_rejected[0] = True
+            body.pop("hybridSearch")
+            response = self._post("search", body, 45, attempts=3, max_wait=5, label=label)
         response.raise_for_status()
         payload = response.json()
         results = []
@@ -619,7 +728,7 @@ class SearchService:
                 "source": "website",
                 "chunk_id": item.get("id"),
             })
-        return {
+        answer = {
             "query": query,
             "count": len(results),
             "total_matches": payload.get("@odata.count"),
@@ -627,6 +736,18 @@ class SearchService:
             "embedding_enabled": True,
             "results": results,
         }
+        if cache_key is not None and results:
+            try:
+                units = float(response.headers.get("x-ms-azs-compute-units-consumed"))
+            except (TypeError, ValueError):
+                units = None
+            with _query_lock:
+                _query_cache[cache_key] = (time.monotonic() + settings.search_cache_seconds, copy.deepcopy(answer), units)
+                limit_entries = settings.search_cache_max_entries
+                if len(_query_cache) > limit_entries:
+                    for old in list(_query_cache)[: max(1, limit_entries // 10)]:
+                        _query_cache.pop(old, None)
+        return answer
 
     @staticmethod
     def _domain_filter(domain):

@@ -11,7 +11,7 @@ from services.config import settings, VERSION
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
-from services.search_service import SearchService, FacetUnavailable, assemble_document, chunk_index, blob_cache_stats
+from services.search_service import SearchService, FacetUnavailable, assemble_document, chunk_index, blob_cache_stats, compute_unit_stats, query_cache_stats
 from services.urlutil import normalize_url
 from services.crawl_state import CrawlState
 from services.manual_page import build_page_documents
@@ -155,7 +155,7 @@ def add_spotlights(result, query, resolution, selected_domains):
         domains = [d for d in selected_domains if d == "sujeeth.org"]
         if not domains:
             return
-        found = searcher.search(query, concepts=["spotlight"], domains=domains, limit=SPOTLIGHT_SLOTS * 3)
+        found = searcher.search(query, concepts=["spotlight"], domains=domains, limit=SPOTLIGHT_SLOTS * 3, label="spotlight")
         picked, seen = [], set()
         for item in found.get("results", []):
             key = str(item.get("url") or "").strip().lower()
@@ -183,7 +183,7 @@ def add_best_bets(result, query, concepts, selected_domains):
     try:
         manual_domains = best_bet_domains(ontology.search_manifest(), selected_domains) if BEST_BETS_MAX else []
         if manual_domains:
-            manual = searcher.search(query, concepts=concepts, domains=manual_domains, limit=10)
+            manual = searcher.search(query, concepts=concepts, domains=manual_domains, limit=10, label="best_bets")
             merged = merge_best_bets(result.get("results", []), manual.get("results", []), BEST_BETS_MAX)
             count = sum(1 for x in merged if x.get("best_bet"))
             result["results"] = merged
@@ -215,6 +215,14 @@ def health(req):
         "search_mode": "azure_ai_search_hybrid" if settings.search_configured and settings.embedding_configured else "not_configured",
         "process": process_info(),
         "blob_cache": blob_cache_stats(),
+        "ai_search_compute": compute_unit_stats(),
+        "query_cache": query_cache_stats(),
+        "search_tuning": {
+            "max_text_recall": settings.search_max_text_recall or None,
+            "vector_k": settings.search_vector_k or None,
+            "count": settings.search_count,
+            "search_fields": settings.search_fields or None,
+        },
     })
 
 
