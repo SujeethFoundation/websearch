@@ -141,6 +141,7 @@ def test_each_azure_half_is_the_hybrid_query_with_the_other_half_removed(conf, m
 
 def test_the_full_azure_query_is_unchanged_by_the_refactor(conf, monkeypatch):
     azure_configured(monkeypatch)
+    monkeypatch.setattr(settings, "search_unique_pages", False)       # about the request body; unique pages ask for more
     monkeypatch.setattr(settings, "search_backend", "azure")
     monkeypatch.setattr(settings, "ai_search_writes", True)
     session = AzureSession(hits=[{"id": "p-1", "title": "Mentor", "url": "https://sujeeth.org/m", "domain": "sujeeth.org",

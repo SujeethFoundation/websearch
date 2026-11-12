@@ -491,7 +491,8 @@ class LocalIndex:
         return found / total
 
     def search(self, terms, qcode, domains, concepts, candidates=50, limit=5, qvec=None, text_candidates=None,
-               concept_weights=None, concept_boost=0.0, max_per_page=0, question=None, phrase_boost=0.0, phrase_pool=100):
+               concept_weights=None, concept_boost=0.0, max_per_page=0, question=None, phrase_boost=0.0, phrase_pool=100,
+               unique_pages=False):
         """(hits, matching) where hits is [(row, score), ...] best first and matching counts the chunks that passed
         the filters. qcode may be None, which leaves out the vector half (keyword only). qvec is the question's 8-bit
         vector; with it (and vectors in the index) the vector half is re-ranked by cosine similarity. `candidates` is how
@@ -507,7 +508,7 @@ class LocalIndex:
         word pairs the chunk holds side by side), on the same scale."""
         rows, ordered, _ = self._rank(terms, qcode, domains, concepts, candidates, qvec, text_candidates,
                                       concept_weights, concept_boost, question, phrase_boost, phrase_pool)
-        return self._pick(ordered, limit, max_per_page), int(len(rows))
+        return self._pick(ordered, limit, max_per_page, unique_pages), int(len(rows))
 
     def _rank(self, terms, qcode, domains, concepts, candidates, qvec, text_candidates, concept_weights, concept_boost,
               question=None, phrase_boost=0.0, phrase_pool=100):
@@ -549,8 +550,21 @@ class LocalIndex:
                         fused[row] += phrase_boost * share / (RRF_K + 1)
         return rows, sorted(fused.items(), key=lambda kv: (-kv[1], kv[0])), parts
 
-    def _pick(self, ordered, limit, max_per_page):
-        """The answer from the ranked candidates: the best `limit`, preferring at most max_per_page chunks of a page."""
+    def _pick(self, ordered, limit, max_per_page, unique=False):
+        """The answer from the ranked candidates: the best `limit`, preferring at most max_per_page chunks of a page.
+        With unique, each page appears once, as its best chunk, and the answer is shorter than `limit` when fewer pages
+        match (the www. and bare copies of an address are one page)."""
+        if unique:
+            kept, seen = [], set()
+            for row, score in ordered:
+                page = int(self.page_codes[row])
+                if page in seen:
+                    continue
+                seen.add(page)
+                kept.append((row, score))
+                if len(kept) >= limit:
+                    break
+            return kept
         if max_per_page <= 0:
             return ordered[:limit]
         kept, spare, per_page, seen = [], [], {}, set()
@@ -590,7 +604,7 @@ class LocalIndex:
 
     def explain(self, terms, qcode, domains, concepts, expect, candidates=50, limit=5, qvec=None, text_candidates=None,
                 concept_weights=None, concept_boost=0.0, max_per_page=0, max_chunks=6, question=None, phrase_boost=0.0,
-                phrase_pool=100):
+                phrase_pool=100, unique_pages=False):
         """Why a search ranks as it does, and where the page it should have found stands.
 
         expect is a list of pieces of URL. Returns the answer with each result's place in the keyword list and the vector
@@ -623,7 +637,7 @@ class LocalIndex:
                 out.update(deep.get(row, {}))
             return out
 
-        answer = [describe(row) for row, _ in self._pick(ordered, limit, max_per_page)]
+        answer = [describe(row) for row, _ in self._pick(ordered, limit, max_per_page, unique_pages)]
         pieces = [str(e).lower() for e in (expect or []) if str(e).strip()]
         wanted = [i for i, url in enumerate(self.urls) if any(p in url.lower() for p in pieces)] if pieces else []
         passing = set(int(r) for r in rows.tolist())

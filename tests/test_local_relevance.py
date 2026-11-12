@@ -161,7 +161,7 @@ def test_the_service_applies_the_settings_and_reports_how_it_ranked(conf, monkey
     answer = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, concept_weights=OWN)
     assert answer["results"][0]["chunk_id"] == "page1-0"
     assert answer["ranking"] == {"question_concepts": {"career_mentor": 1.1, "week_4": 1.2}, "concept_boost": 1.0,
-                                 "phrase_boost": 0.0, "max_per_page": 2}
+                                 "phrase_boost": 0.0, "max_per_page": 2, "unique_pages": True}
     monkeypatch.setattr(settings, "local_concept_boost", 0.0)
     off = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, concept_weights=OWN)
     assert off["results"][0]["chunk_id"] != "page1-0" and off["ranking"]["question_concepts"] == {}
@@ -171,7 +171,7 @@ def test_the_shadow_comparison_ranks_the_plain_way_so_it_still_measures_agreemen
     q, docs = week4_corpus()
     svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
     plain = svc._search_local(QUESTION, FILTER, DOMAINS, 5, concept_weights=OWN, parity=True)
-    assert plain["results"][0]["chunk_id"] != "page1-0" and plain["ranking"] == {"question_concepts": {}, "concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0}
+    assert plain["results"][0]["chunk_id"] != "page1-0" and plain["ranking"] == {"question_concepts": {}, "concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0, "unique_pages": True}
 
 
 def test_an_engine_can_be_forced_for_one_search_and_never_falls_back(conf, monkeypatch):
@@ -378,10 +378,10 @@ def test_one_request_can_try_other_ranking_settings(conf, monkeypatch):
     normal = svc.search(WORDS_Q, concepts=["circle"], domains=["sujeeth.org"], limit=3)
     assert normal["results"][0]["chunk_id"] == "page1-0" and normal["ranking"]["phrase_boost"] == 1.0
     off = svc.search(WORDS_Q, concepts=["circle"], domains=["sujeeth.org"], limit=3, ranking={"phrase_boost": 0, "max_per_page": "1", "junk": 5})
-    assert off["ranking"] == {"question_concepts": {}, "concept_boost": 1.0, "phrase_boost": 0.0, "max_per_page": 1}
+    assert off["ranking"] == {"question_concepts": {}, "concept_boost": 1.0, "phrase_boost": 0.0, "max_per_page": 1, "unique_pages": True}
     bad = svc.search(WORDS_Q, concepts=["circle"], domains=["sujeeth.org"], limit=3, ranking={"phrase_boost": "lots", "concept_boost": -3})
     assert bad["ranking"]["phrase_boost"] == 1.0 and bad["ranking"]["concept_boost"] == 0.0     # not a number: kept; below zero: zero
-    assert ss.SearchService.ranking_settings({"phrase_boost": 9}, parity=True) == {"concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0}
+    assert ss.SearchService.ranking_settings({"phrase_boost": 9}, parity=True) == {"concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0, "unique_pages": True}
 
 
 def test_tried_settings_are_kept_apart_from_normal_answers(conf, monkeypatch):

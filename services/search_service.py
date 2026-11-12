@@ -15,7 +15,7 @@ from services.config import settings
 from services.embedding_service import EmbeddingService
 from services.http_pool import pooled_session
 from services.local_index import (
-    LocalIndexManager, LocalIndexUnavailable, binary_code, entity_from_search_doc, query_terms, split_chunk_id,
+    LocalIndexManager, LocalIndexUnavailable, binary_code, entity_from_search_doc, page_key, query_terms, split_chunk_id,
 )
 
 log = logging.getLogger("sujeeth-web-search.ai-search")
@@ -789,15 +789,19 @@ class SearchService:
     @staticmethod
     def ranking_settings(overrides=None, parity=False):
         """How the local search ranks beyond the plain fusion: the app's settings, changed by `overrides` for one request
-        ({"concept_boost": 2, "phrase_boost": 0, "max_per_page": 1}), or all off for the shadow comparison."""
+        ({"concept_boost": 2, "phrase_boost": 0, "max_per_page": 1, "unique_pages": false}), or all the boosts off for the
+        shadow comparison (which still returns each page once, as the answer's shape rather than its ranking)."""
         if parity:
-            return {"concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0}
+            return {"concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0, "unique_pages": settings.search_unique_pages}
         out = {"concept_boost": settings.local_concept_boost, "phrase_boost": settings.local_phrase_boost,
-               "max_per_page": settings.local_max_per_page}
+               "max_per_page": settings.local_max_per_page, "unique_pages": settings.search_unique_pages}
         for key, value in (overrides or {}).items():
             if key in out:
                 try:
-                    out[key] = max(0, int(value)) if key == "max_per_page" else max(0.0, float(value))
+                    if key == "unique_pages":
+                        out[key] = (str(value).strip().lower() in ("1", "true", "yes", "on")) if isinstance(value, str) else bool(value)
+                    else:
+                        out[key] = max(0, int(value)) if key == "max_per_page" else max(0.0, float(value))
                 except (TypeError, ValueError):
                     pass
         return out
@@ -868,8 +872,9 @@ class SearchService:
                             _query_cache.pop(old, None)
         return answer
 
-    def _azure_body(self, query, concepts, domains, limit):
-        """The request body of the Azure AI Search hybrid query."""
+    def _azure_body(self, query, concepts, domains, limit, fetch=None):
+        """The request body of the Azure AI Search hybrid query. `fetch` (default `limit`) is how many chunks come back;
+        the vector side's k follows `limit`, so asking for extra chunks does not widen the nearest-neighbour search."""
         domain_values = self._odata_values(domains)
         concept_values = self._odata_values(concepts)
         filter_expr = (
@@ -887,7 +892,7 @@ class SearchService:
                 "k": max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10),
             }],
             "select": "id,title,url,domain,concepts" if settings.search_blob_backed else "id,title,url,domain,concepts,content",
-            "top": limit,
+            "top": fetch or limit,
         }
         if settings.search_count:
             body["count"] = True
@@ -914,8 +919,13 @@ class SearchService:
                  "chunk": r.get("id")} for i, r in enumerate(response.json().get("value", [])[:limit])]
 
     def _search_azure(self, query, concepts, domains, limit, label):
-        """The Azure AI Search hybrid query. Returns (answer, Compute Units the query used or None)."""
-        body = self._azure_body(query, concepts, domains, limit)
+        """The Azure AI Search hybrid query. Returns (answer, Compute Units the query used or None).
+
+        With SEARCH_UNIQUE_PAGES (the default) Azure is asked for more chunks than `limit`, the best chunk of each page is
+        kept and the rest are dropped before any text is read, so the answer is `limit` different pages."""
+        unique = settings.search_unique_pages
+        fetch = min(50, max(limit, limit * settings.search_unique_overfetch)) if unique else limit
+        body = self._azure_body(query, concepts, domains, limit, fetch)
         response = self._post("search", body, 45, attempts=3, max_wait=5, label=label)
         if response.status_code == 400 and "hybridSearch" in body:
             # An API version or service that does not accept the option must not break search.
@@ -927,6 +937,17 @@ class SearchService:
         payload = response.json()
         results = []
         items = payload.get("value", [])
+        if unique:
+            seen, kept = set(), []
+            for item in items:
+                key = page_key(item.get("url")) or str(item.get("id"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                kept.append(item)
+                if len(kept) >= limit:
+                    break
+            items = kept
         texts = self._blob_content([i.get("id") for i in items]) if settings.search_blob_backed else {}
         for item in items:
             text = texts.get(str(item.get("id")), "") if settings.search_blob_backed else (item.get("content") or "")
@@ -946,6 +967,7 @@ class SearchService:
             "total_matches": payload.get("@odata.count"),
             "search_mode": "hybrid",
             "embedding_enabled": True,
+            "unique_pages": unique,
             "results": results,
         }
         try:
@@ -978,7 +1000,7 @@ class SearchService:
         parity=True leaves out what goes beyond Azure AI Search's ranking (the concept bonus and the per-page limit), which
         is what the shadow comparison needs to measure whether the two engines agree."""
         how = self.ranking_settings(ranking, parity)
-        boost, per_page = how["concept_boost"], how["max_per_page"]
+        boost, per_page, unique = how["concept_boost"], how["max_per_page"], how["unique_pages"]
         index = self.local.current()
         terms = query_terms(query)
         began = time.perf_counter()
@@ -1000,7 +1022,7 @@ class SearchService:
                                       text_candidates=settings.local_text_recall or settings.search_max_text_recall or 1000,
                                       concept_weights=concept_weights if boost > 0 else None, concept_boost=boost,
                                       max_per_page=per_page, question=query, phrase_boost=how["phrase_boost"],
-                                      phrase_pool=settings.local_phrase_pool)
+                                      phrase_pool=settings.local_phrase_pool, unique_pages=unique)
         texts = self._local_texts(index, [row for row, _ in hits])
         results = []
         for row, score in hits:
@@ -1025,7 +1047,8 @@ class SearchService:
             "embedding_enabled": not keyword_only,
             "backend": "local",
             "ranking": {"question_concepts": dict(sorted((concept_weights or {}).items())) if boost > 0 else {},
-                        "concept_boost": boost, "phrase_boost": how["phrase_boost"], "max_per_page": per_page},
+                        "concept_boost": boost, "phrase_boost": how["phrase_boost"], "max_per_page": per_page,
+                        "unique_pages": unique},
             "results": results,
         }
 
@@ -1053,10 +1076,11 @@ class SearchService:
                             text_candidates=settings.local_text_recall or settings.search_max_text_recall or 1000,
                             concept_weights=weights if boost > 0 else None, concept_boost=boost,
                             max_per_page=how["max_per_page"], question=query, phrase_boost=how["phrase_boost"],
-                            phrase_pool=settings.local_phrase_pool)
+                            phrase_pool=settings.local_phrase_pool, unique_pages=how["unique_pages"])
         out.update({"query": query, "question_concepts": dict(sorted(weights.items())), "filter_concepts": concepts,
                     "filter_domains": domains, "note": note,
                     "settings": {"concept_boost": boost, "phrase_boost": how["phrase_boost"], "max_per_page": how["max_per_page"],
+                                 "unique_pages": how["unique_pages"],
                                  "rescoring": bool(index.vec8 is not None), "text_in_memory": index.texts is not None,
                                  "text_recall": settings.local_text_recall or settings.search_max_text_recall or 1000}})
         return out

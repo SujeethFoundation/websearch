@@ -195,11 +195,15 @@ chunk is tagged with, weighted by the ontology's confidence, on the scale of a f
 chunks that already matched by keyword or vector; it never adds one that matched nothing. `0` turns it off. The answer reports
 `ranking.question_concepts`.
 
-**One page cannot fill the answer.** A search returns at most five results, and four chunks of one page left one slot for
-everything else. Now at most `LOCAL_MAX_PER_PAGE` (2) chunks of a page are returned while other pages have something to offer (`0` removes the
-limit); when too few pages match to fill the answer, the remaining places go to further chunks of the same pages, so an answer
-is never shorter than before. A page crawled both as `www.sujeeth.org/...` and `sujeeth.org/...` counts as one page whose chunks are
-returned once each.
+**Every result is a different page.** A search returns at most five results, and chunks of one page used to take several of them.
+With `SEARCH_UNIQUE_PAGES` (on by default) a page appears once, as its best chunk, in both engines, and the `www.` and bare
+copies of an address (`www.sujeeth.org/circle` and `sujeeth.org/circle/`) are one page. An answer holds fewer than `limit` results
+only when fewer pages match. Azure AI Search returns chunks, so it is asked for `SEARCH_UNIQUE_OVERFETCH` (6) times as many, at
+most 50, and the best chunk of each page is kept before any text is read from storage (the vector search still uses the
+requested limit). Best bets and spotlights are placed first, and a page they share with the ordinary results appears once, as
+the curated copy. `"ranking": {"unique_pages": false}` on one request (or `SEARCH_UNIQUE_PAGES=false`) allows repeats again,
+and then `LOCAL_MAX_PER_PAGE` (2) prefers at most that many chunks of a page, refilling with repeats if too few pages match.
+The shadow comparison returns each page once on both sides.
 
 **Words side by side.** Keyword scoring ignores word order: "114 students completed Career Circles" scores like the same words
 scattered over a page. A chunk whose text or title holds the question's neighbouring words next to each other now gets a

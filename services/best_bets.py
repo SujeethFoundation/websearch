@@ -6,6 +6,9 @@ max_best + limit links.
 """
 
 
+from services.local_index import page_key
+
+
 def best_bet_domains(search_manifest, selected_domains):
     """Selected domains that the ontology marks manual_only."""
     selected = {str(x).lower() for x in (selected_domains or [])}
@@ -19,7 +22,21 @@ def best_bet_domains(search_manifest, selected_domains):
 
 
 def _identity(item):
-    return str(item.get("url") or "").strip().lower()
+    """One key for a page however it was reached: no scheme, no www., no fragment, no trailing slash, lower case."""
+    return page_key(item.get("url")).lower()
+
+
+def unique_pages(items):
+    """The items with each page once: the first of any that share a page (www. and bare addresses are one page)."""
+    seen, out = set(), []
+    for item in items or []:
+        key = _identity(item) or str(item.get("chunk_id") or "")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(item)
+    return out
 
 
 def merge_best_bets(results, manual_results, max_best=3):

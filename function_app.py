@@ -18,7 +18,7 @@ from services.crawl_state import CrawlState
 from services.manual_page import build_page_documents
 from services.page_fetch import fetch_page, PageFetchError
 from services.page_extract import infer_description
-from services.best_bets import best_bet_domains, merge_best_bets
+from services.best_bets import _identity as _page_identity, best_bet_domains, merge_best_bets, unique_pages
 
 # The Azure SDKs log every request and every response at INFO: two multi-line records per storage or table
 # call. At hundreds of thousands of calls a day that floods the logs and the monitoring bill. Warnings and
@@ -151,6 +151,10 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ba
     })
     add_best_bets(result, query, resolution["matched_concepts"], selected_domains)
     add_spotlights(result, query, resolution, selected_domains)
+    # Best bets and spotlights are placed first; whatever page they share with the ordinary results appears once.
+    if settings.search_unique_pages:
+        result["results"] = unique_pages(result.get("results"))
+        result["count"] = len(result["results"])
     return result
 
 
@@ -176,14 +180,14 @@ def add_spotlights(result, query, resolution, selected_domains):
         found = searcher.search(query, concepts=["spotlight"], domains=domains, limit=SPOTLIGHT_SLOTS * 3, label="spotlight")
         picked, seen = [], set()
         for item in found.get("results", []):
-            key = str(item.get("url") or "").strip().lower()
+            key = _page_identity(item)
             if not key or key in seen:
                 continue
             seen.add(key)
             picked.append({**item, "spotlight": True})
             if len(picked) >= SPOTLIGHT_SLOTS:
                 break
-        keep = [x for x in result.get("results", []) if str(x.get("url") or "").strip().lower() not in seen]
+        keep = [x for x in result.get("results", []) if _page_identity(x) not in seen]
         result["results"] = picked + keep
         result["count"] = len(result["results"])
         result["spotlights"] = {"status": "applied" if picked else "no_match", "count": len(picked), "max": SPOTLIGHT_SLOTS}

@@ -51,7 +51,8 @@ def service(monkeypatch):
     monkeypatch.setattr(settings, "search_endpoint", "https://example.search.windows.net")
     monkeypatch.setattr(settings, "search_api_key", "k")
     monkeypatch.setattr(settings, "search_configured", True)  # computed once at import from the environment
-    for name, value in (("search_max_text_recall", 0), ("search_vector_k", 0), ("search_count", True), ("search_fields", "")):
+    for name, value in (("search_max_text_recall", 0), ("search_vector_k", 0), ("search_count", True), ("search_fields", ""),
+                        ("search_unique_pages", False)):   # these tests are about the request body; unique pages ask for more
         monkeypatch.setattr(settings, name, value)
     svc = ss.SearchService.__new__(ss.SearchService)
     svc.storage = None
