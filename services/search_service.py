@@ -931,7 +931,8 @@ class SearchService:
         began = time.perf_counter()
         qcode, keyword_only = None, False
         try:
-            qcode = binary_code(self.embedder.embed_query(query))
+            get_code = getattr(self.embedder, "embed_query_code", None)
+            qcode = get_code(query) if get_code else binary_code(self.embedder.embed_query(query))
         except Exception as exc:
             keyword_only = True
             log.warning("Search question could not be embedded (%s); searching by keywords only", type(exc).__name__)

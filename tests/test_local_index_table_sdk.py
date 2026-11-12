@@ -105,3 +105,35 @@ def test_counts_by_domain_work_against_the_real_sdk(store):
     store.upsert_entities([li.entity_from_search_doc(doc("p1", n)) for n in range(3)]
                           + [li.entity_from_search_doc(doc("p2", n, domain="themuse.com")) for n in range(2)])
     assert store.counts_by_domain() == {"sujeeth.org": 3, "themuse.com": 2}
+
+
+def test_question_codes_round_trip_through_the_real_sdk(monkeypatch):
+    import time as _time
+    from services import query_code_cache as qc
+    monkeypatch.setattr(li.settings, "embed_cache_ttl_days", 30, raising=False)
+    cache = qc.QueryCodeCache(connection_string=CONNECTION, table_name="qcachetest" + uuid.uuid4().hex[:8])
+    code = bytes(range(192))
+    assert cache.get("how do i volunteer", "m", 1536) is None                     # a clean miss, not an error
+    cache.put("how do i volunteer", code, "m", 1536, wait=True)
+    assert cache.get("how do i volunteer", "m", 1536) == code                      # bytes survive the table
+    assert cache.get("how do i volunteer", "other-model", 1536) is None
+    assert cache.stats["errors"] == 0 and cache.stats["hits"] == 1
+    monkeypatch.setattr(li.settings, "embed_cache_ttl_days", 1e-9, raising=False)
+    _time.sleep(0.01)
+    assert cache.get("how do i volunteer", "m", 1536) is None and cache.stats["expired"] == 1
+
+
+def test_an_unreachable_table_is_given_up_on_quickly(monkeypatch):
+    import time as _time
+    from services import query_code_cache as qc
+    monkeypatch.setattr(li.settings, "embed_cache_read_timeout", 0.3, raising=False)
+    monkeypatch.setattr(li.settings, "embed_cache_cooldown", 30, raising=False)
+    dead = "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;TableEndpoint=http://127.0.0.1:1/devstoreaccount1/;"
+    cache = qc.QueryCodeCache(connection_string=dead, table_name="qcachedead")
+    began = _time.perf_counter()
+    assert cache.get("anything", "m", 1536) is None
+    first = _time.perf_counter() - began
+    began = _time.perf_counter()
+    assert cache.get("anything again", "m", 1536) is None
+    assert first < 5 and _time.perf_counter() - began < 0.05                      # the second is skipped, not waited on
+    assert cache.stats["errors"] == 1 and cache.stats["skipped"] == 1

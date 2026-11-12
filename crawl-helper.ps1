@@ -30,6 +30,7 @@
 #     Start-LocalBackfill        copy every stored chunk into the table; asks first (Start-LocalBackfill muse for one domain; -Follow watches it fill)
 #     Watch-LocalBackfill        follow a backfill: rows, rows added, rows per minute, queue backlog (-CountBlobs for a progress bar and ETA)
 #     Watch-Websearch            health watcher: per instance uptime and restarts, index loaded and size, memory, searches and timings, shadow comparison, cache; a summary with checks on Ctrl+C
+#     Seed-EmbedCache            embed common questions ahead of time into the shared question cache (Seed-EmbedCache "How do I volunteer?"; or -Path file.txt, one per line)
 #     Watch-Websearch -Every 5 -Polls 120 -InstanceMb 2048 -MinCompared 300 -MinOverlap 0.6 -MinTop 0.5     (the bars for the checks are yours to choose)
 
 # Run as a normal script, the commands below would vanish when the script ends. Stop early and say how to load it.
@@ -532,6 +533,11 @@ function Show-LocalIndex([switch]$Count, [switch]$CountBlobs) {
         Write-Host "This instance has not loaded the index yet." -ForegroundColor Yellow
     }
     if ($r.last_error) { Write-Host "Last error: $($r.last_error)" -ForegroundColor Red }
+    $e = $r.embed_cache
+    if ($e -and [int]$e.lookups -gt 0) {
+        Write-Host ("Question cache (this instance): {0:N0} lookups, {1:P0} answered without an embedding call (memory {2:N0}, shared table {3:N0}); {4:N0} embedding calls averaging {5} ms; {6:N0} questions in memory" -f `
+            $e.lookups, [double]$e.hit_rate, $e.memory_hits, $e.shared_hits, $e.embed_calls, (Format-Cell $e.avg_remote_ms), $e.memory_entries)
+    } elseif ($e) { Write-Host "Question cache: no lookups on this instance yet." }
     $rows = $null
     if ($Count) {
         if ($r.table_error) { Write-Warning "The table could not be counted: $($r.table_error)" }
@@ -641,6 +647,29 @@ function Start-LocalBackfill([string]$Domain, [switch]$Follow, [switch]$CountBlo
     else { Write-Host "Follow it with: Watch-LocalBackfill   (add -CountBlobs for a progress bar)" }
 }
 
+function Seed-EmbedCache([string[]]$Question, [string]$Path) {
+    # Embeds questions ahead of time and stores their codes in the shared question cache, so visitors never wait for them.
+    # Already remembered questions are skipped. Up to 500 per call (this sends them in batches of 100).
+    #   Seed-EmbedCache "How do I volunteer?", "How do I donate?"
+    #   Seed-EmbedCache -Path .\common-questions.txt        one question per line
+    $all = @()
+    if ($Question) { $all += $Question }
+    if ($Path) {
+        if (-not (Test-Path $Path)) { Write-Warning "No file at $Path"; return }
+        $all += @(Get-Content $Path | Where-Object { $_ -and $_.Trim() })
+    }
+    $all = @($all | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    if (-not $all.Count) { Write-Warning "Give questions with -Question, or a file with -Path."; return }
+    $total = @{ requested = 0; unique = 0; already_cached = 0; embedded = 0; failed = 0 }
+    for ($i = 0; $i -lt $all.Count; $i += 100) {
+        $batch = @($all[$i..([Math]::Min($i + 99, $all.Count - 1))])
+        $r = Call POST "/api/embed-cache/seed" @{ questions = $batch }
+        if (-not $r -or $r -is [string] -or $null -eq $r.embedded) { Write-Warning "A batch was not seeded. Response: $r"; return }
+        foreach ($k in @($total.Keys)) { $total[$k] += [int]$r.$k }
+    }
+    Write-Host ("Seeded: {0} questions sent, {1} unique, {2} already cached, {3} embedded, {4} failed." -f $total.requested, $total.unique, $total.already_cached, $total.embedded, $total.failed) -ForegroundColor $(if ($total.failed) { "Yellow" } else { "Green" })
+}
+
 function Show-WatchSummary($seen, [int]$InstanceMb, [int]$MinCompared, [double]$MinOverlap, [double]$MinTop, $backend, [int]$restarts, $restartLog) {
     $list = @($seen.Values | ForEach-Object { [pscustomobject]$_ } | Sort-Object First)
     if (-not $list.Count) { Write-Host "`nNo instance answered."; return }
@@ -659,8 +688,17 @@ function Show-WatchSummary($seen, [int]$InstanceMb, [int]$MinCompared, [double]$
     if ($searches -gt 0) {
         $emb = ($list | ForEach-Object { (Get-Num $_.EmbMs) * (Get-Num $_.Searches) } | Measure-Object -Sum).Sum / $searches
         $idx = ($list | ForEach-Object { (Get-Num $_.IdxMs) * (Get-Num $_.Searches) } | Measure-Object -Sum).Sum / $searches
-        Write-Host ("Local searches: {0:N0}   average embedding call {1:N0} ms   average search in memory {2:N2} ms" -f $searches, $emb, $idx)
+        Write-Host ("Local searches: {0:N0}   average question-embedding step {1:N0} ms (cache hits count as about 0)   average search in memory {2:N2} ms" -f $searches, $emb, $idx)
     }
+    $lookups = & $sum "EmbLookups"
+    if ($lookups -gt 0) {
+        $calls = & $sum "EmbCalls"
+        $remote = if ($calls -gt 0) { (& $sum "EmbMsTotal") / $calls } else { 0 }
+        Write-Host ("Question cache: {0:N0} lookups, {1:P0} answered without an embedding call (memory {2:N0}, shared table {3:N0}, joined an in-flight call {4:N0}); {5:N0} embedding calls averaging {6:N0} ms" -f `
+            $lookups, (($lookups - $calls) / $lookups), (& $sum "EmbMem"), (& $sum "EmbShared"), (& $sum "EmbJoined"), $calls, $remote)
+    }
+    $kw = & $sum "Kw"
+    if ($kw -gt 0) { Write-Host ("Keyword-only searches: {0:N0} (the embedding call failed or was too slow, so the vector half was skipped)" -f $kw) -ForegroundColor Yellow }
     $overlap = $null; $top = $null
     if ($shadowN -gt 0) {
         $overlap = ($list | ForEach-Object { (Get-Num $_.Overlap) * (Get-Num $_.ShadowN) } | Measure-Object -Sum).Sum / $shadowN
@@ -686,7 +724,11 @@ function Show-WatchSummary($seen, [int]$InstanceMb, [int]$MinCompared, [double]$
         if ($MinTop -gt 0 -and $null -ne $top) { & $mark ($top -ge $MinTop) ("top result agrees at least {0:N2} (is {1:N3})" -f $MinTop, $top) }
         if (-not $MinOverlap -and $null -ne $overlap) { Write-Host "  [ - ] overlap and top-result agreement are shown above; add -MinOverlap and -MinTop to check them against your own bar" }
     }
-    if ($backend -eq "local") { & $mark ((& $sum "Fallbacks") -eq 0) "no searches fell back to Azure AI Search" }
+    if ($backend -eq "local") {
+        & $mark ((& $sum "Fallbacks") -eq 0) "no searches fell back to Azure AI Search"
+        & $mark ($kw -eq 0) $(if ($kw) { "no searches ran keyword-only: $kw did" } else { "no searches ran keyword-only" })
+    }
+    if ($lookups -gt 0) { & $mark ((& $sum "EmbErr") -eq 0) "the shared question cache table answered without errors" }
 }
 
 function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2048, [int]$MinCompared = 200, [double]$MinOverlap = 0, [double]$MinTop = 0) {
@@ -699,8 +741,8 @@ function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2
     #   Watch-Websearch -InstanceMb 2048 -MinCompared 300 -MinOverlap 0.6 -MinTop 0.5   the bars for the checks (you choose them)
     $seen = @{}; $n = 0; $attempts = 0; $rows = 0; $restarts = 0; $restartLog = @(); $backend = ""
     Write-Host "Watching $script:AzureUrl every $Every s. Ctrl+C stops and prints a summary."
-    $header = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,8} {6,6} {7,6} {8,6} {9,6} {10,4} {11,7} {12,7} {13,5} {14,6}  {15}" -f `
-        "Time", "Instance", "Pid", "Up(s)", "Loaded", "Chunks", "ProcMB", "Srch", "EmbMs", "IdxMs", "Fall", "ShadowN", "Overlap", "Top1", "QCache", "Notes")
+    $header = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,8} {6,6} {7,6} {8,6} {9,6} {10,4} {11,4} {12,7} {13,7} {14,5} {15,6} {16,6}  {17}" -f `
+        "Time", "Instance", "Pid", "Up(s)", "Loaded", "Chunks", "ProcMB", "Srch", "EmbMs", "IdxMs", "Fall", "Kw", "ShadowN", "Overlap", "Top1", "QCache", "EmbHit", "Notes")
     try {
         while ($true) {
             $attempts++
@@ -709,7 +751,7 @@ function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2
                 Write-Host ("{0,-8} poll failed or the app has no process section yet (deploy the health patch)" -f (Get-Date).ToUniversalTime().ToString("HH:mm:ss")) -ForegroundColor Yellow
             } else {
                 $n++
-                $p = $h.process; $l = $h.local_index; $sh = $l.shadow; $qc = $h.query_cache; $az = $h.ai_search_compute.query
+                $p = $h.process; $l = $h.local_index; $sh = $l.shadow; $qc = $h.query_cache; $az = $h.ai_search_compute.query; $ec = $h.embed_cache
                 $backend = "$($h.search_backend)"
                 $name = "$($p.instance)"; $notes = @()
                 if (-not $seen.ContainsKey($name)) {
@@ -730,7 +772,11 @@ function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2
                 if ((Get-Num $l.process_memory_mb) -gt $rec.MaxProc) { $rec.MaxProc = [int](Get-Num $l.process_memory_mb) }
                 $rec.Loads = [int](Get-Num $l.loads); $rec.LoadSecs = $l.load_seconds
                 $rec.Searches = [int](Get-Num $l.searches); $rec.EmbMs = $l.avg_embed_ms; $rec.IdxMs = $l.avg_search_ms
-                $rec.Fallbacks = [int](Get-Num $l.fallbacks_to_ai_search)
+                $rec.Fallbacks = [int](Get-Num $l.fallbacks_to_ai_search); $rec.Kw = [int](Get-Num $l.keyword_only_searches)
+                $rec.EmbLookups = [int](Get-Num $ec.lookups); $rec.EmbMem = [int](Get-Num $ec.memory_hits)
+                $rec.EmbShared = [int](Get-Num $ec.shared_hits); $rec.EmbJoined = [int](Get-Num $ec.coalesced)
+                $rec.EmbCalls = [int](Get-Num $ec.embed_calls); $rec.EmbMsTotal = (Get-Num $ec.avg_remote_ms) * (Get-Num $ec.embed_calls)
+                $rec.EmbErr = [int](Get-Num $ec.shared.errors) + [int](Get-Num $ec.shared.write_errors)
                 $rec.ShadowN = [int](Get-Num $sh.compared); $rec.ShadowFailed = [int](Get-Num $sh.failed)
                 $rec.Overlap = $sh.average_overlap; $rec.Top1 = $sh.top_result_agrees
                 $rec.Err = "$($l.last_error)"
@@ -740,10 +786,11 @@ function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2
                 if ($rows % 20 -eq 0) { Write-Host $header }
                 $rows++
                 $qrate = if ($null -ne $qc.hit_rate) { "{0:P0}" -f [double]$qc.hit_rate } else { "-" }
-                $line = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,8} {6,6} {7,6} {8,6} {9,6} {10,4} {11,7} {12,7} {13,5} {14,6}  {15}" -f `
+                $erate = if ($null -ne $ec.hit_rate) { "{0:P0}" -f [double]$ec.hit_rate } else { "-" }
+                $line = ("{0,-8} {1,-13} {2,5} {3,7} {4,-6} {5,8} {6,6} {7,6} {8,6} {9,6} {10,4} {11,4} {12,7} {13,7} {14,5} {15,6} {16,6}  {17}" -f `
                     (Get-Date).ToUniversalTime().ToString("HH:mm:ss"), (Short-Instance $name), $p.pid, (Format-Cell $p.uptime_seconds), $(if ($l.loaded) { "yes" } else { "no" }),
                     (Format-Cell $l.chunks), (Format-Cell $l.process_memory_mb), (Format-Cell $l.searches), (Format-Cell $l.avg_embed_ms), (Format-Cell $l.avg_search_ms "N2"),
-                    (Format-Cell $l.fallbacks_to_ai_search), (Format-Cell $sh.compared), (Format-Cell $sh.average_overlap "N2"), (Format-Cell $sh.top_result_agrees "N2"), $qrate, ($notes -join "; "))
+                    (Format-Cell $l.fallbacks_to_ai_search), (Format-Cell $l.keyword_only_searches), (Format-Cell $sh.compared), (Format-Cell $sh.average_overlap "N2"), (Format-Cell $sh.top_result_agrees "N2"), $qrate, $erate, ($notes -join "; "))
                 if ($notes -match "RESTART|ERROR") { Write-Host $line -ForegroundColor Red } else { Write-Host $line }
             }
             if ($Polls -gt 0 -and $attempts -ge $Polls) { break }
@@ -754,4 +801,4 @@ function Watch-Websearch([int]$Every = 10, [int]$Polls = 0, [int]$InstanceMb = 2
     }
 }
 
-Write-Host "Loaded. Try: Show-Crawl | Show-CrawlHours | Show-CrawlTags | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain> | Show-LocalIndex -Count | Start-LocalBackfill -Follow | Watch-Websearch"
+Write-Host "Loaded. Try: Show-Crawl | Show-CrawlHours | Show-CrawlTags | Wait-Crawl muse | Show-CrawlPages muse | Start-Crawl <domain> -Wait | Resume-Crawl <domain> | Show-LocalIndex -Count | Start-LocalBackfill -Follow | Seed-EmbedCache | Watch-Websearch"

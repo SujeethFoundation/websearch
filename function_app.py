@@ -196,6 +196,14 @@ def add_best_bets(result, query, concepts, selected_domains):
     result["best_bets"] = {"status": status, "count": count, "max": BEST_BETS_MAX}
 
 
+def _embed_cache_stats():
+    stats = getattr(getattr(searcher, "embedder", None), "cache_stats", None)
+    try:
+        return stats() if stats else None
+    except Exception:
+        return None
+
+
 def index_available():
     """True when there is an index to use: Azure AI Search is configured, or the table takes the writes."""
     return bool(settings.search_configured or settings.local_index_write)
@@ -222,6 +230,7 @@ def health(req):
                         "azure_ai_search_hybrid" if settings.search_configured and settings.embedding_configured else "not_configured"),
         "search_backend": settings.search_backend,
         "local_index": searcher.local.describe(),
+        "embed_cache": _embed_cache_stats(),
         "process": process_info(),
         "blob_cache": blob_cache_stats(),
         "ai_search_compute": compute_unit_stats(),
@@ -1058,6 +1067,7 @@ def local_index_status(req):
     (a read of keys and domains only, a few seconds on a large table) and the messages waiting on the queue, which is
     how a backfill is followed. Each call reaches one instance, so loaded figures differ between calls."""
     out = searcher.local.describe()
+    out["embed_cache"] = _embed_cache_stats()
     if not searcher.local.enabled:
         return response({**out, "error": "Set LOCAL_INDEX_CONNECTION_STRING (or the blob storage connection string) first."}, 503)
     if str(req.params.get("count") or "").lower() in ("1", "true", "yes"):
@@ -1072,6 +1082,21 @@ def local_index_status(req):
         except Exception:
             out["queue_messages"] = None
     return response(out)
+
+
+@app.route(route="embed-cache/seed", methods=["POST"])
+def embed_cache_seed(req):
+    """Embed questions ahead of time and store their codes in the shared question cache, so visitors never wait for them.
+    Body: {"questions": ["How do I volunteer?", ...]} (up to 500 a call). Already remembered questions are skipped."""
+    body = read_body(req)
+    questions = [str(q) for q in (body.get("questions") or []) if str(q).strip()]
+    if not questions:
+        return response({"error": "Send {\"questions\": [\"...\"]}."}, 400)
+    if len(questions) > 500:
+        return response({"error": "Send at most 500 questions a call."}, 400)
+    if not settings.embedding_configured or not hasattr(searcher.embedder, "seed_questions"):
+        return response({"error": "Embeddings are not configured."}, 503)
+    return response({**searcher.embedder.seed_questions(questions), "embed_cache": _embed_cache_stats()})
 
 
 @app.route(route="local-index/reload", methods=["POST"])
