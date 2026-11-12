@@ -444,8 +444,42 @@ class LocalIndex:
                 cover += weight * ((bits[:, b // 64] >> np.uint64(b % 64)) & np.uint64(1)).astype(np.float64)
         return cover / total
 
+    def term_idf(self, word):
+        """(idf, chunks that have the word) for one lower-case word."""
+        df = 0
+        if len(self.vocab):
+            h = np.uint64(term_hash(word))
+            p = int(np.searchsorted(self.vocab, h))
+            if p < len(self.vocab) and self.vocab[p] == h:
+                df = int(self.post_ptr[p + 1] - self.post_ptr[p])
+        return float(np.log(1.0 + (self.n - df + 0.5) / (df + 0.5))), df
+
+    def question_phrases(self, question):
+        """[(pair of neighbouring words from the question, weight), ...]. A pair weighs what its commoner word weighs, so
+        "how many" counts for almost nothing and "students completed" for a lot. Pairs with a word no chunk has are left
+        out: nothing can hold them."""
+        words = tokens(question, False)
+        seen, out = set(), []
+        for a, b in zip(words, words[1:]):
+            if (a, b) in seen or a == b:
+                continue
+            seen.add((a, b))
+            (ia, da), (ib, db) = self.term_idf(a), self.term_idf(b)
+            if da and db:
+                out.append((f"{a} {b}", min(ia, ib)))
+        return out
+
+    def phrase_share(self, row, phrases):
+        """The weighted share (0 to 1) of the question's word pairs that this chunk's title or text holds side by side."""
+        total = sum(w for _, w in phrases)
+        if total <= 0 or self.texts is None:
+            return 0.0
+        hay = (self.titles[row] + " \n " + self.texts[row]).lower()
+        found = sum(w for phrase, w in phrases if phrase in hay or phrase.replace(" ", "-") in hay)
+        return found / total
+
     def search(self, terms, qcode, domains, concepts, candidates=50, limit=5, qvec=None, text_candidates=None,
-               concept_weights=None, concept_boost=0.0, max_per_page=0):
+               concept_weights=None, concept_boost=0.0, max_per_page=0, question=None, phrase_boost=0.0, phrase_pool=100):
         """(hits, matching) where hits is [(row, score), ...] best first and matching counts the chunks that passed
         the filters. qcode may be None, which leaves out the vector half (keyword only). qvec is the question's 8-bit
         vector; with it (and vectors in the index) the vector half is re-ranked by cosine similarity. `candidates` is how
@@ -456,15 +490,19 @@ class LocalIndex:
         question itself named) with concept_boost adds to each candidate concept_boost * (share of those concepts the
         chunk is tagged with) on the scale of a first place in one list. max_per_page prefers at most that many chunks of
         one page (further chunks of a page are used only when too few pages matched to fill the answer), and never
-        returns the same chunk of a page twice (the www. and non-www. copies of a page are one page)."""
+        returns the same chunk of a page twice (the www. and non-www. copies of a page are one page). question (its text)
+        with phrase_boost adds, for the best phrase_pool candidates, phrase_boost * (share of the question's neighbouring
+        word pairs the chunk holds side by side), on the same scale."""
         rows, ordered, _ = self._rank(terms, qcode, domains, concepts, candidates, qvec, text_candidates,
-                                      concept_weights, concept_boost)
+                                      concept_weights, concept_boost, question, phrase_boost, phrase_pool)
         return self._pick(ordered, limit, max_per_page), int(len(rows))
 
-    def _rank(self, terms, qcode, domains, concepts, candidates, qvec, text_candidates, concept_weights, concept_boost):
+    def _rank(self, terms, qcode, domains, concepts, candidates, qvec, text_candidates, concept_weights, concept_boost,
+              question=None, phrase_boost=0.0, phrase_pool=100):
         """(rows that pass the filters, [(row, score), ...] every candidate best first, parts) where parts holds each
-        candidate's 0-based place in the keyword list and the vector list and its share of the question's concepts."""
-        parts = {"keyword": {}, "vector": {}, "share": {}}
+        candidate's 0-based place in the keyword list and the vector list, its share of the question's concepts and
+        its share of the question's word pairs."""
+        parts = {"keyword": {}, "vector": {}, "share": {}, "phrase": {}, "phrases": []}
         if not self.n:
             return np.zeros(0, dtype=np.int64), [], parts
         rows = self._rows(domains, concepts)
@@ -487,6 +525,16 @@ class LocalIndex:
                 if share:
                     parts["share"][row] = share
                     fused[row] += concept_boost * share / (RRF_K + 1)
+        if question and phrase_boost > 0 and fused and self.texts is not None:
+            phrases = self.question_phrases(question)
+            parts["phrases"] = phrases
+            if phrases:
+                best = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))[:max(1, int(phrase_pool))]
+                for row, _ in best:
+                    share = self.phrase_share(row, phrases)
+                    if share:
+                        parts["phrase"][row] = share
+                        fused[row] += phrase_boost * share / (RRF_K + 1)
         return rows, sorted(fused.items(), key=lambda kv: (-kv[1], kv[0])), parts
 
     def _pick(self, ordered, limit, max_per_page):
@@ -529,7 +577,8 @@ class LocalIndex:
         return -_popcount_rows(self.codes[rows] ^ query).astype(np.float32)
 
     def explain(self, terms, qcode, domains, concepts, expect, candidates=50, limit=5, qvec=None, text_candidates=None,
-                concept_weights=None, concept_boost=0.0, max_per_page=0, max_chunks=6):
+                concept_weights=None, concept_boost=0.0, max_per_page=0, max_chunks=6, question=None, phrase_boost=0.0,
+                phrase_pool=100):
         """Why a search ranks as it does, and where the page it should have found stands.
 
         expect is a list of pieces of URL. Returns the answer with each result's place in the keyword list and the vector
@@ -538,8 +587,9 @@ class LocalIndex:
         candidates, in the keyword list and in the vector list, counted over every chunk that passes the filters, not
         only the ones that entered the fusion."""
         rows, ordered, parts = self._rank(terms, qcode, domains, concepts, candidates, qvec, text_candidates,
-                                          concept_weights, concept_boost)
+                                          concept_weights, concept_boost, question, phrase_boost, phrase_pool)
         position = {row: i for i, (row, _) in enumerate(ordered)}
+        phrases = parts["phrases"] or (self.question_phrases(question) if question and self.texts is not None else [])
         score = dict(ordered)
         share_all = {}
 
@@ -553,7 +603,10 @@ class LocalIndex:
                    "score": round(score[row], 6) if row in score else None,
                    "keyword_rank": parts["keyword"][row] + 1 if row in parts["keyword"] else None,
                    "vector_rank": parts["vector"][row] + 1 if row in parts["vector"] else None,
-                   "concept_share": round(share_all.get(row, 0.0), 3)}
+                   "concept_share": round(share_all.get(row, 0.0), 3),
+                   # the share of the question's word pairs the chunk holds; "counted" says whether it earned the bonus
+                   "phrase_share": round(self.phrase_share(row, phrases), 3) if phrases else 0.0,
+                   "phrase_counted": row in parts["phrase"]}
             if deep:
                 out.update(deep.get(row, {}))
             return out
@@ -597,6 +650,7 @@ class LocalIndex:
 
         return {
             "passing_filters": int(len(rows)), "candidates": len(ordered), "answer": answer,
+            "phrases": [{"phrase": p, "weight": round(w, 2)} for p, w in sorted(phrases, key=lambda pw: -pw[1])],
             "expected": {"pieces": pieces, "chunks_in_index": len(wanted), "chunks_passing_filters": len(inside),
                          "best": [describe(i, deep) for i in inside[:max_chunks]],
                          "filtered_out": [why_not(i) for i in outside[:max_chunks]]},

@@ -159,7 +159,8 @@ def test_the_service_applies_the_settings_and_reports_how_it_ranked(conf, monkey
     svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
     answer = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, concept_weights=OWN)
     assert answer["results"][0]["chunk_id"] == "page1-0"
-    assert answer["ranking"] == {"question_concepts": {"career_mentor": 1.1, "week_4": 1.2}, "concept_boost": 1.0, "max_per_page": 2}
+    assert answer["ranking"] == {"question_concepts": {"career_mentor": 1.1, "week_4": 1.2}, "concept_boost": 1.0,
+                                 "phrase_boost": 1.0, "max_per_page": 2}
     monkeypatch.setattr(settings, "local_concept_boost", 0.0)
     off = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, concept_weights=OWN)
     assert off["results"][0]["chunk_id"] != "page1-0" and off["ranking"]["question_concepts"] == {}
@@ -169,7 +170,7 @@ def test_the_shadow_comparison_ranks_the_plain_way_so_it_still_measures_agreemen
     q, docs = week4_corpus()
     svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
     plain = svc._search_local(QUESTION, FILTER, DOMAINS, 5, concept_weights=OWN, parity=True)
-    assert plain["results"][0]["chunk_id"] != "page1-0" and plain["ranking"] == {"question_concepts": {}, "concept_boost": 0.0, "max_per_page": 0}
+    assert plain["results"][0]["chunk_id"] != "page1-0" and plain["ranking"] == {"question_concepts": {}, "concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0}
 
 
 def test_an_engine_can_be_forced_for_one_search_and_never_falls_back(conf, monkeypatch):
@@ -309,3 +310,118 @@ def test_the_explain_route_resolves_the_question_and_reports_the_matches(conf, m
     assert {"concept": "networking", "source": "relationship", "confidence": None} in body["concept_matches"]
     monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: {"matched_concepts": [], "domains": []})
     assert "matched no concepts" in json.loads(call({"query": "zzz"}).get_body())["status"]
+
+
+# ---- words side by side
+
+WORDS_Q = "how many students completed career circles"
+
+
+def phrase_corpus():
+    """Two chunks with the same words. One says 'students completed career circles'; the other scatters them."""
+    q = np.ones(DIMS)
+    filler = [make_doc(i, 0, content=f"many students here how career there completed topic{i} circles", vector=q) for i in range(10, 16)]
+    exact = make_doc(1, 0, title="Annual report", content="this year 114 students completed career circles and how many more", vector=q)
+    loose = make_doc(2, 0, title="Whitepaper", content="how many career paths students choose circles of friends completed forms", vector=q)
+    return q, [loose, exact] + filler
+
+
+def test_a_pair_weighs_what_its_commoner_word_weighs_and_unknown_words_drop_out(conf):
+    q, docs = phrase_corpus()
+    index = index_of(docs)
+    pairs = dict(index.question_phrases(WORDS_Q + " zebra"))
+    assert set(pairs) == {"how many", "many students", "students completed", "completed career", "career circles"}   # no pair with 'zebra'
+    rare = index_of(docs + [make_doc(99, 0, content="unique rareword students")])
+    weights = dict(rare.question_phrases("rareword students many"))
+    assert weights["rareword students"] == pytest.approx(rare.term_idf("students")[0])          # the commoner of the two
+    assert rare.term_idf("rareword")[0] > rare.term_idf("students")[0] and rare.term_idf("nosuchword") == (pytest.approx(rare.term_idf("nosuchword")[0]), 0)
+    assert index.question_phrases("students students") == [] and index.question_phrases("") == []
+
+
+def test_the_share_counts_pairs_found_side_by_side_in_the_text_or_the_title(conf):
+    index = index_of([make_doc(1, 0, title="Thank-you email templates", content="write a good note after the interview", vector=np.ones(DIMS)),
+                      make_doc(2, 0, title="Other", content="email thank someone you often note good", vector=np.ones(DIMS))])
+    pairs = [("thank you", 1.0), ("you email", 1.0), ("good note", 2.0)]
+    assert index.phrase_share(0, pairs) == pytest.approx(1.0)          # 'thank-you' counts as 'thank you'; the title counts
+    assert index.phrase_share(1, pairs) == 0.0                           # the same words, never side by side
+    assert index.phrase_share(0, []) == 0.0
+
+
+def test_the_chunk_that_says_it_in_the_questions_words_ranks_first(conf):
+    q, docs = phrase_corpus()
+    index = index_of(docs)
+    args = (li.query_terms(WORDS_Q), li.binary_code(q), ["sujeeth.org"], ["circle"])
+    kw = dict(candidates=50, limit=3, qvec=li.quantize_int8(q), text_candidates=1000)
+    plain, _ = index.search(*args, **kw)
+    boosted, _ = index.search(*args, question=WORDS_Q, phrase_boost=1.0, **kw)
+    assert ids(index, boosted)[0] == "page1-0" and dict(boosted)[index.ids.index("page1-0")] > dict(plain).get(index.ids.index("page1-0"), 0)
+    assert index.search(*args, question=WORDS_Q, phrase_boost=0.0, **kw)[0] == plain
+
+
+def test_only_the_best_candidates_are_checked_and_no_text_in_memory_means_no_bonus(conf):
+    q, docs = phrase_corpus()
+    index = index_of(docs)
+    args = (li.query_terms(WORDS_Q), li.binary_code(q), ["sujeeth.org"], ["circle"])
+    kw = dict(candidates=50, qvec=li.quantize_int8(q), text_candidates=1000, question=WORDS_Q, phrase_boost=1.0)
+    _, ordered, parts = index._rank(*args[:2], args[2], args[3], 50, kw["qvec"], 1000, None, 0.0, WORDS_Q, 1.0, 1)
+    assert len(parts["phrase"]) <= 1                                    # a pool of one: only the top candidate is looked at
+    without_text = li.LocalIndex([li.row_from_entity(li.entity_from_search_doc(d)) for d in docs], keep_text=False)
+    plain, _ = without_text.search(*args, candidates=50, limit=3, qvec=kw["qvec"], text_candidates=1000)
+    assert without_text.search(*args, limit=3, **kw)[0] == plain
+
+
+def test_one_request_can_try_other_ranking_settings(conf, monkeypatch):
+    q, docs = phrase_corpus()
+    svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
+    normal = svc.search(WORDS_Q, concepts=["circle"], domains=["sujeeth.org"], limit=3)
+    assert normal["results"][0]["chunk_id"] == "page1-0" and normal["ranking"]["phrase_boost"] == 1.0
+    off = svc.search(WORDS_Q, concepts=["circle"], domains=["sujeeth.org"], limit=3, ranking={"phrase_boost": 0, "max_per_page": "1", "junk": 5})
+    assert off["ranking"] == {"question_concepts": {}, "concept_boost": 1.0, "phrase_boost": 0.0, "max_per_page": 1}
+    bad = svc.search(WORDS_Q, concepts=["circle"], domains=["sujeeth.org"], limit=3, ranking={"phrase_boost": "lots", "concept_boost": -3})
+    assert bad["ranking"]["phrase_boost"] == 1.0 and bad["ranking"]["concept_boost"] == 0.0     # not a number: kept; below zero: zero
+    assert ss.SearchService.ranking_settings({"phrase_boost": 9}, parity=True) == {"concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0}
+
+
+def test_tried_settings_are_kept_apart_from_normal_answers(conf, monkeypatch):
+    monkeypatch.setattr(settings, "search_cache_seconds", 60)
+    monkeypatch.setattr(ss, "_query_cache", {})
+    q, docs = phrase_corpus()
+    svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
+    a = svc.search(WORDS_Q, concepts=["circle"], domains=["sujeeth.org"], limit=3)
+    b = svc.search(WORDS_Q, concepts=["circle"], domains=["sujeeth.org"], limit=3, ranking={"phrase_boost": 0})
+    assert a["ranking"]["phrase_boost"] == 1.0 and b["ranking"]["phrase_boost"] == 0.0
+
+
+def test_the_explanation_lists_the_word_pairs_and_each_chunks_share(conf):
+    q, docs = phrase_corpus()
+    svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
+    out = svc.explain_local(WORDS_Q, ["circle"], ["sujeeth.org"], ["sujeeth.org/p1"])
+    assert out["phrases"][0]["weight"] >= out["phrases"][-1]["weight"] and {p["phrase"] for p in out["phrases"]} >= {"students completed", "career circles"}
+    assert out["answer"][0]["chunk"] == "page1-0" and out["answer"][0]["phrase_share"] > 0.7 and out["answer"][0]["phrase_counted"] is True
+    assert out["settings"]["phrase_boost"] == 1.0 and out["settings"]["text_in_memory"] is True
+    off = svc.explain_local(WORDS_Q, ["circle"], ["sujeeth.org"], ["sujeeth.org/p1"], ranking={"phrase_boost": 0})
+    assert off["settings"]["phrase_boost"] == 0.0 and off["answer"][0]["phrase_counted"] is False
+
+
+def test_the_routes_pass_tried_settings_through(conf, monkeypatch):
+    seen = {}
+
+    class Searcher:
+        def search(self, query, **kw):
+            seen.update(kw)
+            return {"query": query, "count": 0, "results": []}
+
+        def explain_local(self, query, concepts, domains, expect, **kw):
+            seen["explain"] = kw
+            return {"answer": []}
+    monkeypatch.setattr(fa, "searcher", Searcher())
+    monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: dict(RESOLUTION))
+    monkeypatch.setattr(fa, "add_best_bets", lambda *a, **k: None)
+    monkeypatch.setattr(fa, "add_spotlights", lambda *a, **k: None)
+    post = lambda route, body: func.HttpRequest("POST", f"/api/{route}", params={}, headers={}, body=json.dumps(body).encode())
+    fa.search_post._function._func(post("search", {"query": "week 4", "ranking": {"phrase_boost": 0}}))
+    assert seen["ranking"] == {"phrase_boost": 0}
+    fa.search_post._function._func(post("search", {"query": "week 4", "ranking": "nonsense"}))
+    assert seen["ranking"] is None
+    fa.search_explain._function._func(post("search/explain", {"query": "week 4", "ranking": {"concept_boost": 2}}))
+    assert seen["explain"]["ranking"] == {"concept_boost": 2}

@@ -5,6 +5,9 @@
     python tests/relevance_eval.py --compare          Azure AI Search and the local index side by side
     python tests/relevance_eval.py --compare --explain    ...and, for each question the local index does not answer first,
                                                       why: where the right page stands in each part of the ranking
+    python tests/relevance_eval.py --compare --try phrase_boost=0
+                                                      ...and a third column: the local index with these ranking settings
+                                                      for this run only (concept_boost, phrase_boost, max_per_page)
 
 The app's address is --url, else WEBSEARCH_URL, else the address crawl-helper.ps1 uses; "https://" is added when left off.
 The Function key is --key, else WEBSEARCH_KEY; with neither it is asked for (hidden), as crawl-helper.ps1 does.
@@ -58,11 +61,25 @@ def summarize(ranks):
     }
 
 
-def search(url, key, question, backend=None, limit=5, timeout=60):
+def parse_trial(pairs):
+    """{'phrase_boost': 0.0, ...} from ['phrase_boost=0', ...]; raises ValueError on anything else."""
+    allowed = ("concept_boost", "phrase_boost", "max_per_page")
+    out = {}
+    for pair in pairs or []:
+        name, eq, value = str(pair).partition("=")
+        if not eq or name.strip() not in allowed:
+            raise ValueError(f"--try takes NAME=VALUE with NAME one of {', '.join(allowed)}; got {pair!r}")
+        out[name.strip()] = float(value)
+    return out
+
+
+def search(url, key, question, backend=None, limit=5, timeout=60, ranking=None):
     """(urls, note): the result URLs in order, and a short note when the search did not complete."""
     body = {"query": question, "limit": limit}
     if backend:
         body["backend"] = backend
+    if ranking:
+        body["ranking"] = ranking
     try:
         request = urllib.request.Request(normalize_url(url) + "/api/search", data=json.dumps(body).encode("utf-8"),
                                          headers={"content-type": "application/json", "x-functions-key": key or ""}, method="POST")
@@ -78,11 +95,13 @@ def search(url, key, question, backend=None, limit=5, timeout=60):
     return [r.get("url") for r in payload.get("results") or []], note
 
 
-def explain(url, key, question, expect, timeout=120):
+def explain(url, key, question, expect, timeout=120, ranking=None):
     """The app's explanation of how the local index ranks a question, or {'error': ...}."""
     try:
-        request = urllib.request.Request(normalize_url(url) + "/api/search/explain",
-                                         data=json.dumps({"query": question, "expect": list(expect or [])}).encode("utf-8"),
+        body = {"query": question, "expect": list(expect or [])}
+        if ranking:
+            body["ranking"] = ranking
+        request = urllib.request.Request(normalize_url(url) + "/api/search/explain", data=json.dumps(body).encode("utf-8"),
                                          headers={"content-type": "application/json", "x-functions-key": key or ""}, method="POST")
         with urllib.request.urlopen(request, timeout=timeout) as reply:
             return json.loads(reply.read().decode("utf-8"))
@@ -106,13 +125,23 @@ def explain_lines(e):
         text += f', vector {place(c.get("vector_rank"))}'
         if deep and c.get("vector_rank") is None and c.get("vector_rank_all"):
             text += f' (place {c["vector_rank_all"]} of all, outside the nearest that count)'
-        return text + f', concept share {c.get("concept_share", 0):.2f}, score {place(c.get("score"))}'
+        return text + (f', concept share {c.get("concept_share", 0):.2f}, word pairs {c.get("phrase_share", 0):.2f}'
+                       + ("" if c.get("phrase_counted", True) or not c.get("phrase_share") else " (not counted: too far down)")
+                       + f', score {place(c.get("score"))}')
 
     own = ", ".join(f"{k} {v:g}" for k, v in (e.get("question_concepts") or {}).items()) or "none"
     related = [m["concept"] for m in e.get("concept_matches") or [] if m.get("source") == "relationship"]
     lines = [f"    the question's own concepts: {own}" + (f"   added by relationship: {', '.join(related)}" if related else ""),
              f"    {e.get('passing_filters', 0):,} chunks pass the filters ({len(e.get('filter_concepts') or [])} concepts, "
              f"{len(e.get('filter_domains') or [])} domains); {e.get('candidates', 0):,} entered the ranking"]
+    s = e.get("settings") or {}
+    if s:
+        lines.append(f"    ranking: concept boost {s.get('concept_boost', 0):g}, phrase boost {s.get('phrase_boost', 0):g}, at most "
+                     f"{s.get('max_per_page', 0)} per page, rescoring {'on' if s.get('rescoring') else 'OFF'}"
+                     + ("" if s.get("text_in_memory", True) else ", text not in memory (no phrase bonus)"))
+    pairs = e.get("phrases") or []
+    if pairs:
+        lines.append("    word pairs it looks for side by side: " + ", ".join(f'"{p["phrase"]}" {p["weight"]:g}' for p in pairs[:5]))
     if e.get("note"):
         lines.append(f"    {e['note']}")
     x = e.get("expected") or {}
@@ -155,6 +184,9 @@ def main(argv=None):
     ap.add_argument("--compare", action="store_true", help="run both engines and show them side by side")
     ap.add_argument("--explain", action="store_true",
                     help="for each question the local index does not answer first, show where the right page stands and why")
+    ap.add_argument("--try", dest="trial", nargs="+", metavar="NAME=VALUE",
+                    help="also run the local index with these ranking settings for this run only, "
+                         "for example --try phrase_boost=0 concept_boost=2 (names: concept_boost, phrase_boost, max_per_page)")
     ap.add_argument("--limit", type=int, default=5)
     args = ap.parse_args(argv)
     args.url = normalize_url(args.url)
@@ -174,8 +206,15 @@ def main(argv=None):
     if first_note.startswith("unreachable:"):
         print(f"Could not reach the app: {first_note[len('unreachable:'):].strip()}\nCheck the address ({args.url}) and that the app is running.")
         return 2
+    try:
+        trial = parse_trial(args.trial)
+    except ValueError as exc:
+        print(exc)
+        return 2
     engines = ["azure", "local"] if args.compare else [args.backend]
     runs = {e or "live": evaluate(gold, lambda q, e=e: search(args.url, args.key, q, e, args.limit)) for e in engines}
+    if trial:
+        runs["try"] = evaluate(gold, lambda q: search(args.url, args.key, q, "local", args.limit, ranking=trial))
     names = list(runs)
     place = lambda r: str(r) if r else "-"
     print(f"{len(gold)} questions from {args.gold}\n")
@@ -192,19 +231,23 @@ def main(argv=None):
         s = summarize([row["rank"] for row in runs[name]])
         print(f"{name:>6}: right page first {s['first']}/{s['questions']}   in the top 3 {s['top3']}/{s['questions']}   "
               f"in the top 5 {s['top5']}/{s['questions']}   mean reciprocal rank {s['mrr']:.3f}")
-    if len(names) == 2:
-        a, b = runs[names[0]], runs[names[1]]
+    if trial:
+        print("   try = the local index with " + ", ".join(f"{k}={v:g}" for k, v in trial.items()) + " for this run only")
+    print()
+    for first, second in zip(names, names[1:]):
+        a, b = runs[first], runs[second]
         better = sum(1 for x, y in zip(a, b) if (y["rank"] or 99) < (x["rank"] or 99))
         worse = sum(1 for x, y in zip(a, b) if (y["rank"] or 99) > (x["rank"] or 99))
-        print(f"\n{names[1]} ranks the right page higher than {names[0]} on {better} question(s), lower on {worse}, the same on {len(gold) - better - worse}.")
+        print(f"{second} ranks the right page higher than {first} on {better} question(s), lower on {worse}, the same on {len(gold) - better - worse}.")
     if args.explain:
-        local_name = "local" if "local" in runs else names[-1]
+        local_name = "try" if "try" in runs else ("local" if "local" in runs else names[-1])
         misses = [(item, row) for item, row in zip(gold, runs[local_name]) if row["rank"] != 1]
         print(f"\nWhy the local index does not put the right page first ({len(misses)} question(s)):" if misses
               else "\nThe local index puts the right page first on every question; nothing to explain.")
         for item, row in misses:
             print(f"\n  {item['question']}   (right page at place {place(row['rank'])})")
-            for line in explain_lines(explain(args.url, args.key, item["question"], item.get("expect"))):
+            for line in explain_lines(explain(args.url, args.key, item["question"], item.get("expect"),
+                                              ranking=trial if local_name == "try" else None)):
                 print(line)
     failed = [row for name in names for row in runs[name] if row["note"]]
     if failed:

@@ -97,7 +97,7 @@ def question_concept_weights(resolution):
     return weights
 
 
-def run_search(query, concepts=None, domains=None, purpose="search", limit=5, backend=None):
+def run_search(query, concepts=None, domains=None, purpose="search", limit=5, backend=None, ranking=None):
     # Every search must resolve concepts and domains through the ontology.
     resolution = concept_resolver.resolve_query(
         query=query,
@@ -140,6 +140,7 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ba
         limit=limit,
         concept_weights=question_concept_weights(resolution),
         backend=backend if backend in ("local", "azure") else None,
+        ranking=ranking if isinstance(ranking, dict) else None,
     )
     result.update({
         "status": "completed",
@@ -290,6 +291,7 @@ def search_post(req):
             purpose=body.get("purpose", "search"),
             limit=limit,
             backend=str(body.get("backend") or "").strip().lower() or None,
+            ranking=body.get("ranking"),
         ))
     except Exception as exc:
         log.exception("Search failed")
@@ -317,7 +319,8 @@ def search_explain(req):
             return response({"query": query, "status": "the ontology matched no concepts or no domains, so nothing is searched",
                              "resolution": resolution})
         out = searcher.explain_local(query, resolution["matched_concepts"], resolution["domains"], expect,
-                                     concept_weights=question_concept_weights(resolution))
+                                     concept_weights=question_concept_weights(resolution),
+                                     ranking=body.get("ranking") if isinstance(body.get("ranking"), dict) else None)
         out["concept_matches"] = [{"concept": m.get("concept_id"), "source": m.get("source"), "confidence": m.get("confidence")}
                                   for m in resolution.get("concept_matches") or []]
         return response(out)

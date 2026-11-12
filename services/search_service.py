@@ -786,10 +786,28 @@ class SearchService:
         safe = [str(x).replace("'", "''") for x in values if str(x)]
         return ",".join(safe)
 
-    def search(self, query, concepts=None, domains=None, limit=5, label="query", concept_weights=None, backend=None):
+    @staticmethod
+    def ranking_settings(overrides=None, parity=False):
+        """How the local search ranks beyond the plain fusion: the app's settings, changed by `overrides` for one request
+        ({"concept_boost": 2, "phrase_boost": 0, "max_per_page": 1}), or all off for the shadow comparison."""
+        if parity:
+            return {"concept_boost": 0.0, "phrase_boost": 0.0, "max_per_page": 0}
+        out = {"concept_boost": settings.local_concept_boost, "phrase_boost": settings.local_phrase_boost,
+               "max_per_page": settings.local_max_per_page}
+        for key, value in (overrides or {}).items():
+            if key in out:
+                try:
+                    out[key] = max(0, int(value)) if key == "max_per_page" else max(0.0, float(value))
+                except (TypeError, ValueError):
+                    pass
+        return out
+
+    def search(self, query, concepts=None, domains=None, limit=5, label="query", concept_weights=None, backend=None,
+               ranking=None):
         """One search. concept_weights ({concept: weight}) names the concepts the question itself matched, which the local
         search ranks higher (see LOCAL_CONCEPT_BOOST). backend ("local" or "azure") answers from that engine whatever
-        SEARCH_BACKEND says, for comparing the two on the same questions; a forced engine never falls back to the other."""
+        SEARCH_BACKEND says, for comparing the two on the same questions; a forced engine never falls back to the other.
+        ranking changes the local ranking settings for this one search (see ranking_settings), for trying values out."""
         concepts = sorted({str(x).lower() for x in (concepts or [])})
         domains = sorted({str(x).lower() for x in (domains or [])})
         if not concepts or not domains:
@@ -809,7 +827,8 @@ class SearchService:
                 pass  # the search below reports it, or falls back to Azure AI Search
         if settings.search_cache_seconds > 0:
             cache_key = (normalize_query(query), tuple(concepts), tuple(domains), int(limit),
-                         tuple(sorted(concept_weights.items())), backend if forced else None)
+                         tuple(sorted(concept_weights.items())), backend if forced else None,
+                         tuple(sorted((str(k), str(v)) for k, v in (ranking or {}).items())))
             now = time.monotonic()
             with _query_lock:
                 generation = _query_generation[0]
@@ -827,7 +846,7 @@ class SearchService:
         answer, units = None, None
         if backend == "local":
             try:
-                answer = self._search_local(query, concepts, domains, limit, concept_weights=concept_weights)
+                answer = self._search_local(query, concepts, domains, limit, concept_weights=concept_weights, ranking=ranking)
             except LocalIndexUnavailable as exc:
                 if forced or not (settings.local_search_fallback and self.configured):
                     raise RuntimeError(f"The local search index is not available: {exc}") from exc
@@ -954,12 +973,12 @@ class SearchService:
             position += batch
         return out
 
-    def _search_local(self, query, concepts, domains, limit, concept_weights=None, parity=False):
+    def _search_local(self, query, concepts, domains, limit, concept_weights=None, parity=False, ranking=None):
         """The same hybrid search, answered from the in-memory index. Raises LocalIndexUnavailable when it is not ready.
         parity=True leaves out what goes beyond Azure AI Search's ranking (the concept bonus and the per-page limit), which
         is what the shadow comparison needs to measure whether the two engines agree."""
-        boost = 0.0 if parity else settings.local_concept_boost
-        per_page = 0 if parity else settings.local_max_per_page
+        how = self.ranking_settings(ranking, parity)
+        boost, per_page = how["concept_boost"], how["max_per_page"]
         index = self.local.current()
         terms = query_terms(query)
         began = time.perf_counter()
@@ -980,7 +999,8 @@ class SearchService:
         hits, matching = index.search(terms, qcode, domains, concepts, candidates=candidates, limit=limit, qvec=qvec,
                                       text_candidates=settings.local_text_recall or settings.search_max_text_recall or 1000,
                                       concept_weights=concept_weights if boost > 0 else None, concept_boost=boost,
-                                      max_per_page=per_page)
+                                      max_per_page=per_page, question=query, phrase_boost=how["phrase_boost"],
+                                      phrase_pool=settings.local_phrase_pool)
         texts = self._local_texts(index, [row for row, _ in hits])
         results = []
         for row, score in hits:
@@ -1005,11 +1025,11 @@ class SearchService:
             "embedding_enabled": not keyword_only,
             "backend": "local",
             "ranking": {"question_concepts": dict(sorted((concept_weights or {}).items())) if boost > 0 else {},
-                        "concept_boost": boost, "max_per_page": per_page},
+                        "concept_boost": boost, "phrase_boost": how["phrase_boost"], "max_per_page": per_page},
             "results": results,
         }
 
-    def explain_local(self, query, concepts, domains, expect, concept_weights=None, limit=5):
+    def explain_local(self, query, concepts, domains, expect, concept_weights=None, limit=5, ranking=None):
         """Why the local search ranks a question as it does, and where the page it should have found stands. Uses the
         same settings as a real local search. Raises LocalIndexUnavailable when the index is not ready."""
         concepts = sorted({str(x).lower() for x in (concepts or [])})
@@ -1025,17 +1045,19 @@ class SearchService:
                 qcode = binary_code(self.embedder.embed_query(query))
         except Exception as exc:
             note = f"The question could not be embedded ({exc.__class__.__name__}), so this is the keyword half only."
-        boost = settings.local_concept_boost
+        how = self.ranking_settings(ranking)
+        boost = how["concept_boost"]
         out = index.explain(query_terms(query), qcode, domains, concepts, expect,
                             candidates=max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10),
                             limit=limit, qvec=qvec,
                             text_candidates=settings.local_text_recall or settings.search_max_text_recall or 1000,
                             concept_weights=weights if boost > 0 else None, concept_boost=boost,
-                            max_per_page=settings.local_max_per_page)
+                            max_per_page=how["max_per_page"], question=query, phrase_boost=how["phrase_boost"],
+                            phrase_pool=settings.local_phrase_pool)
         out.update({"query": query, "question_concepts": dict(sorted(weights.items())), "filter_concepts": concepts,
                     "filter_domains": domains, "note": note,
-                    "settings": {"concept_boost": boost, "max_per_page": settings.local_max_per_page,
-                                 "rescoring": bool(index.vec8 is not None),
+                    "settings": {"concept_boost": boost, "phrase_boost": how["phrase_boost"], "max_per_page": how["max_per_page"],
+                                 "rescoring": bool(index.vec8 is not None), "text_in_memory": index.texts is not None,
                                  "text_recall": settings.local_text_recall or settings.search_max_text_recall or 1000}})
         return out
 

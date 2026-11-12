@@ -201,16 +201,26 @@ limit); when too few pages match to fill the answer, the remaining places go to 
 is never shorter than before. A page crawled both as `www.sujeeth.org/...` and `sujeeth.org/...` counts as one page whose chunks are
 returned once each.
 
-Both go beyond what Azure AI Search does, so the shadow comparison leaves them out and keeps measuring whether the two engines
+**Words side by side.** Keyword scoring ignores word order: "114 students completed Career Circles" scores like the same words
+scattered over a page. A chunk whose text or title holds the question's neighbouring words next to each other now gets a
+bonus: `LOCAL_PHRASE_BOOST` (1.0) times the share of the question's word pairs it holds, on the same scale as the concept bonus.
+Each pair weighs what its commoner word weighs, so "how many" counts for almost nothing and "students completed" for a lot.
+It is checked on the best `LOCAL_PHRASE_POOL` (100) candidates, costs about 0.7 ms a search at 40,000 chunks, and needs the
+chunk text in memory (`LOCAL_INDEX_TEXT_IN_MEMORY=true`, the default). `0` turns it off.
+
+All three go beyond what Azure AI Search does, so the shadow comparison leaves them out and keeps measuring whether the two engines
 agree; whether answers are *better* is measured with questions whose right page is known:
 
     python tests/relevance_eval.py --compare
 
 It reads `WEBSEARCH_URL` and `WEBSEARCH_KEY`, asks every question in `tests/relevance_gold.json` of both engines (`POST /api/search`
 takes `"backend": "local"` or `"azure"` to answer from one engine whatever `SEARCH_BACKEND` is, without falling back to the other),
-and reports how often the right page came first, in the top three and in the top five. Add `--explain` and, for every
+and reports how often the right page came first, in the top three and in the top five. `--try phrase_boost=0 concept_boost=2`
+adds a third column: the local index with those ranking settings for that run only (`POST /api/search` and
+`/api/search/explain` take `"ranking": {"concept_boost": .., "phrase_boost": .., "max_per_page": ..}`), so a value can be
+tried against your questions before it becomes an app setting. Add `--explain` and, for every
 question the local index does not answer first, it asks `POST /api/search/explain` (`{"query": ..., "expect": [...]}`) and prints
-why: the concepts the question named and the ones added by relationship, how many chunks pass the filters, whether the right
+why: the ranking settings in force, the word pairs it looked for, the concepts the question named and the ones added by relationship, how many chunks pass the filters, whether the right
 page is in the index at all, whether the filters leave it out (and for which reason), and where its best chunk stands in the
 keyword list, in the vector list (counted over every chunk that passes, not only those that entered the ranking), and overall. The file ships with seven questions as
 a start; replace them with thirty to fifty that students and mentors really ask.

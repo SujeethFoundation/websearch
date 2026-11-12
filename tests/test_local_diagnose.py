@@ -41,6 +41,7 @@ def test_a_chunk_strong_on_vectors_gets_its_keyword_credit_even_when_its_keyword
 
 
 def test_the_local_search_uses_azures_default_depth_and_follows_search_max_text_recall(conf, monkeypatch):
+    monkeypatch.setattr(settings, "local_phrase_boost", 0.0)          # this test is about the depth alone
     q, docs = depth_corpus()
     svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
     first = lambda: svc.search("alpha common", concepts=["circle"], domains=["sujeeth.org"], limit=2)["results"][0]["chunk_id"]

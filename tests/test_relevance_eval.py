@@ -165,9 +165,47 @@ def test_explain_is_asked_only_for_questions_the_local_index_does_not_answer_fir
     answers = {"first": ["https://a.org/right"], "second": ["https://a.org/wrong", "https://a.org/right"]}
     monkeypatch.setattr(ev, "search", lambda url, key, q, backend=None, limit=5, timeout=60: (answers[q], ""))
     asked = []
-    monkeypatch.setattr(ev, "explain", lambda url, key, q, expect, timeout=120: asked.append((q, list(expect))) or EXPLANATION)
+    monkeypatch.setattr(ev, "explain", lambda url, key, q, expect, timeout=120, ranking=None: asked.append((q, list(expect))) or EXPLANATION)
     gold = tmp_path / "g.json"
     gold.write_text(json.dumps([{"question": "first", "expect": ["right"]}, {"question": "second", "expect": ["right"]}]))
     assert ev.main(["--url", "h", "--key", "k", "--gold", str(gold), "--backend", "local", "--explain"]) == 0
     out = capsys.readouterr().out
     assert asked == [("second", ["right"])] and "second   (right page at place 2)" in out and "place 14:" in out
+
+
+def test_tried_settings_are_parsed_strictly():
+    assert ev.parse_trial(["phrase_boost=0", "concept_boost=2.5", "max_per_page=1"]) == {"phrase_boost": 0.0, "concept_boost": 2.5, "max_per_page": 1.0}
+    assert ev.parse_trial(None) == {}
+    for bad in (["phrase_boost"], ["unknown=1"], ["phrase_boost=lots"]):
+        try:
+            ev.parse_trial(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} should be refused")
+
+
+def test_a_trial_adds_a_column_run_on_the_local_index_with_those_settings(tmp_path, capsys, monkeypatch):
+    calls = []
+
+    def fake(url, key, q, backend=None, limit=5, timeout=60, ranking=None):
+        calls.append((backend, ranking))
+        return (["https://a.org/right"] if ranking else ["https://a.org/wrong", "https://a.org/right"]), ""
+    monkeypatch.setattr(ev, "search", fake)
+    explained = []
+    monkeypatch.setattr(ev, "explain", lambda url, key, q, expect, timeout=120, ranking=None: explained.append(ranking) or EXPLANATION)
+    gold = tmp_path / "g.json"
+    gold.write_text(json.dumps([{"question": "q", "expect": ["right"]}]))
+    assert ev.main(["--url", "h", "--key", "k", "--gold", str(gold), "--compare", "--try", "phrase_boost=0"]) == 0
+    out = capsys.readouterr().out
+    assert ("local", {"phrase_boost": 0.0}) in calls and "try = the local index with phrase_boost=0 for this run only" in out
+    assert "   try: right page first 1/1" in out and "try ranks the right page higher than local on 1 question(s)" in out
+    assert ev.main(["--url", "h", "--key", "k", "--gold", str(gold), "--try", "bogus=1"]) == 2
+
+
+def test_the_explanation_shows_the_ranking_settings_and_the_word_pairs():
+    e = dict(EXPLANATION, settings={"concept_boost": 1.0, "phrase_boost": 1.0, "max_per_page": 2, "rescoring": False, "text_in_memory": True},
+             phrases=[{"phrase": "students completed", "weight": 3.1}, {"phrase": "how many", "weight": 0.4}])
+    e["answer"] = [dict(EXPLANATION["answer"][0], phrase_share=0.6, phrase_counted=True)]
+    text = "\n".join(ev.explain_lines(e))
+    assert "ranking: concept boost 1, phrase boost 1, at most 2 per page, rescoring OFF" in text
+    assert 'word pairs it looks for side by side: "students completed" 3.1, "how many" 0.4' in text and "word pairs 0.60" in text

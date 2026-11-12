@@ -136,6 +136,13 @@ class Settings:
     #   one page, and the same chunk of it is returned once). 0 removes the limit.
     local_concept_boost = _float("LOCAL_CONCEPT_BOOST", 1.0)
     local_max_per_page = _int("LOCAL_MAX_PER_PAGE", 2, 0, 50)
+    # - Keyword scoring ignores word order: "students completed Career Circles" scores like the same four words scattered
+    #   over a page. A chunk whose text or title holds the question's neighbouring words next to each other gets a bonus:
+    #   LOCAL_PHRASE_BOOST times the share of the question's word pairs it holds (each pair weighted by how rare its commoner
+    #   word is, so "how many" counts for almost nothing), on the same scale as the concept bonus. Checked on the best
+    #   LOCAL_PHRASE_POOL candidates; needs the text in memory (LOCAL_INDEX_TEXT_IN_MEMORY). 0 turns it off.
+    local_phrase_boost = _float("LOCAL_PHRASE_BOOST", 1.0)
+    local_phrase_pool = _int("LOCAL_PHRASE_POOL", 100, 10, 1000)
     local_rescore = _flag("LOCAL_RESCORE", True)
     local_rescore_pool = _int("LOCAL_RESCORE_POOL", 300, 20, 5000)
     # Search-question embeddings are remembered so a question is embedded once, not once per instance. Only the 1-bit
