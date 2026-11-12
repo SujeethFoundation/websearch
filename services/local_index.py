@@ -457,28 +457,42 @@ class LocalIndex:
         chunk is tagged with) on the scale of a first place in one list. max_per_page prefers at most that many chunks of
         one page (further chunks of a page are used only when too few pages matched to fill the answer), and never
         returns the same chunk of a page twice (the www. and non-www. copies of a page are one page)."""
+        rows, ordered, _ = self._rank(terms, qcode, domains, concepts, candidates, qvec, text_candidates,
+                                      concept_weights, concept_boost)
+        return self._pick(ordered, limit, max_per_page), int(len(rows))
+
+    def _rank(self, terms, qcode, domains, concepts, candidates, qvec, text_candidates, concept_weights, concept_boost):
+        """(rows that pass the filters, [(row, score), ...] every candidate best first, parts) where parts holds each
+        candidate's 0-based place in the keyword list and the vector list and its share of the question's concepts."""
+        parts = {"keyword": {}, "vector": {}, "share": {}}
         if not self.n:
-            return [], 0
+            return np.zeros(0, dtype=np.int64), [], parts
         rows = self._rows(domains, concepts)
         if not len(rows):
-            return [], 0
+            return rows, [], parts
         fused = {}
         scores = self.keyword_scores(terms)[rows]
         hit = np.flatnonzero(scores > 0)
         for rank, pos in enumerate(self._top(scores[hit], text_candidates or candidates, True)):
             row = int(rows[hit[pos]])
+            parts["keyword"][row] = rank
             fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
         if qcode is not None and self.code_bytes:
             for rank, row in enumerate(self.vector_ranking(rows, qcode, qvec, candidates)):
+                parts["vector"][row] = rank
                 fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
         if concept_weights and concept_boost > 0 and fused:
             cand = np.fromiter(fused.keys(), dtype=np.int64, count=len(fused))
             for row, share in zip(cand.tolist(), self.concept_coverage(cand, concept_weights).tolist()):
                 if share:
+                    parts["share"][row] = share
                     fused[row] += concept_boost * share / (RRF_K + 1)
-        ordered = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))
+        return rows, sorted(fused.items(), key=lambda kv: (-kv[1], kv[0])), parts
+
+    def _pick(self, ordered, limit, max_per_page):
+        """The answer from the ranked candidates: the best `limit`, preferring at most max_per_page chunks of a page."""
         if max_per_page <= 0:
-            return ordered[:limit], int(len(rows))
+            return ordered[:limit]
         kept, spare, per_page, seen = [], [], {}, set()
         for row, score in ordered:
             page = int(self.page_codes[row])
@@ -498,7 +512,95 @@ class LocalIndex:
             # Too few pages matched to fill the answer: give the remaining places to further chunks of the same pages,
             # so the limit only ever trades a repeat for another page, never for an empty place.
             kept = sorted(kept + spare[: limit - len(kept)], key=lambda kv: (-kv[1], kv[0]))
-        return kept, int(len(rows))
+        return kept
+
+    def _vector_closeness(self, rows, qcode, qvec, block=4096):
+        """How close every one of `rows` is to the question (higher is closer): cosine on the 8-bit vectors when the
+        index has them, else minus the Hamming distance of the codes. Worked out a block at a time to stay small."""
+        if qvec is not None and self.vec8 is not None and len(qvec) == self.vec_dims:
+            q = np.frombuffer(qvec, dtype=np.int8).astype(np.float32)
+            norm = float(np.sqrt((q * q).sum())) or 1.0
+            out = np.empty(len(rows), dtype=np.float32)
+            for start in range(0, len(rows), block):
+                part = rows[start:start + block]
+                out[start:start + block] = (self.vec8[part].astype(np.float32) @ q) / (self.norm8[part] * norm)
+            return out
+        query = _words([qcode[: self.code_bytes].ljust(self.code_bytes, b"\0")], self.code_bytes)[0]
+        return -_popcount_rows(self.codes[rows] ^ query).astype(np.float32)
+
+    def explain(self, terms, qcode, domains, concepts, expect, candidates=50, limit=5, qvec=None, text_candidates=None,
+                concept_weights=None, concept_boost=0.0, max_per_page=0, max_chunks=6):
+        """Why a search ranks as it does, and where the page it should have found stands.
+
+        expect is a list of pieces of URL. Returns the answer with each result's place in the keyword list and the vector
+        list and its concept share, and for the expected page: how many of its chunks are in the index, how many pass
+        the filters (with the tags and domain of some that do not), and for its best chunks their place among all
+        candidates, in the keyword list and in the vector list, counted over every chunk that passes the filters, not
+        only the ones that entered the fusion."""
+        rows, ordered, parts = self._rank(terms, qcode, domains, concepts, candidates, qvec, text_candidates,
+                                          concept_weights, concept_boost)
+        position = {row: i for i, (row, _) in enumerate(ordered)}
+        score = dict(ordered)
+        share_all = {}
+
+        def describe(row, deep=None):
+            row = int(row)
+            if row not in share_all and concept_weights:
+                share_all[row] = float(self.concept_coverage(np.array([row]), concept_weights)[0])
+            out = {"chunk": self.ids[row], "title": self.titles[row], "url": self.urls[row],
+                   "domain": self.domain_names[self.domain_codes[row]], "tags": list(self.concepts[row]),
+                   "position": position[row] + 1 if row in position else None,
+                   "score": round(score[row], 6) if row in score else None,
+                   "keyword_rank": parts["keyword"][row] + 1 if row in parts["keyword"] else None,
+                   "vector_rank": parts["vector"][row] + 1 if row in parts["vector"] else None,
+                   "concept_share": round(share_all.get(row, 0.0), 3)}
+            if deep:
+                out.update(deep.get(row, {}))
+            return out
+
+        answer = [describe(row) for row, _ in self._pick(ordered, limit, max_per_page)]
+        pieces = [str(e).lower() for e in (expect or []) if str(e).strip()]
+        wanted = [i for i, url in enumerate(self.urls) if any(p in url.lower() for p in pieces)] if pieces else []
+        passing = set(int(r) for r in rows.tolist())
+        inside = [i for i in wanted if i in passing]
+        outside = [i for i in wanted if i not in passing]
+        deep = {}
+        if inside and len(rows):
+            # Places over every chunk that passes the filters, so a chunk that missed the fusion still shows how far off it is.
+            where = {int(r): pos for pos, r in enumerate(rows.tolist())}
+            kscores = self.keyword_scores(terms)[rows]
+            korder = np.argsort(-kscores, kind="stable")
+            kplace = np.empty(len(rows), dtype=np.int64)
+            kplace[korder] = np.arange(len(rows))
+            vplace = None
+            if qcode is not None and self.code_bytes:
+                closeness = self._vector_closeness(rows, qcode, qvec)
+                vorder = np.argsort(-closeness, kind="stable")
+                vplace = {int(rows[p]): i for i, p in enumerate(vorder.tolist())}
+            for i in inside:
+                pos = where[i]
+                deep[i] = {"keyword_rank_all": int(kplace[pos]) + 1 if kscores[pos] > 0 else None,
+                           "vector_rank_all": vplace[i] + 1 if vplace is not None and i in vplace else None}
+        inside.sort(key=lambda i: (position.get(i, 10 ** 9), deep.get(i, {}).get("vector_rank_all") or 10 ** 9))
+        want_domains = {str(d).lower() for d in domains or []}
+        want_concepts = {str(c).lower() for c in concepts or []}
+
+        def why_not(row):
+            domain = self.domain_names[self.domain_codes[row]]
+            tags = list(self.concepts[row])
+            reasons = []
+            if domain not in want_domains:
+                reasons.append("its domain is not one the ontology chose for this question")
+            if not want_concepts & {t.lower() for t in tags}:
+                reasons.append("it carries none of the question's concepts")
+            return {"chunk": self.ids[row], "url": self.urls[row], "domain": domain, "tags": tags, "why": "; ".join(reasons)}
+
+        return {
+            "passing_filters": int(len(rows)), "candidates": len(ordered), "answer": answer,
+            "expected": {"pieces": pieces, "chunks_in_index": len(wanted), "chunks_passing_filters": len(inside),
+                         "best": [describe(i, deep) for i in inside[:max_chunks]],
+                         "filtered_out": [why_not(i) for i in outside[:max_chunks]]},
+        }
 
     # -- reading pages -----------------------------------------------------------------------------------------
     def row_dict(self, i):

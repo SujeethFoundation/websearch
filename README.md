@@ -208,7 +208,11 @@ agree; whether answers are *better* is measured with questions whose right page 
 
 It reads `WEBSEARCH_URL` and `WEBSEARCH_KEY`, asks every question in `tests/relevance_gold.json` of both engines (`POST /api/search`
 takes `"backend": "local"` or `"azure"` to answer from one engine whatever `SEARCH_BACKEND` is, without falling back to the other),
-and reports how often the right page came first, in the top three and in the top five. The file ships with seven questions as
+and reports how often the right page came first, in the top three and in the top five. Add `--explain` and, for every
+question the local index does not answer first, it asks `POST /api/search/explain` (`{"query": ..., "expect": [...]}`) and prints
+why: the concepts the question named and the ones added by relationship, how many chunks pass the filters, whether the right
+page is in the index at all, whether the filters leave it out (and for which reason), and where its best chunk stands in the
+keyword list, in the vector list (counted over every chunk that passes, not only those that entered the ranking), and overall. The file ships with seven questions as
 a start; replace them with thirty to fifty that students and mentors really ask.
 
 **Question cache.** Turning a question into a vector is a network call (often 150 ms or more) and the only slow step of a local

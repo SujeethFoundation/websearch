@@ -239,3 +239,73 @@ def test_the_search_route_passes_the_weights_and_an_engine_choice(conf, monkeypa
     plain = func.HttpRequest("GET", "/api/search", params={"q": "week 4", "backend": "other"}, headers={}, body=b"")
     fa.search_get._function._func(plain)
     assert seen["backend"] is None
+
+
+# ---- explaining a ranking
+
+def test_the_explanation_matches_the_search_and_says_where_the_expected_page_stands(conf):
+    q, docs = week4_corpus()
+    index = index_of(docs)
+    kw = dict(candidates=50, limit=5, qvec=li.quantize_int8(q), text_candidates=1000)
+    plain = index.explain(li.query_terms(QUESTION), li.binary_code(q), DOMAINS, FILTER, ["sujeeth.org/p1"], **kw)
+    hits, matching = index.search(li.query_terms(QUESTION), li.binary_code(q), DOMAINS, FILTER, **kw)
+    assert [a["chunk"] for a in plain["answer"]] == ids(index, hits) and plain["passing_filters"] == matching == 7
+    best = plain["expected"]["best"][0]
+    assert plain["expected"]["chunks_in_index"] == 1 and plain["expected"]["chunks_passing_filters"] == 1
+    assert best["chunk"] == "page1-0" and best["position"] > 3 and best["concept_share"] == 0.0
+    assert best["keyword_rank_all"] and best["vector_rank_all"] == 7          # the farthest vector of the seven
+    boosted = index.explain(li.query_terms(QUESTION), li.binary_code(q), DOMAINS, FILTER, ["sujeeth.org/p1"],
+                            concept_weights=OWN, concept_boost=1.0, **kw)
+    top = boosted["answer"][0]
+    assert top["chunk"] == "page1-0" and top["position"] == 1 and top["concept_share"] == pytest.approx(1.2 / 2.3, abs=0.001)
+    assert boosted["expected"]["best"][0]["position"] == 1 and top["tags"] == ["week_4", "circle"]
+
+
+def test_the_explanation_says_when_the_filters_leave_the_page_out_or_it_is_not_indexed(conf):
+    q, docs = week4_corpus()
+    docs.append(make_doc(50, 0, title="Week 4 guide", content="week 4 mentor", domain="other.org", concepts=("unrelated",), vector=q))
+    index = index_of(docs)
+    out = index.explain(li.query_terms(QUESTION), li.binary_code(q), DOMAINS, FILTER, ["other.org/p50", "nowhere.example"],
+                        qvec=li.quantize_int8(q))
+    x = out["expected"]
+    assert x["chunks_in_index"] == 1 and x["chunks_passing_filters"] == 0 and x["best"] == []
+    assert "domain is not one the ontology chose" in x["filtered_out"][0]["why"] and "none of the question's concepts" in x["filtered_out"][0]["why"]
+    missing = index.explain(li.query_terms(QUESTION), li.binary_code(q), DOMAINS, FILTER, ["nowhere.example"], qvec=li.quantize_int8(q))
+    assert missing["expected"]["chunks_in_index"] == 0 and missing["answer"]
+
+
+def test_a_chunk_that_missed_the_ranking_still_shows_how_far_off_it_was(conf):
+    q = np.ones(DIMS)
+    docs = [make_doc(777, 0, content="zebra", concepts=("week_4",), vector=-q)]
+    docs += [make_doc(i, 0, content="apple banana", concepts=("networking",), vector=q) for i in range(2, 60)]
+    index = index_of(docs)
+    out = index.explain(li.query_terms("apple"), li.binary_code(q), ["sujeeth.org"], FILTER, ["sujeeth.org/p777"],
+                        candidates=50, qvec=li.quantize_int8(q))
+    best = out["expected"]["best"][0]
+    assert best["position"] is None and best["keyword_rank"] is None and best["keyword_rank_all"] is None
+    assert best["vector_rank"] is None and best["vector_rank_all"] == 59                 # last of the 59 that pass the filters
+
+
+def test_the_service_explains_with_the_settings_a_real_search_uses(conf):
+    q, docs = week4_corpus()
+    svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
+    out = svc.explain_local(QUESTION, FILTER, DOMAINS, ["sujeeth.org/p1"], concept_weights=OWN)
+    answer = svc.search(QUESTION, concepts=FILTER, domains=DOMAINS, limit=5, concept_weights=OWN)
+    assert [a["chunk"] for a in out["answer"]] == [r["chunk_id"] for r in answer["results"]]
+    assert out["question_concepts"] == {"career_mentor": 1.1, "week_4": 1.2} and out["settings"]["concept_boost"] == 1.0
+    assert out["settings"]["rescoring"] is True and out["expected"]["best"][0]["position"] == 1 and out["note"] is None
+
+
+def test_the_explain_route_resolves_the_question_and_reports_the_matches(conf, monkeypatch):
+    q, docs = week4_corpus()
+    svc = make_service(store=filled_store(docs), embedder=VectorEmbedder(q))
+    monkeypatch.setattr(fa, "searcher", svc)
+    resolution = dict(RESOLUTION, matched_concepts=FILTER, domains=DOMAINS)
+    monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: resolution)
+    call = lambda body: fa.search_explain._function._func(func.HttpRequest("POST", "/api/search/explain", params={}, headers={}, body=json.dumps(body).encode()))
+    assert call({}).status_code == 400
+    body = json.loads(call({"query": QUESTION, "expect": "sujeeth.org/p1"}).get_body())
+    assert body["expected"]["chunks_in_index"] == 1 and body["answer"][0]["chunk"] == "page1-0"
+    assert {"concept": "networking", "source": "relationship", "confidence": None} in body["concept_matches"]
+    monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: {"matched_concepts": [], "domains": []})
+    assert "matched no concepts" in json.loads(call({"query": "zzz"}).get_body())["status"]

@@ -296,6 +296,36 @@ def search_post(req):
         return response({"error": str(exc), "stage": "concept_resolution_or_search"}, 502)
 
 
+@app.route(route="search/explain", methods=["POST"])
+def search_explain(req):
+    """Why the local search answers a question as it does, and where the page it should have found stands.
+
+    Body: {"query": "...", "expect": ["piece of the right page's URL", ...]} plus optional concepts and domains, as for a
+    search. Answers from the local index whatever SEARCH_BACKEND is. Reports the question's own concepts, the filters, each
+    result's place in the keyword and vector lists and its concept share, and for the expected page: whether it is in the
+    index, whether the filters let it through (and why not), and how far down its best chunks rank."""
+    body = read_body(req)
+    query = str(body.get("query", "")).strip()
+    if not query:
+        return response({"error": "JSON body requires query"}, 400)
+    expect = body.get("expect") or []
+    expect = [expect] if isinstance(expect, str) else [str(x) for x in expect]
+    try:
+        resolution = concept_resolver.resolve_query(query=query, explicit_concepts=body.get("concepts") or [],
+                                                    explicit_domains=body.get("domains") or [], purpose="search")
+        if not resolution.get("matched_concepts") or not resolution.get("domains"):
+            return response({"query": query, "status": "the ontology matched no concepts or no domains, so nothing is searched",
+                             "resolution": resolution})
+        out = searcher.explain_local(query, resolution["matched_concepts"], resolution["domains"], expect,
+                                     concept_weights=question_concept_weights(resolution))
+        out["concept_matches"] = [{"concept": m.get("concept_id"), "source": m.get("source"), "confidence": m.get("confidence")}
+                                  for m in resolution.get("concept_matches") or []]
+        return response(out)
+    except Exception as exc:
+        log.exception("Explain failed")
+        return response({"error": f"{exc.__class__.__name__}: {exc}"}, 502)
+
+
 @app.route(route="domain-resolution", methods=["POST"])
 def domain_resolution(req):
     """Diagnostic endpoint: performs the same mandatory query-to-concept resolution as search."""

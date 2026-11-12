@@ -1009,6 +1009,36 @@ class SearchService:
             "results": results,
         }
 
+    def explain_local(self, query, concepts, domains, expect, concept_weights=None, limit=5):
+        """Why the local search ranks a question as it does, and where the page it should have found stands. Uses the
+        same settings as a real local search. Raises LocalIndexUnavailable when the index is not ready."""
+        concepts = sorted({str(x).lower() for x in (concepts or [])})
+        domains = sorted({str(x).lower() for x in (domains or [])})
+        weights = {str(c).lower(): float(w) for c, w in (concept_weights or {}).items() if w and float(w) > 0}
+        index = self.local.current()
+        qcode, qvec, note = None, None, None
+        try:
+            get_vectors = getattr(self.embedder, "embed_query_vectors", None)
+            if get_vectors:
+                qcode, qvec = get_vectors(query)
+            else:
+                qcode = binary_code(self.embedder.embed_query(query))
+        except Exception as exc:
+            note = f"The question could not be embedded ({exc.__class__.__name__}), so this is the keyword half only."
+        boost = settings.local_concept_boost
+        out = index.explain(query_terms(query), qcode, domains, concepts, expect,
+                            candidates=max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10),
+                            limit=limit, qvec=qvec,
+                            text_candidates=settings.local_text_recall or settings.search_max_text_recall or 1000,
+                            concept_weights=weights if boost > 0 else None, concept_boost=boost,
+                            max_per_page=settings.local_max_per_page)
+        out.update({"query": query, "question_concepts": dict(sorted(weights.items())), "filter_concepts": concepts,
+                    "filter_domains": domains, "note": note,
+                    "settings": {"concept_boost": boost, "max_per_page": settings.local_max_per_page,
+                                 "rescoring": bool(index.vec8 is not None),
+                                 "text_recall": settings.local_text_recall or settings.search_max_text_recall or 1000}})
+        return out
+
     def _maybe_shadow(self, query, concepts, domains, limit, azure_answer):
         """Run a sample of searches locally too, in the background, and record how closely they agree."""
         sample = settings.local_shadow_sample
