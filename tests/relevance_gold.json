@@ -1,0 +1,19 @@
+[
+  {"question": "What does a mentor do in week 4?",
+   "expect": ["sujeeth.org/circle", "/career/week-4"],
+   "note": "The Career Circle page has the section 'Week 4: Networking Strategies'."},
+  {"question": "What happens in week 1 of Career Circles?",
+   "expect": ["week-1-own-your-story", "sujeeth.org/circle"]},
+  {"question": "How many students completed Career Circles?",
+   "expect": ["AnnualReport"],
+   "note": "Program statistics come from sujeeth.org only."},
+  {"question": "How do I become a mentor?",
+   "expect": ["sujeeth.org/volunteer"],
+   "note": "Check this is the page you want first."},
+  {"question": "How do I prepare for a behavioral interview?",
+   "expect": ["behavioral-interview-questions"]},
+  {"question": "How do I explain a gap on my resume?",
+   "expect": ["explain-a-gap-in-your-resume", "explain-your-employment-gap"]},
+  {"question": "What is a good thank-you email?",
+   "expect": ["thank-you-email-templates", "thankyou-note", "thank-you-email-subject-line"]}
+]

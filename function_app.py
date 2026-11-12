@@ -83,7 +83,21 @@ def read_body(req):
         return {}
 
 
-def run_search(query, concepts=None, domains=None, purpose="search", limit=5):
+def question_concept_weights(resolution):
+    """{concept: weight} for the concepts the question itself named (matched in its words, or passed in by the caller),
+    weighted by how confident the match was. Concepts the ontology added by relationship are left out: they widen which
+    chunks may be returned, but a chunk that only carries those is a weaker answer than one tagged with what was asked."""
+    weights = {}
+    for match in resolution.get("concept_matches") or []:
+        if match.get("source") in ("query_match", "explicit") and match.get("concept_id"):
+            try:
+                weights[str(match["concept_id"]).lower()] = float(match.get("confidence") or 1.0)
+            except (TypeError, ValueError):
+                weights[str(match["concept_id"]).lower()] = 1.0
+    return weights
+
+
+def run_search(query, concepts=None, domains=None, purpose="search", limit=5, backend=None):
     # Every search must resolve concepts and domains through the ontology.
     resolution = concept_resolver.resolve_query(
         query=query,
@@ -124,6 +138,8 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5):
         concepts=resolution["matched_concepts"],
         domains=selected_domains,
         limit=limit,
+        concept_weights=question_concept_weights(resolution),
+        backend=backend if backend in ("local", "azure") else None,
     )
     result.update({
         "status": "completed",
@@ -253,7 +269,7 @@ def search_get(req):
         limit = min(max(int(req.params.get("limit", "5")), 1), 5)
         concepts = [x.strip() for x in (req.params.get("concepts") or "").split(",") if x.strip()]
         domains = [x.strip() for x in (req.params.get("domains") or "").split(",") if x.strip()]
-        return response(run_search(query, concepts, domains, "search", limit))
+        return response(run_search(query, concepts, domains, "search", limit, backend=(req.params.get("backend") or "").strip().lower() or None))
     except Exception as exc:
         log.exception("Search failed")
         return response({"error": str(exc), "stage": "concept_resolution_or_search"}, 502)
@@ -273,6 +289,7 @@ def search_post(req):
             domains=body.get("domains") or [],
             purpose=body.get("purpose", "search"),
             limit=limit,
+            backend=str(body.get("backend") or "").strip().lower() or None,
         ))
     except Exception as exc:
         log.exception("Search failed")

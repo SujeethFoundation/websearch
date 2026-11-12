@@ -134,12 +134,32 @@ def _popcount_rows(words):
     return _POP8[words.view(np.uint8)].sum(axis=1, dtype=np.int32)
 
 
+def page_key(url):
+    """One key for a page however it was reached: no scheme, no leading www., no fragment, no trailing slash, host in
+    lower case. https://www.sujeeth.org/circle/ and http://sujeeth.org/circle#top are the same page."""
+    text = str(url or "").strip().split("#", 1)[0]
+    text = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", text)
+    host, slash, rest = text.partition("/")
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return (host + slash + rest).rstrip("/")
+
+
 def split_chunk_id(chunk_id):
     """('<page id>', number) from '<page id>-<number>'."""
     page_id, _, number = str(chunk_id).rpartition("-")
     if not page_id or not number.isdigit():
         raise ValueError(f"chunk id must look like <page>-<number>: {chunk_id!r}")
     return page_id, int(number)
+
+
+def chunk_number(chunk_id):
+    """The number at the end of a chunk id, or 0 when it has none."""
+    try:
+        return split_chunk_id(chunk_id)[1]
+    except ValueError:
+        return 0
 
 
 def build_entity(doc_id, title, url, domain, concepts, content, vector, title_weight=None):
@@ -229,6 +249,12 @@ class LocalIndex:
         self.domain_names = sorted({r["domain"] for r in usable})
         domain_code = {d: i for i, d in enumerate(self.domain_names)}
         self.domain_codes = np.array([domain_code[r["domain"]] for r in usable], dtype=np.int32)
+        # Which page each chunk belongs to (www. and non-www. copies are one page) and its number on that page, so an
+        # answer can hold a page a limited number of times and never the same chunk of it twice.
+        keys = {}
+        self.page_codes = np.fromiter((keys.setdefault(page_key(u), len(keys)) for u in self.urls), dtype=np.int32, count=n)
+        self.chunk_numbers = np.fromiter((chunk_number(i) for i in self.ids), dtype=np.int32, count=n)
+        self.distinct_pages = len(keys)
         self.concept_names = sorted({c.lower() for r in usable for c in r["concepts"]})
         concept_bit = {c: i for i, c in enumerate(self.concept_names)}
         self.concept_words = max(1, (len(self.concept_names) + 63) // 64)
@@ -404,12 +430,33 @@ class LocalIndex:
         distance = _popcount_rows(self.codes[rows] ^ query)
         return [int(rows[pos]) for pos in self._top(distance, count, False)]
 
-    def search(self, terms, qcode, domains, concepts, candidates=50, limit=5, qvec=None, text_candidates=None):
+    def concept_coverage(self, rows, concept_weights):
+        """For each of `rows`, the share (0 to 1) of the weighted concepts it is tagged with."""
+        total = sum(w for w in concept_weights.values() if w > 0)
+        cover = np.zeros(len(rows), dtype=np.float64)
+        if total <= 0 or not len(rows):
+            return cover
+        bits = self.concept_bits[rows]
+        for concept, weight in concept_weights.items():
+            c = str(concept).lower()
+            if weight > 0 and c in self.concept_names:
+                b = self.concept_names.index(c)
+                cover += weight * ((bits[:, b // 64] >> np.uint64(b % 64)) & np.uint64(1)).astype(np.float64)
+        return cover / total
+
+    def search(self, terms, qcode, domains, concepts, candidates=50, limit=5, qvec=None, text_candidates=None,
+               concept_weights=None, concept_boost=0.0, max_per_page=0):
         """(hits, matching) where hits is [(row, score), ...] best first and matching counts the chunks that passed
         the filters. qcode may be None, which leaves out the vector half (keyword only). qvec is the question's 8-bit
         vector; with it (and vectors in the index) the vector half is re-ranked by cosine similarity. `candidates` is how
         many vector results enter the rank fusion, `text_candidates` (default the same) how many keyword results do: Azure
-        AI Search feeds up to 1,000 keyword results and the nearest k vectors, which the caller can mirror."""
+        AI Search feeds up to 1,000 keyword results and the nearest k vectors, which the caller can mirror.
+
+        Two things go beyond that fusion, both off by default here. concept_weights ({concept: weight}, the concepts the
+        question itself named) with concept_boost adds to each candidate concept_boost * (share of those concepts the
+        chunk is tagged with) on the scale of a first place in one list. max_per_page prefers at most that many chunks of
+        one page (further chunks of a page are used only when too few pages matched to fill the answer), and never
+        returns the same chunk of a page twice (the www. and non-www. copies of a page are one page)."""
         if not self.n:
             return [], 0
         rows = self._rows(domains, concepts)
@@ -424,8 +471,34 @@ class LocalIndex:
         if qcode is not None and self.code_bytes:
             for rank, row in enumerate(self.vector_ranking(rows, qcode, qvec, candidates)):
                 fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
-        ordered = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
-        return ordered, int(len(rows))
+        if concept_weights and concept_boost > 0 and fused:
+            cand = np.fromiter(fused.keys(), dtype=np.int64, count=len(fused))
+            for row, share in zip(cand.tolist(), self.concept_coverage(cand, concept_weights).tolist()):
+                if share:
+                    fused[row] += concept_boost * share / (RRF_K + 1)
+        ordered = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))
+        if max_per_page <= 0:
+            return ordered[:limit], int(len(rows))
+        kept, spare, per_page, seen = [], [], {}, set()
+        for row, score in ordered:
+            page = int(self.page_codes[row])
+            chunk = (page, int(self.chunk_numbers[row]))
+            if chunk in seen:
+                continue                      # the same chunk of the same page (its www. copy): never twice
+            seen.add(chunk)
+            if per_page.get(page, 0) >= max_per_page:
+                if len(spare) < limit:
+                    spare.append((row, score))
+                continue
+            per_page[page] = per_page.get(page, 0) + 1
+            kept.append((row, score))
+            if len(kept) >= limit:
+                break
+        if len(kept) < limit:
+            # Too few pages matched to fill the answer: give the remaining places to further chunks of the same pages,
+            # so the limit only ever trades a repeat for another page, never for an empty place.
+            kept = sorted(kept + spare[: limit - len(kept)], key=lambda kv: (-kv[1], kv[0]))
+        return kept, int(len(rows))
 
     # -- reading pages -----------------------------------------------------------------------------------------
     def row_dict(self, i):

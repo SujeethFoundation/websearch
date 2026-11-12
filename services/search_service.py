@@ -786,12 +786,17 @@ class SearchService:
         safe = [str(x).replace("'", "''") for x in values if str(x)]
         return ",".join(safe)
 
-    def search(self, query, concepts=None, domains=None, limit=5, label="query"):
+    def search(self, query, concepts=None, domains=None, limit=5, label="query", concept_weights=None, backend=None):
+        """One search. concept_weights ({concept: weight}) names the concepts the question itself matched, which the local
+        search ranks higher (see LOCAL_CONCEPT_BOOST). backend ("local" or "azure") answers from that engine whatever
+        SEARCH_BACKEND says, for comparing the two on the same questions; a forced engine never falls back to the other."""
         concepts = sorted({str(x).lower() for x in (concepts or [])})
         domains = sorted({str(x).lower() for x in (domains or [])})
         if not concepts or not domains:
             raise ValueError("Search requires ontology-resolved concepts and domains.")
-        backend = settings.search_backend
+        concept_weights = {str(c).lower(): float(w) for c, w in (concept_weights or {}).items() if w and float(w) > 0}
+        forced = backend in ("local", "azure")
+        backend = backend if forced else settings.search_backend
         if backend != "local" and not self.configured:
             raise RuntimeError("Azure AI Search is not configured.")
         cache_key, generation = None, 0
@@ -803,7 +808,8 @@ class SearchService:
             except LocalIndexUnavailable:
                 pass  # the search below reports it, or falls back to Azure AI Search
         if settings.search_cache_seconds > 0:
-            cache_key = (normalize_query(query), tuple(concepts), tuple(domains), int(limit))
+            cache_key = (normalize_query(query), tuple(concepts), tuple(domains), int(limit),
+                         tuple(sorted(concept_weights.items())), backend if forced else None)
             now = time.monotonic()
             with _query_lock:
                 generation = _query_generation[0]
@@ -821,9 +827,9 @@ class SearchService:
         answer, units = None, None
         if backend == "local":
             try:
-                answer = self._search_local(query, concepts, domains, limit)
+                answer = self._search_local(query, concepts, domains, limit, concept_weights=concept_weights)
             except LocalIndexUnavailable as exc:
-                if not (settings.local_search_fallback and self.configured):
+                if forced or not (settings.local_search_fallback and self.configured):
                     raise RuntimeError(f"The local search index is not available: {exc}") from exc
                 self.local.record_fallback()
                 log.warning("Local index not available (%s); answering from Azure AI Search", exc)
@@ -948,8 +954,12 @@ class SearchService:
             position += batch
         return out
 
-    def _search_local(self, query, concepts, domains, limit):
-        """The same hybrid search, answered from the in-memory index. Raises LocalIndexUnavailable when it is not ready."""
+    def _search_local(self, query, concepts, domains, limit, concept_weights=None, parity=False):
+        """The same hybrid search, answered from the in-memory index. Raises LocalIndexUnavailable when it is not ready.
+        parity=True leaves out what goes beyond Azure AI Search's ranking (the concept bonus and the per-page limit), which
+        is what the shadow comparison needs to measure whether the two engines agree."""
+        boost = 0.0 if parity else settings.local_concept_boost
+        per_page = 0 if parity else settings.local_max_per_page
         index = self.local.current()
         terms = query_terms(query)
         began = time.perf_counter()
@@ -968,7 +978,9 @@ class SearchService:
         began = time.perf_counter()
         candidates = max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10)
         hits, matching = index.search(terms, qcode, domains, concepts, candidates=candidates, limit=limit, qvec=qvec,
-                                      text_candidates=settings.local_text_recall or settings.search_max_text_recall or 1000)
+                                      text_candidates=settings.local_text_recall or settings.search_max_text_recall or 1000,
+                                      concept_weights=concept_weights if boost > 0 else None, concept_boost=boost,
+                                      max_per_page=per_page)
         texts = self._local_texts(index, [row for row, _ in hits])
         results = []
         for row, score in hits:
@@ -992,6 +1004,8 @@ class SearchService:
             "search_mode": "keyword" if keyword_only else "hybrid",
             "embedding_enabled": not keyword_only,
             "backend": "local",
+            "ranking": {"question_concepts": dict(sorted((concept_weights or {}).items())) if boost > 0 else {},
+                        "concept_boost": boost, "max_per_page": per_page},
             "results": results,
         }
 
@@ -1003,7 +1017,7 @@ class SearchService:
 
         def work():
             try:
-                local = self._search_local(query, concepts, domains, limit)
+                local = self._search_local(query, concepts, domains, limit, parity=True)
                 a = [r["chunk_id"] for r in azure_answer["results"]]
                 b = [r["chunk_id"] for r in local["results"]]
                 pa = list(dict.fromkeys(r["url"] for r in azure_answer["results"]))

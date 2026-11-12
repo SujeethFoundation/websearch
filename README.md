@@ -186,6 +186,31 @@ difference comes from the keyword scoring, the vector ranking or the fusion. Tha
 disagreement, at most one disagreement every `LOCAL_SHADOW_DIAGNOSE_MIN_SECONDS` (5), so turn it on to investigate and off after.
 `Show-ShadowDiffs` prints all of it.
 
+**Ranking by what the question named.** The ontology turns a question into concepts of two kinds: ones the question's own words
+matched ("week 4", "mentor") and ones it adds by relationship (networking, grit). All of them widen the filter equally, so a
+broad related concept can flood the candidates: "What does a mentor do in week 4?" returned five third-party articles tagged
+only `networking` while the Foundation's own "Week 4: Networking Strategies" section, tagged `week_4`, was left out. The local
+search now adds a bonus to each candidate chunk: `LOCAL_CONCEPT_BOOST` (1.0) times the share of the question's own concepts the
+chunk is tagged with, weighted by the ontology's confidence, on the scale of a first place in one ranked list. It reorders
+chunks that already matched by keyword or vector; it never adds one that matched nothing. `0` turns it off. The answer reports
+`ranking.question_concepts`.
+
+**One page cannot fill the answer.** A search returns at most five results, and four chunks of one page left one slot for
+everything else. Now at most `LOCAL_MAX_PER_PAGE` (2) chunks of a page are returned while other pages have something to offer (`0` removes the
+limit); when too few pages match to fill the answer, the remaining places go to further chunks of the same pages, so an answer
+is never shorter than before. A page crawled both as `www.sujeeth.org/...` and `sujeeth.org/...` counts as one page whose chunks are
+returned once each.
+
+Both go beyond what Azure AI Search does, so the shadow comparison leaves them out and keeps measuring whether the two engines
+agree; whether answers are *better* is measured with questions whose right page is known:
+
+    python tests/relevance_eval.py --compare
+
+It reads `WEBSEARCH_URL` and `WEBSEARCH_KEY`, asks every question in `tests/relevance_gold.json` of both engines (`POST /api/search`
+takes `"backend": "local"` or `"azure"` to answer from one engine whatever `SEARCH_BACKEND` is, without falling back to the other),
+and reports how often the right page came first, in the top three and in the top five. The file ships with seven questions as
+a start; replace them with thirty to fifty that students and mentors really ask.
+
 **Question cache.** Turning a question into a vector is a network call (often 150 ms or more) and the only slow step of a local
 search. Each question is now embedded once, not once per instance: an instance looks in its own memory (10,000 questions,
 `EMBED_CACHE_MEMORY_ENTRIES`), then in a table every instance shares (`EMBED_CACHE_TABLE`, default the index table's name

@@ -127,6 +127,15 @@ class Settings:
     # difference can be put down to the keyword half, the vector half or the fusion. For investigating, not for always.
     local_shadow_diagnose = _flag("LOCAL_SHADOW_DIAGNOSE", False)
     local_shadow_diagnose_min_seconds = _float("LOCAL_SHADOW_DIAGNOSE_MIN_SECONDS", 5)
+    # Ranking beyond what Azure AI Search does (local search only; the shadow comparison leaves both out, so it still
+    # measures whether the two engines agree):
+    # - A chunk tagged with a concept the question itself named ("week 4", "mentor") ranks above one that only passes the
+    #   filter through a concept the ontology added by relationship. The bonus is LOCAL_CONCEPT_BOOST times the share of the
+    #   question's own concepts the chunk carries, on the scale of a first place in one ranked list. 0 turns it off.
+    # - At most LOCAL_MAX_PER_PAGE chunks of one page in an answer (the same page reached as www. and without it counts as
+    #   one page, and the same chunk of it is returned once). 0 removes the limit.
+    local_concept_boost = _float("LOCAL_CONCEPT_BOOST", 1.0)
+    local_max_per_page = _int("LOCAL_MAX_PER_PAGE", 2, 0, 50)
     local_rescore = _flag("LOCAL_RESCORE", True)
     local_rescore_pool = _int("LOCAL_RESCORE_POOL", 300, 20, 5000)
     # Search-question embeddings are remembered so a question is embedded once, not once per instance. Only the 1-bit
