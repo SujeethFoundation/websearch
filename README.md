@@ -165,6 +165,14 @@ the same answer to a visitor) next to the stricter chunk-level numbers, and keep
 differed, with what each engine returned: `GET /api/local-index/shadow-diffs` or `Show-ShadowDiffs`. Those are visitors'
 questions, held in memory only, and the route needs the function key.
 
+**Common words.** The Azure index uses the default Standard Lucene analyzer, whose stop word list is empty: words like "the",
+"is" and "to" are indexed and searched for like any other word (they score low, because nearly every chunk has them). The local
+index used to drop 33 English words from both the chunks and the question. It now keeps them in every chunk, and a question
+searches for them by default (`LOCAL_INDEX_STOPWORDS=none`), which matches Azure; `LOCAL_INDEX_STOPWORDS=english` drops the
+listed words from questions only, with no rewrite needed. On 40,000 synthetic chunks (42% common words) searching for them
+costs about 0.9 ms more a search, and the keyword postings grow. Chunks written before this change lack the common words, so
+**run the local backfill again** (the same run that writes the vectors for rescoring).
+
 **Question cache.** Turning a question into a vector is a network call (often 150 ms or more) and the only slow step of a local
 search. Each question is now embedded once, not once per instance: an instance looks in its own memory (10,000 questions,
 `EMBED_CACHE_MEMORY_ENTRIES`), then in a table every instance shares (`EMBED_CACHE_TABLE`, default the index table's name

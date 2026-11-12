@@ -144,9 +144,20 @@ def test_binary_code_is_one_bit_per_dimension():
     assert len(li.binary_code(np.ones(1536))) == 192
 
 
-def test_the_query_terms_are_distinct_hashes():
+def test_the_query_terms_are_distinct_hashes(monkeypatch):
     terms = li.query_terms("the Mentor mentor program")
-    assert terms.dtype == np.uint64 and len(terms) == 2
+    assert terms.dtype == np.uint64 and len(terms) == 3                    # common words are searched for, as Azure does
+    monkeypatch.setattr(settings, "local_index_stopwords", "english")
+    assert len(li.query_terms("the Mentor mentor program")) == 2           # unless they are turned off
+
+
+def test_the_index_keeps_common_words_whatever_the_question_setting(monkeypatch):
+    monkeypatch.setattr(settings, "local_index_stopwords", "english")
+    tid, _ = li.analyze("The mentor", "to be or not to be a mentor", title_weight=3)
+    hashes = set(np.frombuffer(tid, dtype="<u8").tolist())
+    assert {li.term_hash(w) for w in ("the", "to", "be", "or", "not", "a", "mentor")} <= hashes
+    assert li.tokens("to be or not to be") == []                              # the plain tokenizer still drops them by default
+    assert li.tokens("to be or not to be", False) == ["to", "be", "or", "not", "to", "be"]
 
 
 # ---------------------------------------------------------------------------------------------------------------

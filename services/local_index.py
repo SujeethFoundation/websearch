@@ -62,9 +62,10 @@ class LocalIndexUnavailable(RuntimeError):
 # Text and vectors
 # ---------------------------------------------------------------------------------------------------------------
 
-def tokens(text):
-    """Lower-cased words, without stop words."""
-    return [t for t in _TOKEN.findall(str(text or "").lower()) if t not in STOPWORDS]
+def tokens(text, drop_stopwords=True):
+    """Lower-cased words, without stop words unless drop_stopwords is False."""
+    words = _TOKEN.findall(str(text or "").lower())
+    return [t for t in words if t not in STOPWORDS] if drop_stopwords else words
 
 
 @lru_cache(maxsize=500000)
@@ -74,20 +75,23 @@ def term_hash(token):
 
 
 def query_terms(text):
-    """The distinct words of a question, as an array of hashes."""
-    seen = sorted({term_hash(t) for t in tokens(text)})
+    """The distinct words of a question, as an array of hashes. Common words are searched for like any other (as the
+    Azure index does) unless LOCAL_INDEX_STOPWORDS=english."""
+    seen = sorted({term_hash(t) for t in tokens(text, settings.local_index_stopwords == "english")})
     return np.array(seen, dtype=np.uint64)
 
 
 def analyze(title, content, title_weight=3):
     """(hashes, counts) for one chunk as raw bytes: the word hashes in ascending order and how often each occurs.
 
-    Words in the title count title_weight times, like the title boost in the wiki search. Counts stop at 255."""
+    Words in the title count title_weight times, like the title boost in the wiki search. Counts stop at 255.
+    Every word is kept, common ones too, as the Azure index (default Standard Lucene analyzer) keeps them: whether a
+    question searches for them is decided when it is asked (LOCAL_INDEX_STOPWORDS), so no rewrite is needed to change it."""
     counts = {}
-    for token in tokens(content):
+    for token in tokens(content, False):
         h = term_hash(token)
         counts[h] = counts.get(h, 0) + 1
-    for token in tokens(title):
+    for token in tokens(title, False):
         h = term_hash(token)
         counts[h] = counts.get(h, 0) + max(1, int(title_weight))
     ordered = sorted(counts)

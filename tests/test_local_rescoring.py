@@ -261,3 +261,16 @@ def test_running_the_local_backfill_writes_the_8_bit_vectors_so_the_index_can_re
     svc.local_backfill(names)
     index = li.LocalIndexManager(store=store).current()
     assert index.vec8 is not None and index.rows_without_vectors == 0 and index.vec8.shape == (index.n, 64)
+
+
+def test_a_question_made_of_common_words_still_finds_chunks_unless_they_are_turned_off(conf, monkeypatch):
+    docs = [make_doc(1, 0, content="what is the plan for the week", title="Week plan"),
+            make_doc(2, 0, content="mentor guide and resume tips", title="Guide")]
+    index = index_of(docs)
+    hits, matching = index.search(li.query_terms("what is the"), None, ["sujeeth.org"], ["circle"], candidates=5, limit=5)
+    assert [index.ids[r] for r, _ in hits] == ["page1-0"]                      # indexed words match, like Azure's standard analyzer
+    monkeypatch.setattr(settings, "local_index_stopwords", "english")
+    hits, _ = index.search(li.query_terms("what is the"), None, ["sujeeth.org"], ["circle"], candidates=5, limit=5)
+    assert [index.ids[r] for r, _ in hits] == ["page1-0"]                      # "what" is not on the list, so it still matches
+    hits, _ = index.search(li.query_terms("is the"), None, ["sujeeth.org"], ["circle"], candidates=5, limit=5)
+    assert hits == []                                                          # a question of only listed words searches for nothing

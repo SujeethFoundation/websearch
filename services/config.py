@@ -114,6 +114,10 @@ class Settings:
     # also keeps its vector at 8 bits a dimension (about 1.5 KB), and the best LOCAL_RESCORE_POOL chunks by code are
     # re-ranked by cosine similarity on those. Needs the table rows to carry the vectors (run the local backfill again
     # after upgrading); until every row has one, the search quietly uses the codes alone.
+    # What the index does with common words ("the", "is", "to"). The Azure index uses the default Standard Lucene analyzer,
+    # which keeps them (its stop word list is empty), so they are stored with every chunk and, by default, searched for like
+    # any other word; they score low because nearly every chunk has them. "english" drops a list of 33 of them from questions.
+    local_index_stopwords = os.getenv("LOCAL_INDEX_STOPWORDS", "none").strip().lower()
     local_rescore = _flag("LOCAL_RESCORE", True)
     local_rescore_pool = _int("LOCAL_RESCORE_POOL", 300, 20, 5000)
     # Search-question embeddings are remembered so a question is embedded once, not once per instance. Only the 1-bit
