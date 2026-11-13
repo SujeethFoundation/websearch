@@ -230,6 +230,50 @@ def row_from_entity(entity):
 # The in-memory index
 # ---------------------------------------------------------------------------------------------------------------
 
+_UNSET = object()
+
+
+class QueryWork:
+    """What searches for the same question over the same index have in common, worked out at most once.
+
+    Made by LocalIndex.begin() and used by one request on one thread. Each part is worked out the first time a search
+    needs it, so a search that does not need a part (no phrase boost, no vector half) never pays for it."""
+
+    def __init__(self, index, terms, qcode, qvec, question=None):
+        self.index, self.terms, self.qcode, self.qvec, self.question = index, terms, qcode, qvec, question
+        self._keywords = None
+        self._phrases = _UNSET
+        self._base_rows = None       # the biggest set of chunks whose distances were worked out, ascending
+        self._base_distance = None
+
+    def keyword_scores(self):
+        """BM25 scores of every chunk for the question's words (read only: do not change the array)."""
+        if self._keywords is None:
+            self._keywords = self.index.keyword_scores(self.terms)
+        return self._keywords
+
+    def phrases(self):
+        """The question's neighbouring word pairs, as question_phrases returns them."""
+        if self._phrases is _UNSET:
+            self._phrases = self.index.question_phrases(self.question)
+        return self._phrases
+
+    def distance_for(self, rows, compute):
+        """Hamming distance of the question's code to each of `rows` (ascending), the same numbers `compute()` returns.
+
+        The first set asked for is worked out with `compute` and kept. A later set that lies inside it is read from
+        it. Any other set is worked out with `compute`."""
+        base = self._base_rows
+        if base is None:
+            self._base_rows, self._base_distance = rows, compute()
+            return self._base_distance
+        if len(rows) and len(base):
+            where = np.minimum(np.searchsorted(base, rows), len(base) - 1)
+            if np.array_equal(base[where], rows):
+                return self._base_distance[where]
+        return compute()
+
+
 class LocalIndex:
     """An immutable snapshot. Built once from rows, then only read, so any number of searches can use it at once."""
 
@@ -436,25 +480,32 @@ class LocalIndex:
                 scores[self.post_docs[a:z]] += self.post_weights[a:z]
         return scores
 
-    def vector_ranking(self, rows, qcode, qvec, count, pool=None):
+    def vector_ranking(self, rows, qcode, qvec, count, pool=None, distance=None):
         """The `count` best of `rows` for a question, best first, as row numbers.
 
         The 1-bit codes pick a shortlist of `pool` chunks (all of them when fewer pass the filters); the shortlist is
         then ranked by cosine similarity on the 8-bit vectors. Without a question vector, or without vectors in the
-        index, the codes alone rank (Hamming distance, which has many ties and ranks close neighbours poorly)."""
+        index, the codes alone rank (Hamming distance, which has many ties and ranks close neighbours poorly).
+
+        `distance`, when given, is QueryWork.distance_for: it supplies the Hamming distances of `rows` (reusing what an
+        earlier search for the same question already worked out) and is called with a function that works them out."""
         pool = pool or settings.local_rescore_pool
         query = _words([qcode[: self.code_bytes].ljust(self.code_bytes, b"\0")], self.code_bytes)[0]
+
+        def hamming(chosen):
+            compute = lambda: _popcount_rows(self.codes[chosen] ^ query)
+            return distance(chosen, compute) if distance is not None else compute()
+
         if qvec is not None and self.vec8 is not None and len(qvec) == self.vec_dims:
             if len(rows) > max(pool, count):
-                shortlist = rows[self._top(_popcount_rows(self.codes[rows] ^ query), max(pool, count), False)]
+                shortlist = rows[self._top(hamming(rows), max(pool, count), False)]
             else:
                 shortlist = rows
             q = np.frombuffer(qvec, dtype=np.int8).astype(np.float32)
             norm = float(np.sqrt((q * q).sum())) or 1.0
             similarity = (self.vec8[shortlist].astype(np.float32) @ q) / (self.norm8[shortlist] * norm)
             return [int(shortlist[i]) for i in self._top(similarity, count, True)]
-        distance = _popcount_rows(self.codes[rows] ^ query)
-        return [int(rows[pos]) for pos in self._top(distance, count, False)]
+        return [int(rows[pos]) for pos in self._top(hamming(rows), count, False)]
 
     def concept_coverage(self, rows, concept_weights):
         """For each of `rows`, the share (0 to 1) of the weighted concepts it is tagged with."""
@@ -528,7 +579,7 @@ class LocalIndex:
         return self._pick(ordered, limit, max_per_page, unique_pages), int(len(rows))
 
     def _rank(self, terms, qcode, domains, concepts, candidates, qvec, text_candidates, concept_weights, concept_boost,
-              question=None, phrase_boost=0.0, phrase_pool=100):
+              question=None, phrase_boost=0.0, phrase_pool=100, work=None):
         """(rows that pass the filters, [(row, score), ...] every candidate best first, parts) where parts holds each
         candidate's 0-based place in the keyword list and the vector list, its share of the question's concepts and
         its share of the question's word pairs."""
@@ -539,14 +590,15 @@ class LocalIndex:
         if not len(rows):
             return rows, [], parts
         fused = {}
-        scores = self.keyword_scores(terms)[rows]
+        scores = (work.keyword_scores() if work is not None else self.keyword_scores(terms))[rows]
         hit = np.flatnonzero(scores > 0)
         for rank, pos in enumerate(self._top(scores[hit], text_candidates or candidates, True)):
             row = int(rows[hit[pos]])
             parts["keyword"][row] = rank
             fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
         if qcode is not None and self.code_bytes:
-            for rank, row in enumerate(self.vector_ranking(rows, qcode, qvec, candidates)):
+            ranked = self.vector_ranking(rows, qcode, qvec, candidates, distance=work.distance_for if work is not None else None)
+            for rank, row in enumerate(ranked):
                 parts["vector"][row] = rank
                 fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
         if concept_weights and concept_boost > 0 and fused:
@@ -556,7 +608,7 @@ class LocalIndex:
                     parts["share"][row] = share
                     fused[row] += concept_boost * share / (RRF_K + 1)
         if question and phrase_boost > 0 and fused and self.texts is not None:
-            phrases = self.question_phrases(question)
+            phrases = work.phrases() if work is not None else self.question_phrases(question)
             parts["phrases"] = phrases
             if phrases:
                 best = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))[:max(1, int(phrase_pool))]
@@ -604,6 +656,35 @@ class LocalIndex:
             # so the limit only ever trades a repeat for another page, never for an empty place.
             kept = sorted(kept + spare[: limit - len(kept)], key=lambda kv: (-kv[1], kv[0]))
         return kept
+
+    def begin(self, terms, qcode, qvec, question=None):
+        """The workspace several searches for one question share (see QueryWork)."""
+        return QueryWork(self, terms, qcode, qvec, question)
+
+    def search_many(self, work, jobs):
+        """Several searches for one question in one pass: what they have in common is worked out once.
+
+        Each job is a dict of what differs between the searches: domains, concepts, candidates, limit and, optionally,
+        text_candidates, concept_weights, concept_boost, max_per_page, phrase_boost, phrase_pool and unique_pages (the
+        arguments of search()). Returns one entry per job, in order: exactly what search() returns for it, (hits,
+        matching), or the exception that job raised, so one failing job does not stop the others.
+
+        Shared: the keyword scores of every chunk, the question's word pairs, and the Hamming distances of the codes
+        (worked out once for the biggest set of chunks and read from there for the smaller sets inside it)."""
+        sizes = [len(self._rows(job["domains"], job["concepts"])) if self.n else 0 for job in jobs]
+        out = [None] * len(jobs)
+        for i in sorted(range(len(jobs)), key=lambda k: (-sizes[k], k)):   # the biggest set first: it is the base for the rest
+            job = jobs[i]
+            try:
+                rows, ordered, _ = self._rank(
+                    work.terms, work.qcode, job["domains"], job["concepts"], job["candidates"], work.qvec,
+                    job.get("text_candidates"), job.get("concept_weights"), job.get("concept_boost", 0.0),
+                    work.question, job.get("phrase_boost", 0.0), job.get("phrase_pool", 100), work=work)
+                out[i] = (self._pick(ordered, job["limit"], job.get("max_per_page", 0), job.get("unique_pages", False)),
+                          int(len(rows)))
+            except Exception as exc:
+                out[i] = exc
+        return out
 
     def _vector_closeness(self, rows, qcode, qvec, block=4096):
         """How close every one of `rows` is to the question (higher is closer): cosine on the 8-bit vectors when the

@@ -191,14 +191,25 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ra
             "resolution": resolution,
         }
 
-    result = searcher.search(
-        query,
-        concepts=resolution["matched_concepts"],
-        domains=selected_domains,
-        limit=limit,
-        concept_weights=question_concept_weights(resolution),
-        ranking=ranking if isinstance(ranking, dict) else None,
-    )
+    # The main search and the two side searches (best bets, spotlights) ask the same question of the same index, so
+    # they run together in one pass: the embedding, the keyword scores and the code distances are worked out once.
+    bet_domains, bet_failed = plan_best_bets(selected_domains)
+    spotlight_domains = plan_spotlights(resolution, selected_domains)
+    jobs = [{
+        "concepts": resolution["matched_concepts"],
+        "domains": selected_domains,
+        "limit": limit,
+        "concept_weights": question_concept_weights(resolution),
+        "ranking": ranking if isinstance(ranking, dict) else None,
+    }]
+    if bet_domains:
+        jobs.append({"concepts": resolution["matched_concepts"], "domains": bet_domains, "limit": 10})
+    if spotlight_domains:
+        jobs.append({"concepts": ["spotlight"], "domains": spotlight_domains, "limit": SPOTLIGHT_SLOTS * 3})
+    found = searcher.search_many(query, jobs)
+    result = found[0]
+    if isinstance(result, Exception):
+        raise result                       # the main search fails the request, as it always did
     result.update({
         "status": "completed",
         "ontology_version": resolution.get("ontology_version"),
@@ -206,8 +217,14 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ra
         "domains": selected_domains,
         "resolution": resolution,
     })
-    add_best_bets(result, query, resolution["matched_concepts"], selected_domains)
-    add_spotlights(result, query, resolution, selected_domains)
+    position = 1
+    bet_found = spotlight_found = None
+    if bet_domains:
+        bet_found, position = found[position], position + 1
+    if spotlight_domains:
+        spotlight_found = found[position]
+    add_best_bets(result, bet_found, bet_domains, bet_failed)
+    add_spotlights(result, spotlight_found, spotlight_domains)
     # Best bets and spotlights are placed first; whatever page they share with the ordinary results appears once.
     if settings.search_unique_pages:
         result["results"] = unique_pages(result.get("results"))
@@ -218,23 +235,34 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ra
 SPOTLIGHT_SLOTS = settings.spotlight_slots
 
 
-def add_spotlights(result, query, resolution, selected_domains):
+def plan_spotlights(resolution, selected_domains):
+    """The domains the Spotlight search covers: sujeeth.org when "spotlight" is among the matched concepts, else none.
+
+    The MCP server resolves first and sends the matched concepts back as explicit concepts, so the match source is
+    not reliable here. Spotlight among the matched concepts is enough."""
+    try:
+        if not SPOTLIGHT_SLOTS or "spotlight" not in [str(c).lower() for c in resolution.get("matched_concepts", [])]:
+            return []
+        return [d for d in selected_domains if d == "sujeeth.org"]
+    except Exception:
+        log.exception("Spotlight planning failed; returning normal results only")
+        return []
+
+
+def add_spotlights(result, found, domains):
     """Reserve result slots for Spotlight pages on questions the ontology says Spotlights illustrate.
 
     Added whenever "spotlight" is among the matched concepts, whether the person asked for it or
     the ontology added it through a relationship (a career question). Spotlight pages carry the spotlight tag
-    and compete with larger sites in ranking, so they get their own query and are placed first,
-    flagged spotlight=True. Never fails the search.
+    and compete with larger sites in ranking, so they get their own query (run together with the main search, see
+    run_search) and are placed first, flagged spotlight=True. `found` is that query's answer, or the exception it
+    raised; `domains` the domains it covered (none: no Spotlight search was made). Never fails the search.
     """
+    if not domains:
+        return
     try:
-        # The MCP server resolves first and sends the matched concepts back as explicit concepts,
-        # so the match source is not reliable here. Spotlight among the matched concepts is enough.
-        if not SPOTLIGHT_SLOTS or "spotlight" not in [str(c).lower() for c in resolution.get("matched_concepts", [])]:
-            return
-        domains = [d for d in selected_domains if d == "sujeeth.org"]
-        if not domains:
-            return
-        found = searcher.search(query, concepts=["spotlight"], domains=domains, limit=SPOTLIGHT_SLOTS * 3)
+        if isinstance(found, Exception):
+            raise found
         picked, seen = [], set()
         for item in found.get("results", []):
             key = _page_identity(item)
@@ -256,13 +284,28 @@ def add_spotlights(result, query, resolution, selected_domains):
 BEST_BETS_MAX = settings.best_bets_max
 
 
-def add_best_bets(result, query, concepts, selected_domains):
-    """Put matching manually added pages first, flagged best_bet. Never fails the search."""
-    status, count = "none", 0
+def plan_best_bets(selected_domains):
+    """(domains, failed): the selected domains that hold manually added pages, and whether the ontology manifest that
+    says which ones could not be read. Never raises."""
     try:
-        manual_domains = best_bet_domains(ontology.search_manifest(), selected_domains) if BEST_BETS_MAX else []
+        return (best_bet_domains(ontology.search_manifest(), selected_domains) if BEST_BETS_MAX else []), False
+    except Exception:
+        log.exception("Best-bet lookup failed; returning normal results only")
+        return [], True
+
+
+def add_best_bets(result, found, manual_domains, failed=False):
+    """Put matching manually added pages first, flagged best_bet. Never fails the search.
+
+    `found` is the answer of the best-bet search (run together with the main search, see run_search) or the
+    exception it raised; `manual_domains` the domains it covered (none: no best-bet search was made); `failed` that
+    planning it failed."""
+    status, count = "unavailable" if failed else "none", 0
+    try:
         if manual_domains:
-            manual = searcher.search(query, concepts=concepts, domains=manual_domains, limit=10)
+            if isinstance(found, Exception):
+                raise found
+            manual = found
             merged = merge_best_bets(result.get("results", []), manual.get("results", []), BEST_BETS_MAX)
             count = sum(1 for x in merged if x.get("best_bet"))
             result["results"] = merged

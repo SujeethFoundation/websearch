@@ -112,12 +112,17 @@ def run(monkeypatch, results, unique=True):
     class Searcher:
         def search(self, query, **kw):
             return {"query": query, "count": len(results), "results": [dict(r) for r in results]}
+
+        def search_many(self, query, jobs):
+            return [self.search(query, **job) for job in jobs]
     monkeypatch.setattr(fa, "searcher", Searcher())
     monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: dict(RESOLUTION))
     monkeypatch.setattr(settings, "search_unique_pages", unique)
 
-    def spotlight(result, query, resolution, domains):
+    def spotlight(result, *args, **kw):
         result["results"] = [{"url": "https://www.sujeeth.org/spotlight/x", "spotlight": True}] + result["results"]
+    monkeypatch.setattr(fa, "plan_best_bets", lambda *a, **k: ([], False))
+    monkeypatch.setattr(fa, "plan_spotlights", lambda *a, **k: [])
     monkeypatch.setattr(fa, "add_best_bets", lambda *a, **k: None)
     monkeypatch.setattr(fa, "add_spotlights", spotlight)
     return fa.run_search("week 4")

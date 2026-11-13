@@ -480,6 +480,22 @@ class SearchService:
         index = self.local.current()
         terms = query_terms(query)
         began = time.perf_counter()
+        qcode, qvec, keyword_only = self._embed_query(query)
+        embed_ms = (time.perf_counter() - began) * 1000
+        began = time.perf_counter()
+        candidates = max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10)
+        hits, matching = index.search(terms, qcode, domains, concepts, candidates=candidates, limit=limit, qvec=qvec,
+                                      text_candidates=settings.local_text_recall or 1000,
+                                      concept_weights=concept_weights if boost > 0 else None, concept_boost=boost,
+                                      max_per_page=per_page, question=query, phrase_boost=how["phrase_boost"],
+                                      phrase_pool=settings.local_phrase_pool, unique_pages=unique)
+        answer = self._answer(index, query, hits, matching, keyword_only, concept_weights, how)
+        self.local.record_search(embed_ms, (time.perf_counter() - began) * 1000, keyword_only,
+                                 rescored=bool(qvec is not None and index.vec8 is not None and not keyword_only))
+        return answer
+
+    def _embed_query(self, query):
+        """(code, vector, keyword_only) for a question. When it cannot be embedded the search goes on by keywords only."""
         qcode, qvec, keyword_only = None, None, False
         try:
             get_vectors = getattr(self.embedder, "embed_query_vectors", None)
@@ -491,14 +507,11 @@ class SearchService:
         except Exception as exc:
             keyword_only = True
             log.warning("Search question could not be embedded (%s); searching by keywords only", type(exc).__name__)
-        embed_ms = (time.perf_counter() - began) * 1000
-        began = time.perf_counter()
-        candidates = max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10)
-        hits, matching = index.search(terms, qcode, domains, concepts, candidates=candidates, limit=limit, qvec=qvec,
-                                      text_candidates=settings.local_text_recall or 1000,
-                                      concept_weights=concept_weights if boost > 0 else None, concept_boost=boost,
-                                      max_per_page=per_page, question=query, phrase_boost=how["phrase_boost"],
-                                      phrase_pool=settings.local_phrase_pool, unique_pages=unique)
+        return qcode, qvec, keyword_only
+
+    def _answer(self, index, query, hits, matching, keyword_only, concept_weights, how):
+        """The answer a search returns, from the rows it picked."""
+        boost, per_page, unique = how["concept_boost"], how["max_per_page"], how["unique_pages"]
         texts = self._local_texts(index, [row for row, _ in hits])
         results = []
         for row, score in hits:
@@ -513,8 +526,6 @@ class SearchService:
                 "source": "website",
                 "chunk_id": data["id"],
             })
-        self.local.record_search(embed_ms, (time.perf_counter() - began) * 1000, keyword_only,
-                                 rescored=bool(qvec is not None and index.vec8 is not None and not keyword_only))
         return {
             "query": query,
             "count": len(results),
@@ -526,6 +537,114 @@ class SearchService:
                         "unique_pages": unique},
             "results": results,
         }
+
+    def search_many(self, query, jobs):
+        """Several searches for one question in one pass over the in-memory index.
+
+        jobs is a list of dicts with the arguments of search() that differ: concepts, domains, limit and, optionally,
+        concept_weights and ranking. Returns one entry per job, in order: the answer search() gives for it, or the
+        exception that job raised (invalid arguments, a failure reading text), so a side search that fails does not
+        take the main one with it. A job that is just like one asked a moment ago is answered from the search cache
+        when it is on. What the jobs share is worked out once: the embedding of the question, the keyword scores, the
+        question's word pairs and the code distances. Raises RuntimeError, as search() does, when the index is not
+        ready, and LocalIndexLoading while this instance is still loading it."""
+        plans = []
+        for job in jobs:
+            try:
+                concepts = sorted({str(x).lower() for x in (job.get("concepts") or [])})
+                domains = sorted({str(x).lower() for x in (job.get("domains") or [])})
+                if not concepts or not domains:
+                    raise ValueError("Search requires ontology-resolved concepts and domains.")
+                weights = {str(c).lower(): float(w) for c, w in (job.get("concept_weights") or {}).items() if w and float(w) > 0}
+                plans.append({"concepts": concepts, "domains": domains, "limit": int(job.get("limit", 5)),
+                              "weights": weights, "ranking": job.get("ranking"), "key": None})
+            except Exception as exc:
+                plans.append(exc)
+        answers = [p if isinstance(p, Exception) else None for p in plans]
+        todo = [i for i, p in enumerate(plans) if not isinstance(p, Exception)]
+        generation = 0
+        if settings.search_cache_seconds > 0 and todo:
+            try:
+                self.local.current()   # let a first load swap the index in (and clear kept answers) before the generation is read
+            except LocalIndexUnavailable:
+                pass
+            now = time.monotonic()
+            for i in list(todo):
+                plan = plans[i]
+                plan["key"] = (normalize_query(query), tuple(plan["concepts"]), tuple(plan["domains"]), plan["limit"],
+                               tuple(sorted(plan["weights"].items())),
+                               tuple(sorted((str(k), str(v)) for k, v in (plan["ranking"] or {}).items())))
+                with _query_lock:
+                    generation = _query_generation[0]
+                    entry = _query_cache.get(plan["key"])
+                    if entry and entry[0] > now:
+                        _query_stats["hits"] += 1
+                    else:
+                        entry = None
+                        _query_stats["misses"] += 1
+                if entry is not None:
+                    cached = copy.deepcopy(entry[1])
+                    cached["query"] = query
+                    answers[i] = cached
+                    todo.remove(i)
+        if todo:
+            try:
+                fresh = self._search_local_many(query, [plans[i] for i in todo])
+            except LocalIndexUnavailable as exc:
+                raise RuntimeError(f"The local search index is not available: {exc}") from exc
+            for i, answer in zip(todo, fresh):
+                answers[i] = answer
+                key = plans[i]["key"]
+                if (key is not None and not isinstance(answer, Exception) and answer.get("results")
+                        and answer.get("search_mode") != "keyword"):
+                    snapshot = copy.deepcopy(answer)
+                    with _query_lock:
+                        if generation == _query_generation[0]:
+                            _query_cache[key] = (time.monotonic() + settings.search_cache_seconds, snapshot)
+                            limit_entries = settings.search_cache_max_entries
+                            if len(_query_cache) > limit_entries:
+                                for old_key in list(_query_cache)[: max(1, limit_entries // 10)]:
+                                    _query_cache.pop(old_key, None)
+        return answers
+
+    def _search_local_many(self, query, plans):
+        """The hybrid searches of search_many, answered from the in-memory index in one pass. One entry per plan: the
+        answer, or the exception that plan raised. Raises LocalIndexUnavailable when the index is not ready."""
+        index = self.local.current()
+        terms = query_terms(query)
+        began = time.perf_counter()
+        qcode, qvec, keyword_only = self._embed_query(query)
+        embed_ms = (time.perf_counter() - began) * 1000
+        began = time.perf_counter()
+        work = index.begin(terms, qcode, qvec, query)
+        hows, specs = [], []
+        for plan in plans:
+            how = self.ranking_settings(plan["ranking"])
+            hows.append(how)
+            limit = plan["limit"]
+            specs.append({
+                "domains": plan["domains"], "concepts": plan["concepts"], "limit": limit,
+                "candidates": max(limit, settings.search_vector_k) if settings.search_vector_k else max(50, limit * 10),
+                "text_candidates": settings.local_text_recall or 1000,
+                "concept_weights": plan["weights"] if how["concept_boost"] > 0 else None,
+                "concept_boost": how["concept_boost"], "max_per_page": how["max_per_page"],
+                "phrase_boost": how["phrase_boost"], "phrase_pool": settings.local_phrase_pool,
+                "unique_pages": how["unique_pages"],
+            })
+        found = index.search_many(work, specs)
+        answers = []
+        for plan, how, outcome in zip(plans, hows, found):
+            if isinstance(outcome, Exception):
+                answers.append(outcome)
+                continue
+            try:
+                hits, matching = outcome
+                answers.append(self._answer(index, query, hits, matching, keyword_only, plan["weights"], how))
+            except Exception as exc:
+                answers.append(exc)
+        self.local.record_search(embed_ms, (time.perf_counter() - began) * 1000, keyword_only,
+                                 rescored=bool(qvec is not None and index.vec8 is not None and not keyword_only))
+        return answers
 
     def explain_local(self, query, concepts, domains, expect, concept_weights=None, limit=5, ranking=None):
         """Why the local search ranks a question as it does, and where the page it should have found stands. Uses the

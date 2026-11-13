@@ -203,8 +203,13 @@ def test_the_search_route_passes_the_questions_own_concepts_as_weights(conf, mon
         def search(self, query, **kw):
             seen.update(kw, query=query)
             return {"query": query, "count": 0, "results": []}
+
+        def search_many(self, query, jobs):
+            return [self.search(query, **job) for job in jobs]
     monkeypatch.setattr(fa, "searcher", Searcher())
     monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: dict(RESOLUTION))
+    monkeypatch.setattr(fa, "plan_best_bets", lambda *a, **k: ([], False))
+    monkeypatch.setattr(fa, "plan_spotlights", lambda *a, **k: [])
     monkeypatch.setattr(fa, "add_best_bets", lambda *a, **k: None)
     monkeypatch.setattr(fa, "add_spotlights", lambda *a, **k: None)
     post = func.HttpRequest("POST", "/api/search", params={}, headers={}, body=json.dumps({"query": "what does a mentor do in week 4"}).encode())
@@ -383,11 +388,16 @@ def test_the_routes_pass_tried_settings_through(conf, monkeypatch):
             seen.update(kw)
             return {"query": query, "count": 0, "results": []}
 
+        def search_many(self, query, jobs):
+            return [self.search(query, **job) for job in jobs]
+
         def explain_local(self, query, concepts, domains, expect, **kw):
             seen["explain"] = kw
             return {"answer": []}
     monkeypatch.setattr(fa, "searcher", Searcher())
     monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: dict(RESOLUTION))
+    monkeypatch.setattr(fa, "plan_best_bets", lambda *a, **k: ([], False))
+    monkeypatch.setattr(fa, "plan_spotlights", lambda *a, **k: [])
     monkeypatch.setattr(fa, "add_best_bets", lambda *a, **k: None)
     monkeypatch.setattr(fa, "add_spotlights", lambda *a, **k: None)
     post = lambda route, body: func.HttpRequest("POST", f"/api/{route}", params={}, headers={}, body=json.dumps(body).encode())

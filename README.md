@@ -212,6 +212,14 @@ ordinary results appears once, as the curated copy. `"ranking": {"unique_pages":
 `SEARCH_UNIQUE_PAGES=false`) allows repeats again, and then `LOCAL_MAX_PER_PAGE` (2) prefers at most that many chunks of a
 page, refilling with repeats if too few pages match.
 
+**One pass for the main search, best bets and spotlights.** A search request asks the index up to three questions: the main
+search, a search of the manually added pages (best bets) and a search of Spotlight pages. They are the same question with
+different filters, so `run_search` runs them together (`SearchService.search_many`): the question is embedded once, and the keyword
+scores of every chunk, the question's word pairs and the code distances are worked out once and shared. Each answer is exactly
+what a separate search would have given (`tests/test_search_many.py` checks this against the separate searches). One request
+counts as one search in `local_index.searches` and its timings, however many questions it asked. A best-bet or spotlight search that
+fails marks `best_bets` or `spotlights` as `unavailable`, as before, and leaves the main answer alone.
+
 **Words side by side.** Keyword scoring ignores word order: "114 students completed Career Circles" scores like the same words
 scattered over a page. A chunk whose text or title holds the question's neighbouring words next to each other gets a bonus:
 `LOCAL_PHRASE_BOOST` (1.0) times the share of the question's word pairs it holds, on the same scale as the concept bonus. Only
