@@ -99,6 +99,19 @@ class OntologyClient:
     def search_manifest(self):
         return self._cached("search-manifest", lambda: self.get("/api/ontology/search-manifest"))
 
+    def text_cold_domains(self):
+        """Lower-case domains whose chunk text the search keeps in the table, not in memory: the search-enabled domains
+        with index_policy.text_in_memory set to false. Their vectors and words are still indexed in memory."""
+        manifest = self.search_manifest()
+        rows = manifest.get("search_domains") if isinstance(manifest, dict) else manifest
+        cold = set()
+        for item in rows or []:
+            if isinstance(item, dict) and (item.get("index_policy") or {}).get("text_in_memory") is False:
+                domain = str(item.get("domain") or "").strip().lower()
+                if domain:
+                    cold.add(domain)
+        return frozenset(cold)
+
     def crawl_manifest(self):
         return self._cached("crawl-manifest", lambda: self.get("/api/ontology/crawl-manifest"))
 

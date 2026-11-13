@@ -63,7 +63,14 @@ class FakeTable:
         entity = self.rows[(partition, row)]
         return {k: v for k, v in entity.items() if not select or k in select or k in ("PartitionKey", "RowKey")}
 
-    def query_entities(self, flt, select=None):
+    def query_entities(self, flt=None, select=None, query_filter=None, parameters=None, results_per_page=None):
+        flt = query_filter or flt
+        if parameters:  # "domain ne @d0 and domain ne @d1" or "domain eq @d0 or domain eq @d1"
+            def passes(entity):
+                if " and " in flt or " ne " in flt:
+                    return all(entity.get("domain") != parameters[t[1:]] for t in flt.split() if t.startswith("@"))
+                return any(entity.get("domain") == parameters[t[1:]] for t in flt.split() if t.startswith("@"))
+            return [self.get_entity(p, r, select) for (p, r) in sorted(self.rows) if passes(self.rows[(p, r)])]
         partition = flt.split("'")[1]
         return [self.get_entity(p, r, select) for (p, r) in sorted(self.rows) if p == partition]
 
@@ -523,6 +530,57 @@ def test_the_text_can_stay_in_the_table(conf, monkeypatch):
     monkeypatch.setattr(settings, "local_index_text_in_memory", False)
     manager = li.LocalIndexManager(store=filled_store())
     assert manager.current().texts is None and manager.describe()["text_in_memory"] is False
+
+
+def test_domains_that_keep_their_text_in_the_table_are_still_searched_but_hold_no_text(conf):
+    docs = corpus()
+    full = index_of(docs)
+    manager = li.LocalIndexManager(store=filled_store(docs), text_skip_provider=lambda: {"themuse.com"})
+    index = manager.current()
+    cold = [i for i, u in enumerate(index.urls) if "themuse.com" in u]
+    hot = [i for i, u in enumerate(index.urls) if "sujeeth.org" in u]
+    assert cold and hot and index.n == full.n
+    assert all(index.texts[i] is None for i in cold) and all(index.texts[i] for i in hot)
+    assert index.memory_bytes() < full.memory_bytes()
+    assert manager.describe()["text_not_in_memory_domains"] == ["themuse.com"]
+    # still found by words and by vector, and a phrase bonus is simply not given to a chunk without text
+    word = docs[1]["content"].split()[0]
+    hits, matching = index.search(li.query_terms(word), None, ["themuse.com"], ["resume"], limit=3)
+    assert hits and all(index.domain_names[index.domain_codes[row]] == "themuse.com" for row, _ in hits)
+    assert index.phrase_share(cold[0], [("w1 w2", 1.0)]) == 0.0
+
+
+def test_a_scan_leaves_the_text_out_of_the_skipped_domains_only():
+    store = new_store()
+    store.upsert_entities(entities(corpus(pages=4)))
+    rows = list(store.scan(True, ["themuse.com"]))
+    assert len(rows) == 20
+    for r in rows:
+        assert ("text" in r) == (r["domain"] != "themuse.com")
+
+
+def test_a_change_in_which_domains_keep_their_text_out_reloads_the_index(conf):
+    store = filled_store(corpus(pages=4))
+    skip = {"value": frozenset()}
+    manager = li.LocalIndexManager(store=store, text_skip_provider=lambda: skip["value"])
+    assert all(t for t in manager.current().texts)
+    skip["value"] = frozenset({"themuse.com"})
+    manager._last_check = float("-inf")
+    manager.current()  # starts the background check
+    assert wait_for(lambda: manager.describe()["text_not_in_memory_domains"] == ["themuse.com"])
+    assert any(t is None for t in manager.current().texts)
+
+
+def test_text_for_a_skipped_domain_is_read_from_the_table_when_a_result_needs_it(conf):
+    docs = corpus(pages=4)
+    store = filled_store(docs)
+    service = ss.SearchService.__new__(ss.SearchService)
+    service.local = li.LocalIndexManager(store=store, text_skip_provider=lambda: {"themuse.com"})
+    index = service.local.current()
+    rows = list(range(index.n))
+    texts = service._local_texts(index, rows)
+    assert len(texts) == index.n and all(t for t in texts.values())
+    assert texts[rows[1]] == next(d["content"] for d in docs if d["id"] == index.ids[rows[1]])[:li.MAX_TEXT_CHARS]
 
 
 # ---------------------------------------------------------------------------------------------------------------

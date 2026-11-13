@@ -458,13 +458,16 @@ class SearchService:
             if max_chars is not None and loaded >= max_chars:
                 break
             group = rows[position:position + batch]
-            if index.texts is not None:
-                texts = [index.texts[i] for i in group]
-            else:
+            # A chunk's text is in memory unless its domain keeps text in the table (None) or no text is in memory at all.
+            missing = [i for i in group if index.texts is None or index.texts[i] is None]
+            fetched = {}
+            if missing:
                 store = self.local.store()
-                with ThreadPoolExecutor(max_workers=max(1, min(batch, len(group)))) as pool:
-                    texts = [t or "" for t in pool.map(lambda i: store.get_text(index.ids[i]), group)]
-            for i, text in zip(group, texts):
+                with ThreadPoolExecutor(max_workers=max(1, min(batch, len(missing)))) as pool:
+                    for i, t in zip(missing, pool.map(lambda i: store.get_text(index.ids[i]), missing)):
+                        fetched[i] = t or ""
+            for i in group:
+                text = fetched[i] if i in fetched else index.texts[i]
                 out[i] = text
                 loaded += len(text)
             position += batch

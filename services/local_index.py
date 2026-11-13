@@ -34,6 +34,7 @@ from functools import lru_cache
 import numpy as np
 
 from services.config import settings
+from services.ontology_client import OntologyClient
 
 log = logging.getLogger("sujeeth-web-search.local-index")
 
@@ -228,7 +229,7 @@ def row_from_entity(entity):
 class LocalIndex:
     """An immutable snapshot. Built once from rows, then only read, so any number of searches can use it at once."""
 
-    def __init__(self, rows, keep_text=True):
+    def __init__(self, rows, keep_text=True, text_skip_domains=()):
         usable = []
         skipped = 0
         width = 0
@@ -251,7 +252,13 @@ class LocalIndex:
         self.titles = [r["title"] for r in usable]
         self.urls = [r["url"] for r in usable]
         self.concepts = [list(r["concepts"]) for r in usable]
-        self.texts = [r.get("text") or "" for r in usable] if keep_text else None
+        # Domains whose chunk text stays in the table (ontology index_policy.text_in_memory is false): their rows get None
+        # here and the text of the few chunks a search returns is read from the table. Their vectors and words are
+        # in the index like any other domain's, so they are searched the same way.
+        self.text_skip_domains = frozenset(str(d).lower() for d in text_skip_domains or ())
+        skip = self.text_skip_domains
+        self.texts = ([None if r["domain"] in skip else (r.get("text") or "") for r in usable]
+                      if keep_text else None)
 
         # domains and concepts become small integers and bits
         self.domain_names = sorted({r["domain"] for r in usable})
@@ -355,7 +362,7 @@ class LocalIndex:
         arrays = (self.codes, self.concept_bits, self.domain_codes, self.vocab, self.post_docs, self.post_weights, self.post_ptr)
         total = sum(a.nbytes for a in arrays)
         total += (self.vec8.nbytes + self.norm8.nbytes) if self.vec8 is not None else 0
-        total += sum(len(s) * 2 for s in (self.texts or [])) + sum(len(s) for s in self.ids) + sum(len(s) for s in self.urls)
+        total += sum(len(s) * 2 for s in (self.texts or []) if s) + sum(len(s) for s in self.ids) + sum(len(s) for s in self.urls)
         total += sum(len(s) for s in self.titles)
         return total
 
@@ -484,8 +491,8 @@ class LocalIndex:
     def phrase_share(self, row, phrases):
         """The weighted share (0 to 1) of the question's word pairs that this chunk's title or text holds side by side."""
         total = sum(w for _, w in phrases)
-        if total <= 0 or self.texts is None:
-            return 0.0
+        if total <= 0 or self.texts is None or self.texts[row] is None:
+            return 0.0  # no text in memory for this chunk, so no phrase bonus (see text_skip_domains)
         hay = (self.titles[row] + " \n " + self.texts[row]).lower()
         found = sum(w for phrase, w in phrases if phrase in hay or phrase.replace(" ", "-") in hay)
         return found / total
@@ -859,11 +866,22 @@ class LocalIndexStore:
             return None
 
     # -- reading everything ----------------------------------------------------------------------------------
-    def scan(self, keep_text=True):
-        select = (["id", "title", "url", "domain", "concepts", "vec", "tid", "tcnt"]
-                  + (["v8"] if settings.local_rescore else []) + (["text"] if keep_text else []))
-        for entity in self.chunks.list_entities(select=select, results_per_page=1000):
-            yield entity
+    def scan(self, keep_text=True, text_skip_domains=()):
+        """Every row, as the table returns it. With keep_text the rows carry their text, except those of
+        text_skip_domains: the table is read twice, once for the other domains with the text column and once for these
+        without it, so their text never crosses the wire at all."""
+        select = ["id", "title", "url", "domain", "concepts", "vec", "tid", "tcnt"] + (["v8"] if settings.local_rescore else [])
+        skip = sorted({str(d).lower() for d in text_skip_domains or () if d})
+        if not keep_text or not skip:
+            yield from self.chunks.list_entities(select=select + (["text"] if keep_text else []), results_per_page=1000)
+            return
+        params = {f"d{i}": d for i, d in enumerate(skip)}
+        others = " and ".join(f"domain ne @d{i}" for i in range(len(skip)))
+        these = " or ".join(f"domain eq @d{i}" for i in range(len(skip)))
+        yield from self.chunks.query_entities(query_filter=others, select=select + ["text"], parameters=params,
+                                              results_per_page=1000)
+        yield from self.chunks.query_entities(query_filter=these, select=select, parameters=params,
+                                              results_per_page=1000)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -897,8 +915,11 @@ class LocalIndexManager:
 
     FAILURE_COOLDOWN_SECONDS = 15.0
 
-    def __init__(self, store=None):
+    def __init__(self, store=None, text_skip_provider=None):
         self._store = store
+        self._text_skip_provider = text_skip_provider  # () -> domains whose text stays in the table; default: the ontology
+        self._ontology = None
+        self._text_skip = frozenset()
         self._index = None
         self._version = None
         self._loaded_at = float("-inf")
@@ -919,6 +940,24 @@ class LocalIndexManager:
         if self._store is None:
             self._store = LocalIndexStore()
         return self._store
+
+    def _current_text_skip(self):
+        """Domains whose chunk text is not held in memory: those the ontology marks index_policy.text_in_memory = false.
+        When the ontology cannot be read, the set this instance already uses stays in force (none, on the first load)."""
+        if not settings.local_index_text_in_memory:
+            return frozenset()  # no text in memory for anyone
+        try:
+            provider = self._text_skip_provider
+            if provider is None:
+                if not settings.ontology_api_url:
+                    return self._text_skip
+                self._ontology = self._ontology or OntologyClient()
+                provider = self._ontology.text_cold_domains
+            return frozenset(str(d).lower() for d in provider())
+        except Exception as exc:
+            log.warning("Local index: could not read which domains keep their text out of memory (%s); keeping %s",
+                        exc, sorted(self._text_skip) or "all text in memory")
+            return self._text_skip
 
     # -- using the index -----------------------------------------------------------------------------------------
     def current(self):
@@ -951,7 +990,8 @@ class LocalIndexManager:
         store = self.store()
         version = store.get_version()  # read first: a write during the scan then shows up as a newer token
         keep_text = settings.local_index_text_in_memory
-        rows = (row_from_entity(e) for e in store.scan(keep_text))
+        skip = self._current_text_skip()
+        rows = (row_from_entity(e) for e in store.scan(keep_text, skip))
         read_done = {}
 
         def counting():
@@ -959,11 +999,12 @@ class LocalIndexManager:
                 yield r
             read_done["t"] = time.perf_counter()
 
-        index = LocalIndex(counting(), keep_text=keep_text)
+        index = LocalIndex(counting(), keep_text=keep_text, text_skip_domains=skip)
         if not index.n:
             raise LocalIndexUnavailable("the local index table is empty; run the backfill first")
         now = time.perf_counter()
         self._index, self._version, self._loaded_at = index, version, time.monotonic()
+        self._text_skip = skip
         if self.on_swap:
             try:
                 self.on_swap()
@@ -992,8 +1033,10 @@ class LocalIndexManager:
         def work():
             try:
                 token = self.store().get_version()
+                skip = self._current_text_skip()  # an ontology change to which domains keep their text out reloads too
                 due = now - self._loaded_at >= settings.local_index_min_reload_seconds
-                if token and token != self._version and due and self._load_lock.acquire(blocking=False):
+                changed = bool(token and token != self._version) or skip != self._text_skip
+                if changed and due and self._load_lock.acquire(blocking=False):
                     try:
                         self._reload_locked()
                     finally:
@@ -1030,6 +1073,7 @@ class LocalIndexManager:
             "memory_mb": round(index.memory_bytes() / 1e6, 1) if index else 0,
             "process_memory_mb": process_memory_mb(),
             "text_in_memory": settings.local_index_text_in_memory,
+            "text_not_in_memory_domains": sorted(self._text_skip),
             "version": self._version,
             "age_seconds": round(time.monotonic() - self._loaded_at) if index else None,
             "loads": s["loads"],
