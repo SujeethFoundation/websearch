@@ -915,8 +915,11 @@ class LocalIndexManager:
 
     FAILURE_COOLDOWN_SECONDS = 15.0
 
-    def __init__(self, store=None, text_skip_provider=None):
+    def __init__(self, store=None, text_skip_provider=None, snapshot_store=None):
         self._store = store
+        self._snapshots = snapshot_store        # services.index_snapshot.SnapshotStore; resolved from settings when None
+        self._snapshots_resolved = snapshot_store is not None
+        self._snapshot_lock = threading.Lock()  # one snapshot upload at a time on this instance
         self._text_skip_provider = text_skip_provider  # () -> domains whose text stays in the table; default: the ontology
         self._ontology = None
         self._text_skip = frozenset()
@@ -929,7 +932,9 @@ class LocalIndexManager:
         self._checking = threading.Lock()
         self.on_swap = None  # called after a rebuilt index replaces the old one (the search service clears its answers)
         self.stats = {"loads": 0, "load_seconds": None, "build_seconds": None, "last_error": None, "searches": 0,
-                      "embed_ms_total": 0.0, "search_ms_total": 0.0, "keyword_only": 0, "rescored": 0}
+                      "embed_ms_total": 0.0, "search_ms_total": 0.0, "keyword_only": 0, "rescored": 0,
+                      "source": None, "snapshot_seconds": None, "snapshot_skipped": None, "snapshot_error": None,
+                      "snapshot_published": None}
         self._stats_lock = threading.Lock()
 
     @property
@@ -941,9 +946,10 @@ class LocalIndexManager:
             self._store = LocalIndexStore()
         return self._store
 
-    def _current_text_skip(self):
+    def _current_text_skip(self, fallback=None):
         """Domains whose chunk text is not held in memory: those the ontology marks index_policy.text_in_memory = false.
-        When the ontology cannot be read, the set this instance already uses stays in force (none, on the first load)."""
+        When the ontology cannot be read, the set this instance already uses stays in force; on the first load that is
+        `fallback` (the set a snapshot was built with) when given, otherwise none."""
         if not settings.local_index_text_in_memory:
             return frozenset()  # no text in memory for anyone
         try:
@@ -955,9 +961,10 @@ class LocalIndexManager:
                 provider = self._ontology.text_cold_domains
             return frozenset(str(d).lower() for d in provider())
         except Exception as exc:
+            kept = self._text_skip or frozenset(fallback or ())
             log.warning("Local index: could not read which domains keep their text out of memory (%s); keeping %s",
-                        exc, sorted(self._text_skip) or "all text in memory")
-            return self._text_skip
+                        exc, sorted(kept) or "all text in memory")
+            return kept
 
     # -- using the index -----------------------------------------------------------------------------------------
     def current(self):
@@ -985,21 +992,31 @@ class LocalIndexManager:
                 log.warning("Local index could not be loaded: %s", self.stats["last_error"])
                 raise LocalIndexUnavailable(self.stats["last_error"]) from exc
 
-    def _reload_locked(self):
+    def _reload_locked(self, use_snapshot=True, publish=None):
+        """Build the index and swap it in. From the prebuilt snapshot when one is current, else from the table.
+        publish: None saves a snapshot after a table build when INDEX_SNAPSHOT_AUTOBUILD is on (in the background);
+        True saves one now and waits (the snapshot route)."""
         began = time.perf_counter()
         store = self.store()
         version = store.get_version()  # read first: a write during the scan then shows up as a newer token
         keep_text = settings.local_index_text_in_memory
-        skip = self._current_text_skip()
-        rows = (row_from_entity(e) for e in store.scan(keep_text, skip))
+        index, skip, source, rows = None, None, "table", None
         read_done = {}
+        if use_snapshot:
+            loaded = self._load_from_snapshot(version, keep_text)
+            if loaded:
+                index, skip = loaded
+                source = "snapshot"
+        if index is None:
+            skip = self._current_text_skip()
+            rows = (row_from_entity(e) for e in store.scan(keep_text, skip))
 
-        def counting():
-            for r in rows:
-                yield r
-            read_done["t"] = time.perf_counter()
+            def counting():
+                for r in rows:
+                    yield r
+                read_done["t"] = time.perf_counter()
 
-        index = LocalIndex(counting(), keep_text=keep_text, text_skip_domains=skip)
+            index = LocalIndex(counting(), keep_text=keep_text, text_skip_domains=skip)
         if not index.n:
             raise LocalIndexUnavailable("the local index table is empty; run the backfill first")
         now = time.perf_counter()
@@ -1013,16 +1030,104 @@ class LocalIndexManager:
         del rows
         release_memory()
         self.stats["loads"] += 1
+        self.stats["source"] = source
         self.stats["load_seconds"] = round(now - began, 2)
-        self.stats["build_seconds"] = round(now - read_done.get("t", began), 2)
+        self.stats["build_seconds"] = round(now - read_done.get("t", began), 2) if source == "table" else None
         self.stats["last_error"] = None
-        log.info("Local index loaded: %d chunks, %d pages, %.1f MB, %.1f s", index.n, len(index.pages),
-                 index.memory_bytes() / 1e6, now - began)
+        log.info("Local index loaded from the %s: %d chunks, %d pages, %.1f MB, %.1f s", source, index.n,
+                 len(index.pages), index.memory_bytes() / 1e6, now - began)
+        if source == "table" and version and (publish or (publish is None and settings.index_snapshot_autobuild)):
+            if publish:
+                self._publish_snapshot(index, version, skip, force=True)
+            else:
+                threading.Thread(target=self._publish_snapshot, args=(index, version, skip),
+                                 name="index-snapshot-publish", daemon=True).start()
 
-    def reload(self):
-        """Rebuild now, on this instance, and wait for it. Used by the reload route and the preload."""
+    # -- the prebuilt snapshot -----------------------------------------------------------------------------------
+    def _snapshot_store(self):
+        if not settings.index_snapshot_enabled:
+            return None
+        if not self._snapshots_resolved:
+            self._snapshots_resolved = True
+            try:
+                from services.index_snapshot import SnapshotStore
+                self._snapshots = SnapshotStore.from_settings()
+            except Exception:
+                log.warning("Index snapshots are unavailable", exc_info=True)
+                self._snapshots = None
+        return self._snapshots
+
+    def _load_from_snapshot(self, version, keep_text):
+        """(index, text_skip) from the current snapshot, or None when there is none or it cannot stand in for a scan.
+        Never raises: whatever goes wrong, the caller scans the table."""
+        snaps = self._snapshot_store()
+        if snaps is None:
+            return None
+        from services import index_snapshot
+        began = time.perf_counter()
+        try:
+            manifest = snaps.read_manifest()
+            if manifest is None:
+                self.stats["snapshot_skipped"] = "no snapshot has been published yet"
+                return None
+            skip = self._current_text_skip(fallback=frozenset(manifest.get("text_skip") or ()))
+            usable, why = index_snapshot.compatible(manifest, version=version, keep_text=keep_text, text_skip=skip,
+                                                    rescore=settings.local_rescore)
+            if not usable:
+                self.stats["snapshot_skipped"] = why
+                log.info("Index snapshot not used: %s", why)
+                return None
+            index = snaps.load(manifest, LocalIndex, keep_text=keep_text, text_skip=skip, rescore=settings.local_rescore)
+        except Exception as exc:
+            self.stats["snapshot_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            log.warning("Index snapshot could not be used, scanning the table instead: %s", self.stats["snapshot_error"])
+            return None
+        self.stats["snapshot_skipped"] = None
+        self.stats["snapshot_error"] = None
+        self.stats["snapshot_seconds"] = round(time.perf_counter() - began, 2)
+        return index, skip
+
+    def _publish_snapshot(self, index, version, skip, force=False):
+        """Save this instance's freshly built index as the snapshot the other instances read. Never raises."""
+        snaps = self._snapshot_store()
+        if snaps is None:
+            return None
+        began = time.perf_counter()
+        with self._snapshot_lock:
+            try:
+                manifest = snaps.publish(index, version, skip, force=force)
+            except Exception as exc:
+                self.stats["snapshot_error"] = f"{type(exc).__name__}: {exc}"[:300]
+                log.warning("Index snapshot could not be saved: %s", self.stats["snapshot_error"])
+                return None
+        if manifest:
+            self.stats["snapshot_published"] = {"version": manifest["version"], "at": manifest["built_at"],
+                                                "seconds": round(time.perf_counter() - began, 1)}
+            log.info("Index snapshot saved: %d chunks, %.1f s", manifest["scalars"]["n"], time.perf_counter() - began)
+        return manifest
+
+    def snapshot_status(self):
+        """What this instance did with snapshots, and what the container holds now."""
+        out = dict(self.describe()["snapshot"])
+        snaps = self._snapshot_store()
+        out["configured"] = snaps is not None
+        if snaps is not None:
+            try:
+                m = snaps.read_manifest()
+                out["current"] = None if m is None else {
+                    "version": m["version"], "build": m["build"], "built_at": m["built_at"], "chunks": m["scalars"]["n"],
+                    "megabytes": round(sum(a["bytes"] for a in m["arrays"].values()) / 1e6, 1),
+                    "text_not_in_memory_domains": m["text_skip"], "has_8bit_vectors": m["has_vec8"],
+                    "matches_table": m["version"] == self.store().get_version()}
+            except Exception as exc:
+                out["current_error"] = f"{type(exc).__name__}: {exc}"[:300]
+        return out
+
+    def reload(self, use_snapshot=True, publish=None):
+        """Rebuild now, on this instance, and wait for it. Used by the reload route and the preload.
+        use_snapshot=False reads the table even when a snapshot is current; publish=True then saves a new snapshot."""
         with self._load_lock:
-            self._reload_locked()
+            self._reload_locked(use_snapshot=use_snapshot, publish=publish)
 
     def _maybe_refresh(self):
         now = time.monotonic()
@@ -1074,6 +1179,10 @@ class LocalIndexManager:
             "process_memory_mb": process_memory_mb(),
             "text_in_memory": settings.local_index_text_in_memory,
             "text_not_in_memory_domains": sorted(self._text_skip),
+            "load_source": s["source"],
+            "snapshot": {"enabled": bool(settings.index_snapshot_enabled), "load_seconds": s["snapshot_seconds"],
+                         "not_used_because": s["snapshot_skipped"], "error": s["snapshot_error"],
+                         "published": s["snapshot_published"]},
             "version": self._version,
             "age_seconds": round(time.monotonic() - self._loaded_at) if index else None,
             "loads": s["loads"],

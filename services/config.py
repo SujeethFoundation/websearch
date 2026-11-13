@@ -137,6 +137,19 @@ class Settings:
     # batch means fewer round trips.
     index_backfill_batch_size = max(1, min(int(os.getenv("INDEX_BACKFILL_BATCH_SIZE", "50")), 100))
 
+    # A prebuilt copy of the in-memory index in Blob Storage (see services/index_snapshot.py). An instance that starts or
+    # reloads reads it instead of scanning and parsing the whole table, when the table's version row still matches the
+    # snapshot's. Any problem with it means the table is scanned as before.
+    index_snapshot_enabled = _flag("INDEX_SNAPSHOT_ENABLED", True)
+    # After an instance has built the index from the table, it saves a snapshot for the others (one instance builds it,
+    # whichever claims it first). false: only POST /api/index/snapshot builds one.
+    index_snapshot_autobuild = _flag("INDEX_SNAPSHOT_AUTOBUILD", True)
+    index_snapshot_prefix = os.getenv("INDEX_SNAPSHOT_PREFIX", "index-snapshot").strip().strip("/") or "index-snapshot"
+    # Parallel range requests per blob download or upload.
+    index_snapshot_concurrency = _int("INDEX_SNAPSHOT_CONCURRENCY", 4, 1, 16)
+    # Files of older builds are deleted once nothing has written to them for this long (a reader may be mid-download).
+    index_snapshot_keep_seconds = _int("INDEX_SNAPSHOT_KEEP_SECONDS", 3600, 0)
+
     max_pages = int(os.getenv("MAX_PAGES_PER_DOMAIN", "10000"))
     max_crawl_depth = int(os.getenv("MAX_CRAWL_DEPTH", "5"))
     crawl_delay = float(os.getenv("CRAWL_DELAY_SECONDS", "0.5"))

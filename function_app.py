@@ -1187,6 +1187,28 @@ def local_index_reload(req):
         return response({"error": str(exc)}, 502)
 
 
+@app.route(route="index/snapshot", methods=["GET", "POST"])
+def index_snapshot(req):
+    """GET: what this instance did with the prebuilt index snapshot and what the container holds now.
+    POST: read the table on this instance and save a new snapshot for every instance to load (it runs in the
+    background, a minute or so on the live index: poll GET, where `current.matches_table` turns true)."""
+    if not searcher.local.enabled:
+        return response({"error": "Set LOCAL_INDEX_CONNECTION_STRING (or the blob storage connection string) first."}, 503)
+    if req.method == "GET":
+        return response(searcher.local.snapshot_status())
+    if searcher.local._snapshot_store() is None:
+        return response({"error": "Snapshots are off (INDEX_SNAPSHOT_ENABLED) or there is no blob storage connection."}, 503)
+
+    def build():
+        try:
+            searcher.local.reload(use_snapshot=False, publish=True)
+        except Exception:
+            log.exception("Index snapshot build failed")
+
+    threading.Thread(target=build, name="index-snapshot-build", daemon=True).start()
+    return response({"status": "started", "note": "GET /api/index/snapshot shows the result."}, 202)
+
+
 def _preload_local_index():
     try:
         searcher.local.current()

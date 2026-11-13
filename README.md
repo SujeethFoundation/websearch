@@ -27,6 +27,7 @@ All routes require a Function key and are under `/api`.
 | `POST /domain-resolution` | Show how a query resolves to concepts and domains |
 | `POST /search/explain` | Why the search ranks a question as it does and where the page it should find stands. Body: `query`, `expect` (pieces of the right page's address), optional `concepts`, `domains`, `ranking` |
 | `GET /local-index/status`, `POST /local-index/reload` | What this instance has loaded (`?count=true` also counts the table's rows and the queue); rebuild this instance's index now |
+| `GET /index/snapshot`, `POST /index/snapshot` | What this instance did with the prebuilt index snapshot and what the container holds (`current.matches_table` says whether it is current). `POST` reads the table on this instance and saves a new snapshot in the background |
 | `POST /embed-cache/seed` | Embed common questions ahead of time (see Search) |
 | `POST /document` | Read an indexed page. Body: `url` or `chunk_id`, optional `neighbors` (0–3, default 1), `max_chars` (500–20000, default 6000) |
 | `GET /sources` | Approved search sources |
@@ -107,6 +108,8 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `LOCAL_INDEX_POLL_SECONDS`, `LOCAL_INDEX_MIN_RELOAD_SECONDS` | `60`, `600` | How often an instance checks the version row, and the least time between rebuilds |
 | `LOCAL_INDEX_TITLE_WEIGHT` | `3` | How much a title word counts against a body word in keyword scoring. Used when a chunk is written, so changing it needs a backfill with `mode: all` |
 | `LOCAL_INDEX_PRELOAD` | `true` | Load the index when the worker starts, not at the first search |
+| `INDEX_SNAPSHOT_ENABLED`, `INDEX_SNAPSHOT_AUTOBUILD` | `true`, `true` | Read a prebuilt copy of the index from Blob Storage instead of scanning the table, and save one after a table build (see Search). `false` for the first turns snapshots off entirely; `false` for the second leaves building to `POST /api/index/snapshot` |
+| `INDEX_SNAPSHOT_PREFIX`, `INDEX_SNAPSHOT_CONCURRENCY`, `INDEX_SNAPSHOT_KEEP_SECONDS` | `index-snapshot`, `4`, `3600` | Where in the blob container the snapshot lives (nothing else lists that prefix), parallel range requests per blob, and how long older builds are kept before they are deleted |
 | `LOCAL_INDEX_STOPWORDS` | `none` | `english` drops 33 common words from questions (not from chunks) |
 | `SEARCH_VECTOR_K`, `LOCAL_TEXT_RECALL` | `0` (50), `0` (1,000) | How many vector and keyword results go into the rank fusion |
 | `LOCAL_RESCORE`, `LOCAL_RESCORE_POOL` | `true`, `300` | Re-rank the vector shortlist by cosine similarity on 8-bit vectors |
@@ -154,6 +157,28 @@ with `mode: all` after changing how chunks are analysed (the title weight, or th
 reports what this instance has loaded; with `?count=true` it also counts the table's rows (in all and per domain, a read of
 keys and domains that takes a few seconds on a large table) and the messages waiting on the queue, which is how a backfill is
 followed.
+
+**Prebuilt snapshot.** Every instance used to scan the whole table, parse every row in Python and build the same arrays
+(postings, code matrix, page and concept lookups). Now one instance does that and saves the finished arrays under
+`index-snapshot/` in the blob container; an instance that starts or reloads reads them back. The snapshot is used only when
+the table's version row equals the snapshot's version, so it is exactly as fresh as a scan. In every other case (no snapshot,
+the table changed, a different format, a different set of text-cold domains, a missing or damaged blob, storage down) the
+table is scanned as before and a search is never affected. `/api/health` (`local_index.load_source`, `local_index.snapshot`)
+and `GET /api/index/snapshot` say which happened and why.
+
+- **Who builds it.** After a table build, an instance claims the build (`<version>-<fingerprint>/claim.json`, created only if
+  absent) and uploads it in the background; instances that start together build it once. A claim older than 20 minutes belongs
+  to a builder that died and is taken over. The manifest, `latest.json`, is written last, so a reader never sees a half-written
+  build. `POST /api/index/snapshot` builds one on demand.
+- **What it holds.** The arrays as raw `.bin` blobs (about 280 MB at 86,500 chunks, 133 MB of it the 8-bit vectors) and one
+  gzip JSON file for ids, titles, urls, concepts and the text of the domains that keep their text in memory. With rescoring off
+  the 8-bit vectors are not downloaded. A reader that keeps more domains' text in the table than the snapshot did drops that
+  text on load; one that wants text the snapshot lacks scans instead.
+- **The ontology.** If the ontology cannot be read on a first load, the snapshot's own set of text-cold domains is used
+  rather than loading every domain's text.
+- **Cost.** An instance that builds a snapshot holds a few copies of one array at a time while it uploads (the largest is the
+  133 MB of vectors). Set `INDEX_SNAPSHOT_AUTOBUILD=false` and build with `POST /api/index/snapshot` when no instance can spare it.
+  Old builds are deleted an hour after they were last written.
 
 **Rescoring.** The 1-bit codes find a shortlist of close chunks quickly but rank close neighbours poorly (many equal
 distances). Each row also holds the chunk's vector at 8 bits a dimension, and the search re-ranks the best
