@@ -63,6 +63,10 @@ PHRASE_SPAN = 4  # two of the question's content words make a phrase when at mos
 _TOKEN = re.compile(r"[^\W_]+")  # runs of letters and digits in any script
 
 
+class LocalIndexLoading(RuntimeError):
+    """This instance is still loading its first index and LOCAL_INDEX_FAIL_FAST is on: try again in a moment."""
+
+
 class LocalIndexUnavailable(RuntimeError):
     """The in-memory index is not loaded, is empty, or could not be loaded."""
 
@@ -362,7 +366,14 @@ class LocalIndex:
         arrays = (self.codes, self.concept_bits, self.domain_codes, self.vocab, self.post_docs, self.post_weights, self.post_ptr)
         total = sum(a.nbytes for a in arrays)
         total += (self.vec8.nbytes + self.norm8.nbytes) if self.vec8 is not None else 0
-        total += sum(len(s) * 2 for s in (self.texts or []) if s) + sum(len(s) for s in self.ids) + sum(len(s) for s in self.urls)
+        texts = self.texts
+        if texts is None:
+            text_bytes = 0
+        elif hasattr(texts, "nbytes"):
+            text_bytes = texts.nbytes()   # a restored snapshot holds its text as bytes: nothing is decoded to count it
+        else:
+            text_bytes = sum(len(s) * 2 for s in texts if s)
+        total += text_bytes + sum(len(s) for s in self.ids) + sum(len(s) for s in self.urls)
         total += sum(len(s) for s in self.titles)
         return total
 
@@ -970,6 +981,8 @@ class LocalIndexManager:
     def current(self):
         index = self._index
         if index is None:
+            if settings.local_index_fail_fast and self._load_lock.locked():
+                raise LocalIndexLoading("the local index is still loading on this instance")
             self._load_first()
             index = self._index
             if index is None:

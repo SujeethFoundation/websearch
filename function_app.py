@@ -9,6 +9,7 @@ import azure.functions as func
 from urllib.parse import urlparse
 
 from services.config import settings, VERSION
+from services.local_index import LocalIndexLoading
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
@@ -106,12 +107,20 @@ def process_info():
     }
 
 
-def response(data, status=200):
+def response(data, status=200, headers=None):
     return func.HttpResponse(
         json.dumps(data, ensure_ascii=False, default=str),
         status_code=status,
         mimetype="application/json",
+        headers=headers,
     )
+
+
+def index_loading_response(exc):
+    """503 with Retry-After for a search that reached an instance still loading its index (LOCAL_INDEX_FAIL_FAST)."""
+    wait = settings.local_index_retry_after
+    return response({"error": str(exc), "stage": "index_loading", "retry_after_seconds": wait}, 503,
+                    headers={"Retry-After": str(wait)})
 
 
 def _domains(body):
@@ -313,6 +322,8 @@ def search_get(req):
         concepts = [x.strip() for x in (req.params.get("concepts") or "").split(",") if x.strip()]
         domains = [x.strip() for x in (req.params.get("domains") or "").split(",") if x.strip()]
         return response(run_search(query, concepts, domains, "search", limit))
+    except LocalIndexLoading as exc:
+        return index_loading_response(exc)
     except Exception as exc:
         log.exception("Search failed")
         return response({"error": str(exc), "stage": "concept_resolution_or_search"}, 502)
@@ -334,6 +345,8 @@ def search_post(req):
             limit=limit,
             ranking=body.get("ranking"),
         ))
+    except LocalIndexLoading as exc:
+        return index_loading_response(exc)
     except Exception as exc:
         log.exception("Search failed")
         return response({"error": str(exc), "stage": "concept_resolution_or_search"}, 502)

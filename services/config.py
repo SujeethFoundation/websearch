@@ -85,6 +85,11 @@ class Settings:
     local_index_min_reload_seconds = _int("LOCAL_INDEX_MIN_RELOAD_SECONDS", 600, 0)
     local_index_title_weight = _int("LOCAL_INDEX_TITLE_WEIGHT", 3, 1, 20)
     local_index_preload = _flag("LOCAL_INDEX_PRELOAD", True)
+    # While an instance is still loading its first index, a search normally waits for the load, and holds one of the
+    # instance's concurrent request slots meanwhile. true: it fails at once (HTTP 503 with Retry-After) so the slot
+    # stays free and the caller can retry or be sent elsewhere. Off by default.
+    local_index_fail_fast = _flag("LOCAL_INDEX_FAIL_FAST", False)
+    local_index_retry_after = _int("LOCAL_INDEX_RETRY_AFTER_SECONDS", 3, 1, 60)
     # The 1-bit codes find a shortlist of close chunks quickly, but they rank poorly among close neighbours. Each chunk
     # also keeps its vector at 8 bits a dimension (about 1.5 KB), and the best LOCAL_RESCORE_POOL chunks by code are
     # re-ranked by cosine similarity on those. Needs the table rows to carry the vectors (run the backfill again after

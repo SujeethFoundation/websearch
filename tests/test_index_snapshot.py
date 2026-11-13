@@ -96,15 +96,28 @@ PLAIN = ("n", "skipped", "ids", "titles", "urls", "concepts", "texts", "domain_n
          "concept_words", "distinct_pages", "vec_dims", "rows_without_vectors", "text_skip_domains", "pages", "by_url", "by_id")
 
 
+def text_term(index):
+    """What memory_bytes() counts for the text: chars * 2 for a list, the real bytes for a restored snapshot."""
+    texts = index.texts
+    if texts is None:
+        return 0
+    return texts.nbytes() if hasattr(texts, "nbytes") else sum(len(t) * 2 for t in texts if t)
+
+
 def same_index(a, b):
     for name in PLAIN:
+        if name == "texts":
+            assert (a.texts is None) == (b.texts is None)
+            if a.texts is not None:
+                assert list(a.texts) == list(b.texts), name   # a restored snapshot holds LazyTexts, not a list
+            continue
         assert getattr(a, name) == getattr(b, name), name
     for name in ARRAYS:
         x, y = getattr(a, name), getattr(b, name)
         assert (x is None) == (y is None), name
         if x is not None:
             assert x.dtype == y.dtype and x.shape == y.shape and np.array_equal(x, y), name
-    assert a.memory_bytes() == b.memory_bytes()
+    assert a.memory_bytes() - text_term(a) == b.memory_bytes() - text_term(b)
 
 
 def build(skip=("themuse.com",), keep_text=True):
