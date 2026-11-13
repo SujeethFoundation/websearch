@@ -40,3 +40,43 @@ def test_total_can_reach_eight_with_five_normal_and_three_best_bets():
 def test_no_manual_results_leaves_normal_results_unchanged_apart_from_flag():
     out = merge_best_bets([hit("https://s/1")], [])
     assert out == [{**hit("https://s/1"), "best_bet": False}]
+
+
+# -- the relevance check -------------------------------------------------------------------------------------------
+
+from services.best_bets import dropped_best_bets, top_pages  # noqa: E402
+
+
+def test_a_manual_page_the_main_search_does_not_rank_is_not_a_best_bet():
+    main = [hit(f"https://s/{i}") for i in range(8)]
+    manual = [hit("https://m/unrelated"), hit("https://s/2")]
+    out = merge_best_bets(main, manual, max_best=3, within_rank=5)
+    assert [x["url"] for x in out if x["best_bet"]] == ["https://s/2"]
+    assert out[0]["url"] == "https://s/2"                 # promoted to the front, once
+    assert [x["url"] for x in out].count("https://s/2") == 1
+    assert "https://m/unrelated" not in [x["url"] for x in out]
+
+
+def test_the_check_counts_distinct_pages_not_chunks():
+    main = [hit("https://s/1", chunk="a"), hit("https://s/1", chunk="b"), hit("https://s/2"), hit("https://s/3")]
+    assert top_pages(main, 2) == {"s/1", "s/2"} or len(top_pages(main, 2)) == 2
+    manual = [hit("https://s/3")]
+    assert [x["best_bet"] for x in merge_best_bets(main, manual, within_rank=2)][0] is False   # third page: outside
+    assert merge_best_bets(main, manual, within_rank=3)[0]["best_bet"] is True                 # inside
+
+
+def test_rank_zero_keeps_every_manual_page_as_before():
+    main = [hit(f"https://s/{i}") for i in range(8)]
+    manual = [hit("https://m/1"), hit("https://m/2")]
+    out = merge_best_bets(main, manual, max_best=3, within_rank=0)
+    assert [x["url"] for x in out[:2]] == ["https://m/1", "https://m/2"] and dropped_best_bets(main, manual, 0) == 0
+
+
+def test_the_check_reports_how_many_manual_pages_it_left_out():
+    main = [hit(f"https://s/{i}") for i in range(8)]
+    manual = [hit("https://m/1"), hit("https://m/2"), hit("https://s/1")]
+    assert dropped_best_bets(main, manual, 5) == 2
+
+
+def test_no_manual_page_ranks_when_the_main_search_found_nothing():
+    assert merge_best_bets([], [hit("https://m/1")], within_rank=5) == []

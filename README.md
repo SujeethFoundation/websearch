@@ -23,7 +23,7 @@ All routes require a Function key and are under `/api`.
 | Route | Purpose |
 |---|---|
 | `GET /health` | Version, configuration flags, the index, caches and the process |
-| `GET /search?q=` and `POST /search` | Ontology-gated hybrid search. Body: `query`, optional `concepts`, `domains`, `limit` (max 5) |
+| `GET /search?q=` and `POST /search` | Ontology-gated hybrid search. Body: `query`, optional `concepts`, `domains`, `limit` (default 5, at most `SEARCH_MAX_LIMIT`, default 20). The answer includes the `resolution` (matched concepts, their source, the approved domains), so a caller needs no separate `domain-resolution` request first |
 | `POST /domain-resolution` | Show how a query resolves to concepts and domains |
 | `POST /search/explain` | Why the search ranks a question as it does and where the page it should find stands. Body: `query`, `expect` (pieces of the right page's address), optional `concepts`, `domains`, `ranking` |
 | `GET /local-index/status`, `POST /local-index/reload` | What this instance has loaded (`?count=true` also counts the table's rows and the queue); rebuild this instance's index now |
@@ -208,7 +208,15 @@ matched by keyword or vector; it never adds one that matched nothing. `0` turns 
 **Every result is a different page.** With `SEARCH_UNIQUE_PAGES` (on by default) a page appears once, as its best chunk, and
 the `www.` and bare copies of an address (`www.sujeeth.org/circle` and `sujeeth.org/circle/`) are one page. An answer holds fewer
 than `limit` results only when fewer pages match. Best bets and spotlights are placed first, and a page they share with the
-ordinary results appears once, as the curated copy. `"ranking": {"unique_pages": false}` on one request (or
+ordinary results appears once, as the curated copy.
+
+**Spotlights are boosted three ways.** The ontology says a Spotlight illustrates career development and the career skills (networking, interviewing, job applications, salary negotiation), so a question on any of them reserves up to `SPOTLIGHT_SLOTS` (3) places for Spotlight stories, placed first and flagged `spotlight`. A Spotlight added that way also counts toward the main ranking at `SPOTLIGHT_CONCEPT_WEIGHT` (1.0; 0 leaves it out), so Spotlight pages that are not in a reserved place rank higher too. The MCP server then tells the agent to offer a Spotlight as a real example, with its link.
+
+**A best bet must also rank in the main search.** Best bets are searched among the few hand-added pages alone, where the top
+page scores high whatever it says. So a hand-added page is a best bet only when it is also among the first
+`BEST_BET_MAX_RANK` (5) pages of the main search, which ranks every selected domain together. `0` turns the check off. When it
+leaves pages out, `best_bets.not_relevant` says how many. Pages that were not ranked in the main search are left to the
+ordinary results, so a question about 2025 expenses is no longer led by a profile page that merely matched "Foundation". `"ranking": {"unique_pages": false}` on one request (or
 `SEARCH_UNIQUE_PAGES=false`) allows repeats again, and then `LOCAL_MAX_PER_PAGE` (2) prefers at most that many chunks of a
 page, refilling with repeats if too few pages match.
 

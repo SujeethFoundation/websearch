@@ -15,5 +15,11 @@
   {"question": "How do I explain a gap on my resume?",
    "expect": ["explain-a-gap-in-your-resume", "explain-your-employment-gap"]},
   {"question": "What is a good thank-you email?",
-   "expect": ["thank-you-email-templates", "thankyou-note", "thank-you-email-subject-line"]}
+   "expect": ["thank-you-email-templates", "thankyou-note", "thank-you-email-subject-line"]},
+  {"question": "What were the Foundation's total expenses in 2025?",
+   "expect": ["AnnualReport"],
+   "note": "A financial question. The hand-added Candid profile and portal Books page must not outrank the annual report."},
+  {"question": "How do I volunteer as a mentor and what is the time commitment?",
+   "expect": ["sujeeth.org/volunteer"],
+   "note": "Added with the best-bet relevance check: a hand-added page should lead only when it answers the question."}
 ]

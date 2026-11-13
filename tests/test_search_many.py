@@ -374,3 +374,105 @@ def test_run_search_makes_one_pass_over_the_index(conf, monkeypatch):
     wire(monkeypatch, svc)
     fa.run_search("w3 w14 mentor")
     assert svc.local.describe()["searches"] == 1 and len(svc.embedder.calls) == 1
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# relevance of best bets, and how many results a request may ask for
+# ---------------------------------------------------------------------------------------------------------------
+
+def page_keys(results):
+    return [fa._page_identity(r) for r in results]
+
+
+@pytest.mark.parametrize("query", ["w3 w14 mentor", "w27 w5 w60 circle", "week 4 agenda"])
+def test_a_best_bet_must_also_rank_in_the_main_search(conf, monkeypatch, query):
+    monkeypatch.setattr(settings, "local_rescore_pool", 20)
+    svc = service(VectorEmbedder(np.random.default_rng(len(query)).standard_normal(DIMS)))
+    monkeypatch.setattr(settings, "best_bet_max_rank", 0)
+    wire(monkeypatch, svc)
+    ungated = fa.run_search(query, limit=10)
+    monkeypatch.setattr(settings, "best_bet_max_rank", 3)
+    wire(monkeypatch, svc)
+    gated = fa.run_search(query, limit=10)
+    # The main ranking alone (run_search puts reserved spotlight pages in front of it, which is not a rank).
+    main = svc.search(query, concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"], limit=10,
+                      concept_weights=fa.question_concept_weights(RESOLUTION))
+    top3 = set(page_keys(main["results"])[:3])
+    bets = [r for r in gated["results"] if r.get("best_bet")]
+    assert all(fa._page_identity(r) in top3 for r in bets)                      # every best bet is a top-3 page of the main search
+    assert {fa._page_identity(r) for r in bets} <= {fa._page_identity(r) for r in ungated["results"] if r.get("best_bet")}
+    assert gated["best_bets"]["count"] == len(bets)
+
+
+def test_the_check_off_places_every_manual_page_first_as_before(conf, monkeypatch):
+    monkeypatch.setattr(settings, "local_rescore_pool", 20)
+    svc = service(VectorEmbedder(np.random.default_rng(3).standard_normal(DIMS)))
+    monkeypatch.setattr(settings, "best_bet_max_rank", 0)
+    wire(monkeypatch, svc)
+    out = fa.run_search("w3 w14 mentor", limit=5)
+    assert "not_relevant" not in out["best_bets"]
+
+
+class FakeRequest:
+    params = {}
+
+    def __init__(self, body):
+        self.body = body
+
+    def get_json(self):
+        return self.body
+
+
+@pytest.mark.parametrize("asked, expected", [(50, 20), (12, 12), (None, 5), (0, 1)])
+def test_a_request_may_ask_for_up_to_the_configured_limit(monkeypatch, asked, expected):
+    seen = []
+    monkeypatch.setattr(fa, "run_search", lambda **kw: seen.append(kw["limit"]) or {"results": []})
+    body = {"query": "mentor"} if asked is None else {"query": "mentor", "limit": asked}
+    fa.search_post(FakeRequest(body))
+    assert seen == [expected]
+
+
+def test_the_limit_ceiling_is_a_setting(monkeypatch):
+    seen = []
+    monkeypatch.setattr(fa, "run_search", lambda **kw: seen.append(kw["limit"]) or {"results": []})
+    monkeypatch.setattr(settings, "search_max_limit", 5)
+    fa.search_post(FakeRequest({"query": "mentor", "limit": 50}))
+    assert seen == [5]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# boosting Spotlights
+# ---------------------------------------------------------------------------------------------------------------
+
+CAREER = {"concept_matches": [
+    {"concept_id": "career_development", "confidence": 1.2, "source": "query_match"},
+    {"concept_id": "spotlight", "confidence": None, "source": "relationship"}]}
+
+
+def test_a_spotlight_added_by_relationship_counts_toward_the_ranking(monkeypatch):
+    monkeypatch.setattr(settings, "spotlight_concept_weight", 1.0)
+    assert fa.question_concept_weights(CAREER) == {"career_development": 1.2, "spotlight": 1.0}
+
+
+def test_the_spotlight_weight_is_a_setting_and_zero_leaves_it_out(monkeypatch):
+    monkeypatch.setattr(settings, "spotlight_concept_weight", 0.5)
+    assert fa.question_concept_weights(CAREER)["spotlight"] == 0.5
+    monkeypatch.setattr(settings, "spotlight_concept_weight", 0)
+    assert "spotlight" not in fa.question_concept_weights(CAREER)
+
+
+def test_other_relationship_concepts_stay_out_of_the_weights(monkeypatch):
+    monkeypatch.setattr(settings, "spotlight_concept_weight", 1.0)
+    res = {"concept_matches": [{"concept_id": "networking", "confidence": 1.1, "source": "query_match"},
+                               {"concept_id": "week_4", "confidence": None, "source": "relationship"}]}
+    assert fa.question_concept_weights(res) == {"networking": 1.1}
+
+
+def test_a_spotlight_the_question_named_keeps_its_own_weight(monkeypatch):
+    monkeypatch.setattr(settings, "spotlight_concept_weight", 1.0)
+    res = {"concept_matches": [{"concept_id": "spotlight", "confidence": 1.4, "source": "query_match"}]}
+    assert fa.question_concept_weights(res) == {"spotlight": 1.4}
+
+
+def test_three_spotlight_slots_by_default():
+    assert settings.spotlight_slots == 3 and fa.SPOTLIGHT_SLOTS == 3

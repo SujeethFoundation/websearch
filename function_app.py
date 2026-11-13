@@ -19,7 +19,7 @@ from services.crawl_state import CrawlState
 from services.manual_page import build_page_documents
 from services.page_fetch import fetch_page, PageFetchError
 from services.page_extract import infer_description
-from services.best_bets import _identity as _page_identity, best_bet_domains, merge_best_bets, unique_pages
+from services.best_bets import _identity as _page_identity, best_bet_domains, dropped_best_bets, merge_best_bets, unique_pages
 
 # The Azure SDKs log every request and every response at INFO: two multi-line records per storage or table
 # call. At hundreds of thousands of calls a day that floods the logs and the monitoring bill. Warnings and
@@ -152,6 +152,15 @@ def question_concept_weights(resolution):
                 weights[str(match["concept_id"]).lower()] = float(match.get("confidence") or 1.0)
             except (TypeError, ValueError):
                 weights[str(match["concept_id"]).lower()] = 1.0
+    # Concepts the ontology added by relationship stay out of the weights, with one exception: Spotlight stories are
+    # meant to surface on the questions they illustrate, so a Spotlight added that way counts for
+    # SPOTLIGHT_CONCEPT_WEIGHT. (Before the MCP server stopped sending matched concepts back as explicit ones, this
+    # happened by accident, at full weight, for every relationship concept.)
+    boost = settings.spotlight_concept_weight
+    if boost > 0 and "spotlight" not in weights:
+        for match in resolution.get("concept_matches") or []:
+            if str(match.get("concept_id") or "").lower() == "spotlight" and match.get("source") == "relationship":
+                weights["spotlight"] = boost
     return weights
 
 
@@ -238,8 +247,8 @@ SPOTLIGHT_SLOTS = settings.spotlight_slots
 def plan_spotlights(resolution, selected_domains):
     """The domains the Spotlight search covers: sujeeth.org when "spotlight" is among the matched concepts, else none.
 
-    The MCP server resolves first and sends the matched concepts back as explicit concepts, so the match source is
-    not reliable here. Spotlight among the matched concepts is enough."""
+    Spotlight among the matched concepts is enough, whether the question named it or the ontology added it through
+    a relationship (callers that send matched concepts back as explicit ones make the source unreliable)."""
     try:
         if not SPOTLIGHT_SLOTS or "spotlight" not in [str(c).lower() for c in resolution.get("matched_concepts", [])]:
             return []
@@ -300,13 +309,15 @@ def add_best_bets(result, found, manual_domains, failed=False):
     `found` is the answer of the best-bet search (run together with the main search, see run_search) or the
     exception it raised; `manual_domains` the domains it covered (none: no best-bet search was made); `failed` that
     planning it failed."""
-    status, count = "unavailable" if failed else "none", 0
+    status, count, dropped = "unavailable" if failed else "none", 0, 0
     try:
         if manual_domains:
             if isinstance(found, Exception):
                 raise found
             manual = found
-            merged = merge_best_bets(result.get("results", []), manual.get("results", []), BEST_BETS_MAX)
+            rank = settings.best_bet_max_rank
+            dropped = dropped_best_bets(result.get("results", []), manual.get("results", []), rank)
+            merged = merge_best_bets(result.get("results", []), manual.get("results", []), BEST_BETS_MAX, rank)
             count = sum(1 for x in merged if x.get("best_bet"))
             result["results"] = merged
             result["count"] = len(merged)
@@ -315,6 +326,9 @@ def add_best_bets(result, found, manual_domains, failed=False):
         log.exception("Best-bet lookup failed; returning normal results only")
         status = "unavailable"
     result["best_bets"] = {"status": status, "count": count, "max": BEST_BETS_MAX}
+    if dropped:
+        # The manual pages the check left out because the main search did not rank them highly.
+        result["best_bets"]["not_relevant"] = dropped
 
 
 def _embed_cache_stats():
@@ -361,7 +375,7 @@ def search_get(req):
     if not query:
         return response({"error": "Provide ?q=search terms"}, 400)
     try:
-        limit = min(max(int(req.params.get("limit", "5")), 1), 5)
+        limit = min(max(int(req.params.get("limit", "5")), 1), settings.search_max_limit)
         concepts = [x.strip() for x in (req.params.get("concepts") or "").split(",") if x.strip()]
         domains = [x.strip() for x in (req.params.get("domains") or "").split(",") if x.strip()]
         return response(run_search(query, concepts, domains, "search", limit))
@@ -379,7 +393,7 @@ def search_post(req):
     if not query:
         return response({"error": "JSON body requires query"}, 400)
     try:
-        limit = min(max(int(body.get("limit", 5)), 1), 5)
+        limit = min(max(int(body.get("limit", 5)), 1), settings.search_max_limit)
         return response(run_search(
             query=query,
             concepts=body.get("concepts") or [],

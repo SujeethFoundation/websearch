@@ -117,7 +117,7 @@ class OntologyClient:
 
     def resolve_domains(self, concepts, purpose="search"):
         # Reused for ONTOLOGY_CACHE_SECONDS, like the manifests and domain validation. Every search resolves
-        # its concepts twice (the MCP server resolves first, then the search resolves again), and the answer
+        # its concepts at least once (a caller that resolves first and then searches makes it twice), and the answer
         # depends only on the concepts and the purpose, so without this each search made two requests to the
         # ontology app. A change to which domains a concept allows takes effect after that interval. The key
         # keeps the concepts in the order given, so a different order is a different entry.

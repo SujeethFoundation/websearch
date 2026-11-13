@@ -170,8 +170,18 @@ class Settings:
     max_query_concepts = int(os.getenv("MAX_QUERY_CONCEPTS", "5"))
 
     # Search results (these were read straight from the environment in function_app.py).
-    spotlight_slots = _int("SPOTLIGHT_SLOTS", 2, 0, 3)
+    spotlight_slots = _int("SPOTLIGHT_SLOTS", 3, 0, 3)
+    # How much a Spotlight page's tag counts toward the main ranking when the ontology added Spotlight to the question
+    # through a relationship (a career question), as a share of the weight a concept the question named carries (1.0).
+    # 0 leaves relationship concepts out of the ranking, as before. The reserved Spotlight slots do not depend on it.
+    spotlight_concept_weight = _float("SPOTLIGHT_CONCEPT_WEIGHT", 1.0)
     best_bets_max = _int("BEST_BETS_MAX", 3, 0, 3)
+    # A hand-added page is a best bet only when it also ranks among the first BEST_BET_MAX_RANK pages of the main search
+    # (0 turns the check off). Best bets are searched among the few manual pages alone, where the top page scores high
+    # whatever it says, so a page that is merely the least unrelated manual page must not be placed first.
+    best_bet_max_rank = _int("BEST_BET_MAX_RANK", 5, 0, 100)
+    # The most results one search request may ask for. The MCP server asks for a pool of candidates to choose from.
+    search_max_limit = _int("SEARCH_MAX_LIMIT", 20, 1, 100)
     full_text_domains = frozenset(_csv("FULL_TEXT_DOMAINS", "sujeeth.org,topics.sujeeth.org"))
     excerpt_max_chars = _int("EXCERPT_MAX_CHARS", 3000)
 

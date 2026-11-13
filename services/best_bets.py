@@ -39,15 +39,36 @@ def unique_pages(items):
     return out
 
 
-def merge_best_bets(results, manual_results, max_best=3):
+def top_pages(results, count):
+    """The page keys of the first `count` distinct pages of the main results (a page's chunks count once)."""
+    keys = []
+    for item in results or []:
+        key = _identity(item)
+        if key and key not in keys:
+            keys.append(key)
+        if len(keys) >= count:
+            break
+    return set(keys)
+
+
+def merge_best_bets(results, manual_results, max_best=3, within_rank=0):
     """Return best bets first (one per URL, at most max_best), then the normal results.
 
     A URL that is a best bet is removed from the normal results so it appears once.
+
+    within_rank turns on the relevance check: a manual page is a best bet only when it is also among the first
+    `within_rank` distinct pages of the main results, whose ranking covers every selected domain. The manual pages
+    are searched among themselves, so their own scores say only which of them is least unrelated; the main ranking
+    says whether the page is a good answer. 0 keeps every manual page that was found. Returns the merged list; the
+    number the check dropped is read with dropped_best_bets.
     """
+    allowed = top_pages(results, within_rank) if within_rank and within_rank > 0 else None
     best, seen = [], set()
     for item in manual_results or []:
         key = _identity(item)
         if not key or key in seen:
+            continue
+        if allowed is not None and key not in allowed:
             continue
         if len(best) >= max_best:
             break
@@ -55,3 +76,12 @@ def merge_best_bets(results, manual_results, max_best=3):
         best.append({**item, "best_bet": True})
     rest = [{**item, "best_bet": False} for item in (results or []) if _identity(item) not in seen]
     return best + rest
+
+
+def dropped_best_bets(results, manual_results, within_rank):
+    """How many distinct manual pages the relevance check left out (for the best_bets block of the answer)."""
+    if not within_rank or within_rank <= 0:
+        return 0
+    allowed = top_pages(results, within_rank)
+    keys = {_identity(item) for item in manual_results or [] if _identity(item)}
+    return len(keys - allowed)
