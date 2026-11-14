@@ -12,6 +12,24 @@ def tokens(value):
     return set(normalize(value).split())
 
 
+# Words that carry no topic. A partial match (some of an alias's words appear in the question) counts only the words
+# outside this set, so "make a gift" no longer matches "how to make a pyramid" and "tell me about yourself" no longer
+# matches "tell me how to make a vodka tonic". A phrase that appears whole in the question still matches as before.
+STOPWORDS = frozenset("""
+a an the and or but if of to in on at by for from with without into about as is are was were be been am do does did
+have has had can could should would will may might must i me my mine we us our you your yours he she it its they them
+their this that these those there here what which who whom whose when where why how not no yes so than then too very
+just also any some more most other such only own same up out over under again all each both few
+make makes made making give gives gave giving tell tells told telling show shows showing get gets got getting take
+takes taking let lets need needs want wants like use using go goes going know help helps teach teaches way ways
+thing things please tips tip
+""".split())
+
+
+def content_tokens(words):
+    return {w for w in words if w not in STOPWORDS}
+
+
 def get_items(payload, keys):
     """Accept the ontology API's common wrapper shapes without assuming one schema."""
     if isinstance(payload, list):
@@ -165,6 +183,10 @@ class ConceptResolver:
                 score = 1.0 + min(n, 4) * 0.1
             else:
                 overlap = len(query_tokens & alias_tokens)
+                # A partial match needs at least one content word in common. Sharing only filler ("make", "me",
+                # "to") is not a match. Scores are otherwise unchanged, so this can lower a score and never raise one.
+                if overlap and not (query_tokens & content_tokens(alias_tokens)):
+                    overlap = 0
                 score = overlap / max(1, n) * 0.65
                 # Do not let a single generic token match a long definition.
                 if overlap == 1 and n > 2:
@@ -224,6 +246,10 @@ class ConceptResolver:
                 score = 1.0 + min(len(alias_tokens), 4) * 0.1
             else:
                 overlap = len(query_tokens & alias_tokens)
+                # A partial match needs at least one content word in common. Sharing only filler ("make", "me",
+                # "to") is not a match. Scores are otherwise unchanged, so this can lower a score and never raise one.
+                if overlap and not (query_tokens & content_tokens(alias_tokens)):
+                    overlap = 0
                 score = overlap / max(1, len(alias_tokens)) * 0.65
                 # Do not let a single generic token match a long definition.
                 if overlap == 1 and len(alias_tokens) > 2:
