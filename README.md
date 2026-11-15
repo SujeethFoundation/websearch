@@ -23,7 +23,7 @@ All routes require a Function key and are under `/api`.
 | Route | Purpose |
 |---|---|
 | `GET /health` | Version, configuration flags, the index, caches and the process |
-| `GET /search?q=` and `POST /search` | Ontology-gated hybrid search. Body: `query`, optional `concepts`, `domains`, `limit` (default 5, at most `SEARCH_MAX_LIMIT`, default 20). The answer includes the `resolution` (matched concepts, their source, the approved domains), so a caller needs no separate `domain-resolution` request first |
+| `GET /search?q=` and `POST /search` | MCP-filtered hybrid search. POST body: `query`, MCP-supplied `concepts` and `domains`, optional `queries` (up to five variants searched together), and `limit` (default 5, at most `SEARCH_MAX_LIMIT`, default 20). Batch results include `for_query` on each result. Websearch does not resolve concepts or approve domains during a search request |
 | `POST /domain-resolution` | Show how a query resolves to concepts and domains |
 | `POST /search/explain` | Why the search ranks a question as it does and where the page it should find stands. Body: `query`, `expect` (pieces of the right page's address), optional `concepts`, `domains`, `ranking` |
 | `GET /local-index/status`, `POST /local-index/reload` | What this instance has loaded (`?count=true` also counts the table's rows and the queue); rebuild this instance's index now |

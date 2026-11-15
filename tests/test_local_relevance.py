@@ -196,7 +196,7 @@ def test_only_the_concepts_the_question_named_get_a_weight():
     assert fa.question_concept_weights({}) == {} and fa.question_concept_weights({"concept_matches": [{"source": "query_match"}]}) == {}
 
 
-def test_the_search_route_passes_the_questions_own_concepts_as_weights(conf, monkeypatch):
+def test_the_search_route_passes_the_mcp_filters_to_the_local_search(conf, monkeypatch):
     seen = {}
 
     class Searcher:
@@ -212,11 +212,30 @@ def test_the_search_route_passes_the_questions_own_concepts_as_weights(conf, mon
     monkeypatch.setattr(fa, "plan_spotlights", lambda *a, **k: [])
     monkeypatch.setattr(fa, "add_best_bets", lambda *a, **k: None)
     monkeypatch.setattr(fa, "add_spotlights", lambda *a, **k: None)
-    post = func.HttpRequest("POST", "/api/search", params={}, headers={}, body=json.dumps({"query": "what does a mentor do in week 4"}).encode())
+    post = func.HttpRequest("POST", "/api/search", params={}, headers={}, body=json.dumps({
+        "query": "what does a mentor do in week 4", "concepts": FILTER, "domains": DOMAINS,
+    }).encode())
     assert fa.search_post._function._func(post).status_code == 200
-    assert seen["concept_weights"] == {"week_4": 1.2, "career_mentor": 1.0} and "backend" not in seen
+    assert seen["concepts"] == FILTER and seen["domains"] == DOMAINS and "backend" not in seen
     get = func.HttpRequest("GET", "/api/search", params={"q": "week 4", "backend": "azure"}, headers={}, body=b"")
     assert fa.search_get._function._func(get).status_code == 200 and "backend" not in seen       # an old caller's parameter is ignored
+
+
+def test_the_search_route_batches_query_variants_with_one_filter_set(monkeypatch):
+    calls = []
+    def run(query, concepts=None, domains=None, **kwargs):
+        calls.append((query, concepts, domains))
+        return {"query": query, "status": "completed", "count": 1,
+                "results": [{"title": query, "url": f"https://sujeeth.org/{len(calls)}"}]}
+    monkeypatch.setattr(fa, "run_search", run)
+    body = {"query": "company research", "queries": ["company research", "compare employers", "research roles"],
+            "concepts": ["explore"], "domains": ["sujeeth.org"], "limit": 10}
+    request = func.HttpRequest("POST", "/api/search", params={}, headers={}, body=json.dumps(body).encode())
+    result = json.loads(fa.search_post._function._func(request).get_body())
+    assert {call[0] for call in calls} == set(body["queries"])
+    assert all(concepts == ["explore"] and domains == ["sujeeth.org"] for _, concepts, domains in calls)
+    assert result["queries"] == body["queries"]
+    assert [item["for_query"] for item in result["results"]] == body["queries"]
 
 
 # ---- explaining a ranking
@@ -401,9 +420,10 @@ def test_the_routes_pass_tried_settings_through(conf, monkeypatch):
     monkeypatch.setattr(fa, "add_best_bets", lambda *a, **k: None)
     monkeypatch.setattr(fa, "add_spotlights", lambda *a, **k: None)
     post = lambda route, body: func.HttpRequest("POST", f"/api/{route}", params={}, headers={}, body=json.dumps(body).encode())
-    fa.search_post._function._func(post("search", {"query": "week 4", "ranking": {"phrase_boost": 0}}))
+    base = {"query": "week 4", "concepts": FILTER, "domains": DOMAINS}
+    fa.search_post._function._func(post("search", {**base, "ranking": {"phrase_boost": 0}}))
     assert seen["ranking"] == {"phrase_boost": 0}
-    fa.search_post._function._func(post("search", {"query": "week 4", "ranking": "nonsense"}))
+    fa.search_post._function._func(post("search", {**base, "ranking": "nonsense"}))
     assert seen["ranking"] is None
     fa.search_explain._function._func(post("search/explain", {"query": "week 4", "ranking": {"concept_boost": 2}}))
     assert seen["explain"]["ranking"] == {"concept_boost": 2}

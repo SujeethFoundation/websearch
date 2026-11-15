@@ -4,6 +4,7 @@ import os
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import azure.functions as func
 from urllib.parse import urlparse
@@ -246,6 +247,46 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ra
     return result
 
 
+def run_search_batch(query, queries, concepts=None, domains=None, purpose="search", limit=5, ranking=None,
+                     ontology_version=None):
+    """Run a bounded set of query variants with one shared MCP-approved filter."""
+    candidates, seen_queries = [], set()
+    for text in [query] + (queries if isinstance(queries, list) else []):
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        key = " ".join(text.casefold().split())
+        if text and key not in seen_queries:
+            seen_queries.add(key)
+            candidates.append(text)
+        if len(candidates) >= 5:
+            break
+    if not candidates:
+        return {"query": query, "status": "completed", "queries": [], "count": 0, "results": []}
+    if len(candidates) == 1:
+        return run_search(query=candidates[0], concepts=concepts, domains=domains, purpose=purpose, limit=limit,
+                          ranking=ranking, ontology_version=ontology_version)
+
+    with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        answers = list(pool.map(lambda text: run_search(query=text, concepts=concepts, domains=domains,
+                                                        purpose=purpose, limit=limit, ranking=ranking,
+                                                        ontology_version=ontology_version), candidates))
+    results = []
+    for text, answer in zip(candidates, answers):
+        for item in answer.get("results", []) or []:
+            results.append({**item, "for_query": text})
+    return {
+        "query": query,
+        "queries": candidates,
+        "status": "completed",
+        "ontology_version": ontology_version,
+        "concepts": list(dict.fromkeys(str(x) for x in (concepts or []) if str(x).strip())),
+        "domains": list(dict.fromkeys(str(x).lower() for x in (domains or []) if str(x).strip())),
+        "count": len(results),
+        "results": results,
+    }
+
+
 SPOTLIGHT_SLOTS = settings.spotlight_slots
 
 
@@ -399,15 +440,19 @@ def search_post(req):
         return response({"error": "JSON body requires query"}, 400)
     try:
         limit = min(max(int(body.get("limit", 5)), 1), settings.search_max_limit)
-        return response(run_search(
-            query=query,
-            concepts=body.get("concepts") or [],
-            domains=body.get("domains") or [],
-            purpose=body.get("purpose", "search"),
-            limit=limit,
-            ranking=body.get("ranking"),
-            ontology_version=body.get("ontology_version"),
-        ))
+        args = {
+            "concepts": body.get("concepts") or [],
+            "domains": body.get("domains") or [],
+            "purpose": body.get("purpose", "search"),
+            "limit": limit,
+            "ranking": body.get("ranking"),
+            "ontology_version": body.get("ontology_version"),
+        }
+        queries = body.get("queries") or []
+        if isinstance(queries, list) and any(isinstance(q, str) and q.strip() and q.strip().casefold() != query.casefold()
+                                             for q in queries):
+            return response(run_search_batch(query=query, queries=queries, **args))
+        return response(run_search(query=query, **args))
     except LocalIndexLoading as exc:
         return index_loading_response(exc)
     except Exception as exc:
