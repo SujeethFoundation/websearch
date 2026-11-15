@@ -30,6 +30,19 @@ def content_tokens(words):
     return {w for w in words if w not in STOPWORDS}
 
 
+def match_tokens(words):
+    """Normalize common English plurals for query-to-ontology phrase overlap."""
+    out = set()
+    for word in words:
+        if len(word) > 4 and word.endswith("ies"):
+            out.add(word[:-3] + "y")
+        elif len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            out.add(word[:-1])
+        else:
+            out.add(word)
+    return out
+
+
 def get_items(payload, keys):
     """Accept the ontology API's common wrapper shapes without assuming one schema."""
     if isinstance(payload, list):
@@ -190,7 +203,7 @@ class ConceptResolver:
             # "what the world needs" has one topic word. Sharing it ("the World Series") is not a match; the phrase has
             # to appear whole.
             return 0.0
-        overlap = len(query_tokens & content)
+        overlap = len(match_tokens(query_tokens) & match_tokens(content))
         score = overlap / len(content) * 0.65
         if overlap == 1:
             score *= 0.45
