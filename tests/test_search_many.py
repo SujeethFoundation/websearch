@@ -293,8 +293,8 @@ RESOLUTION = {"matched_concepts": MAIN_CONCEPTS, "domains": MAIN_DOMAINS, "ontol
 
 def wire(monkeypatch, svc, bet_domains=("manual.sujeeth.org",), resolution=None):
     monkeypatch.setattr(fa, "searcher", svc)
-    monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: dict(resolution or RESOLUTION))
     monkeypatch.setattr(fa, "plan_best_bets", lambda domains: (list(bet_domains), False))
+    monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: (_ for _ in ()).throw(AssertionError("Websearch must not resolve ontology")))
 
 
 def legacy_run_search(svc, query, resolution):
@@ -318,8 +318,9 @@ def test_run_search_gives_the_same_final_answer_as_three_separate_searches(conf,
     monkeypatch.setattr(settings, "local_rescore_pool", 20)
     svc = service(VectorEmbedder(np.random.default_rng(len(query)).standard_normal(DIMS)))
     wire(monkeypatch, svc)
-    now = fa.run_search(query)
-    assert now == legacy_run_search(svc, query, dict(RESOLUTION))
+    now = fa.run_search(query, concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"])
+    expected_resolution = dict(RESOLUTION, ontology_version=None, status="resolved")
+    assert now == legacy_run_search(svc, query, expected_resolution)
     assert now["best_bets"]["status"] in ("applied", "no_match") and now["spotlights"]["status"] in ("applied", "no_match")
 
 
@@ -329,11 +330,11 @@ def test_run_search_makes_only_the_searches_it_needs(conf, monkeypatch):
     seen = []
     real = svc.search_many
     monkeypatch.setattr(svc, "search_many", lambda q, jobs: seen.append(len(jobs)) or real(q, jobs))
-    out = fa.run_search("w3 w14", limit=5)
+    out = fa.run_search("w3 w14", concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"], limit=5)
     assert seen == [2] and out["best_bets"]["status"] == "none"                             # main + spotlights (spotlight is matched)
     wire(monkeypatch, svc, bet_domains=("manual.sujeeth.org",), resolution=dict(RESOLUTION, matched_concepts=["circle", "mentor"]))
     seen.clear()
-    out = fa.run_search("w3 w14", limit=5)
+    out = fa.run_search("w3 w14", concepts=["circle", "mentor"], domains=RESOLUTION["domains"], limit=5)
     assert seen == [2] and "spotlights" not in out                                          # main + best bets, no spotlight concept
 
 
@@ -342,7 +343,7 @@ def test_a_side_search_that_fails_leaves_the_main_answer_alone(conf, monkeypatch
     wire(monkeypatch, svc)
     real = svc.search_many
     monkeypatch.setattr(svc, "search_many", lambda q, jobs: [real(q, jobs)[0]] + [RuntimeError("table busy")] * (len(jobs) - 1))
-    out = fa.run_search("w3 w14 mentor")
+    out = fa.run_search("w3 w14 mentor", concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"])
     assert out["status"] == "completed" and out["best_bets"]["status"] == "unavailable"
     assert out["spotlights"]["status"] == "unavailable" and out["count"] > 0
 
@@ -352,7 +353,7 @@ def test_a_failing_main_search_fails_the_request_as_before(conf, monkeypatch):
     wire(monkeypatch, svc)
     monkeypatch.setattr(svc, "search_many", lambda q, jobs: [ValueError("no concepts")] + [None] * (len(jobs) - 1))
     with pytest.raises(ValueError):
-        fa.run_search("w3 w14 mentor")
+        fa.run_search("w3 w14 mentor", concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"])
 
 
 def test_an_unreadable_manifest_marks_best_bets_unavailable_and_still_searches(conf, monkeypatch):
@@ -360,20 +361,29 @@ def test_an_unreadable_manifest_marks_best_bets_unavailable_and_still_searches(c
     wire(monkeypatch, svc)
     monkeypatch.undo()                                                                       # back to the real planner, with a broken ontology
     monkeypatch.setattr(fa, "searcher", svc)
-    monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: dict(RESOLUTION))
 
     def broken():
         raise RuntimeError("ONTOLOGY_API_URL is not configured")
     monkeypatch.setattr(fa.ontology, "search_manifest", broken)
-    out = fa.run_search("w3 w14 mentor")
+    out = fa.run_search("w3 w14 mentor", concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"])
     assert out["best_bets"] == {"status": "unavailable", "count": 0, "max": fa.BEST_BETS_MAX} and out["count"] > 0
 
 
 def test_run_search_makes_one_pass_over_the_index(conf, monkeypatch):
     svc = service(VectorEmbedder(np.random.default_rng(9).standard_normal(DIMS)))
     wire(monkeypatch, svc)
-    fa.run_search("w3 w14 mentor")
+    fa.run_search("w3 w14 mentor", concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"])
     assert svc.local.describe()["searches"] == 1 and len(svc.embedder.calls) == 1
+
+
+def test_run_search_requires_mcp_supplied_concepts_and_domains(conf, monkeypatch):
+    svc = service()
+    wire(monkeypatch, svc)
+    no_concepts = fa.run_search("volunteer", domains=RESOLUTION["domains"])
+    no_domains = fa.run_search("volunteer", concepts=RESOLUTION["matched_concepts"])
+    assert no_concepts["status"] == "no_ontology_concept_match"
+    assert no_domains["status"] == "no_approved_domains_for_concepts"
+    assert svc.local.describe()["searches"] == 0
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -390,10 +400,10 @@ def test_a_best_bet_must_also_rank_in_the_main_search(conf, monkeypatch, query):
     svc = service(VectorEmbedder(np.random.default_rng(len(query)).standard_normal(DIMS)))
     monkeypatch.setattr(settings, "best_bet_max_rank", 0)
     wire(monkeypatch, svc)
-    ungated = fa.run_search(query, limit=10)
+    ungated = fa.run_search(query, concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"], limit=10)
     monkeypatch.setattr(settings, "best_bet_max_rank", 3)
     wire(monkeypatch, svc)
-    gated = fa.run_search(query, limit=10)
+    gated = fa.run_search(query, concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"], limit=10)
     # The main ranking alone (run_search puts reserved spotlight pages in front of it, which is not a rank).
     main = svc.search(query, concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"], limit=10,
                       concept_weights=fa.question_concept_weights(RESOLUTION))
@@ -409,7 +419,7 @@ def test_the_check_off_places_every_manual_page_first_as_before(conf, monkeypatc
     svc = service(VectorEmbedder(np.random.default_rng(3).standard_normal(DIMS)))
     monkeypatch.setattr(settings, "best_bet_max_rank", 0)
     wire(monkeypatch, svc)
-    out = fa.run_search("w3 w14 mentor", limit=5)
+    out = fa.run_search("w3 w14 mentor", concepts=RESOLUTION["matched_concepts"], domains=RESOLUTION["domains"], limit=5)
     assert "not_relevant" not in out["best_bets"]
 
 

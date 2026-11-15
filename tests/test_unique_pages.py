@@ -125,7 +125,7 @@ def run(monkeypatch, results, unique=True):
     monkeypatch.setattr(fa, "plan_spotlights", lambda *a, **k: [])
     monkeypatch.setattr(fa, "add_best_bets", lambda *a, **k: None)
     monkeypatch.setattr(fa, "add_spotlights", spotlight)
-    return fa.run_search("week 4")
+    return fa.run_search("week 4", concepts=["week_4"], domains=["sujeeth.org"])
 
 
 def test_the_final_answer_has_each_page_once_whatever_was_added_to_it(conf, monkeypatch):
