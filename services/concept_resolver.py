@@ -174,23 +174,35 @@ class ConceptResolver:
         return out
 
     @staticmethod
-    def _score_indexed(query_norm, query_tokens, aliases):
-        """The same scoring as _score_class, over aliases that were normalized in advance."""
+    def _score_alias(padded_query, query_tokens, alias_norm, alias_tokens):
+        """How well one alias matches the question. 1.0 or more: the alias appears in the question as whole words (a
+        plural s on its last word is accepted). Below 1.0: only some of its words do.
+
+        Two rules keep unrelated questions out. A whole-phrase match is on word boundaries, so "job" is not found in
+        "jobbing" nor "sway" in "swaying". A partial match counts topic words only, and one shared word of a longer
+        phrase is not a match: "first moon landing" shares one word with "First Job", "monthly car payment" one with
+        "monthly gift". A concept that should answer to a single word needs that word as an alias or query phrase."""
+        n = len(alias_tokens)
+        if f" {alias_norm} " in padded_query or f" {alias_norm}s " in padded_query:
+            return 1.0 + min(n, 4) * 0.1
+        content = content_tokens(alias_tokens)
+        if len(content) < 2:
+            # "what the world needs" has one topic word. Sharing it ("the World Series") is not a match; the phrase has
+            # to appear whole.
+            return 0.0
+        overlap = len(query_tokens & content)
+        score = overlap / len(content) * 0.65
+        if overlap == 1:
+            score *= 0.45
+        return score
+
+    @classmethod
+    def _score_indexed(cls, query_norm, query_tokens, aliases):
+        """The best-matching alias of one class: (score, the alias as written). Aliases were normalized in advance."""
         best, matched = 0.0, None
+        padded = f" {query_norm} "
         for alias_norm, alias_tokens, alias in aliases:
-            n = len(alias_tokens)
-            if alias_norm in query_norm:
-                score = 1.0 + min(n, 4) * 0.1
-            else:
-                overlap = len(query_tokens & alias_tokens)
-                # A partial match needs at least one content word in common. Sharing only filler ("make", "me",
-                # "to") is not a match. Scores are otherwise unchanged, so this can lower a score and never raise one.
-                if overlap and not (query_tokens & content_tokens(alias_tokens)):
-                    overlap = 0
-                score = overlap / max(1, n) * 0.65
-                # Do not let a single generic token match a long definition.
-                if overlap == 1 and n > 2:
-                    score *= 0.45
+            score = cls._score_alias(padded, query_tokens, alias_norm, alias_tokens)
             if score > best:
                 best, matched = score, alias
         return best, matched
@@ -231,50 +243,116 @@ class ConceptResolver:
         return [str(v) for v in values if v]
 
     def _score_class(self, query, class_item):
-        concept_id = self._class_id(class_item)
+        """Score one class without the prepared index (same rule as _score_indexed)."""
+        aliases = self._index_aliases(self._term_aliases(self._class_id(class_item), class_item))
         query_norm = normalize(query)
-        query_tokens = tokens(query)
-        aliases = self._term_aliases(concept_id, class_item)
-        best = 0.0
-        matched = None
-        for alias in aliases:
-            alias_norm = normalize(alias)
-            alias_tokens = tokens(alias)
-            if not alias_norm:
+        return self._score_indexed(query_norm, set(query_norm.split()), aliases)
+
+    EFFECTS = ("expand", "boost", "suppress")
+
+    @staticmethod
+    def _behavior(spec, fallback=None):
+        """(matched endpoint, effect, weight) from a search_behavior block, or None when it is off or incomplete.
+        matched endpoint is "subject", "object" or "either": the end of the relationship the question has to match.
+        The effect falls on the concept at the other end."""
+        spec = spec if isinstance(spec, dict) else {}
+        base = fallback or (None, None, 0.0)
+        if spec.get("enabled") is False:
+            return None
+        matched = str(spec.get("matched_endpoint") or base[0] or "").lower()
+        effect = str(spec.get("effect") or base[1] or "").lower()
+        try:
+            weight = float(spec.get("weight", base[2]))
+        except (TypeError, ValueError):
+            weight = base[2]
+        if matched not in ("subject", "object", "either") or effect not in ConceptResolver.EFFECTS:
+            return None
+        return matched, effect, max(0.0, min(abs(weight), 1.0))
+
+    def _predicate_behaviors(self, catalog):
+        """{predicate: (matched endpoint, effect, weight)} from the ontology's predicates.
+
+        A predicate takes part when its search_behavior block is enabled and names an effect. "illustrates" keeps its
+        long-standing behavior when the ontology says nothing more: a match on the object brings in the subject, with no
+        ranking weight. With RELATIONSHIP_EFFECTS off, that is the only behavior."""
+        behaviors = {"illustrates": ("object", "expand", 0.0)}
+        if not settings.relationship_effects:
+            return behaviors
+        for predicate in (catalog.get("ontology") or {}).get("predicates") or []:
+            if not isinstance(predicate, dict) or not predicate.get("id"):
                 continue
-            if alias_norm in query_norm:
-                score = 1.0 + min(len(alias_tokens), 4) * 0.1
+            pid = str(predicate["id"]).lower()
+            spec = predicate.get("search_behavior")
+            if spec is None:
+                continue
+            found = self._behavior(spec, behaviors.get(pid))
+            if found:
+                behaviors[pid] = found
             else:
-                overlap = len(query_tokens & alias_tokens)
-                # A partial match needs at least one content word in common. Sharing only filler ("make", "me",
-                # "to") is not a match. Scores are otherwise unchanged, so this can lower a score and never raise one.
-                if overlap and not (query_tokens & content_tokens(alias_tokens)):
-                    overlap = 0
-                score = overlap / max(1, len(alias_tokens)) * 0.65
-                # Do not let a single generic token match a long definition.
-                if overlap == 1 and len(alias_tokens) > 2:
-                    score *= 0.45
-            if score > best:
-                best, matched = score, alias
-        return best, matched
+                behaviors.pop(pid, None)
+        return behaviors
+
+    def _relationship_effects(self, selected, catalog=None):
+        """What the ontology's relationships do to a search, given the concepts the question matched.
+
+        Returns [{"concept_id", "effect", "weight", "via"}], one entry per related concept, never one the question itself
+        matched. Three effects:
+          expand    the related concept joins the search filter, so pages tagged only with it can be returned, and it
+                    counts for `weight` in the ranking (0: filter only).
+          boost     the filter is unchanged; a page already in the results that also carries the related concept ranks
+                    higher by `weight`.
+          suppress  the filter is unchanged; a page that carries the related concept ranks lower by `weight`.
+        A weight is a share of what carrying everything the question named is worth (1.0). The behavior comes from the
+        relationship's predicate (search_behavior in the ontology's predicates); a relationship can carry its own
+        search_behavior to override it, or {"enabled": false} to opt out. One hop only. When several relationships reach
+        the same concept, it is expanded if any of them expands it, and its weight is the strongest boost less the
+        strongest suppress (two relationships saying the same thing do not count twice)."""
+        catalog = catalog or self._load_catalog()
+        behaviors = self._predicate_behaviors(catalog)
+        chosen = {str(c).lower() for c in selected}
+        hits = []  # (anchor the question matched, predicate, effect, weight, the concept at the other end, relationship id)
+        for rel in catalog.get("relationships") or []:
+            if not isinstance(rel, dict):
+                continue
+            predicate = str(rel.get("predicate", "")).lower()
+            behavior = behaviors.get(predicate)
+            if "search_behavior" in rel and settings.relationship_effects:
+                behavior = self._behavior(rel.get("search_behavior"), behavior)
+            if not behavior:
+                continue
+            matched, effect, weight = behavior
+            subject, obj = str(rel.get("subject", "")).strip(), str(rel.get("object", "")).strip()
+            via = rel.get("id") or f"{subject} {predicate} {obj}"
+            if matched in ("object", "either") and obj.lower() in chosen and subject:
+                hits.append((obj.lower(), predicate, effect, weight, subject, via))
+            if matched in ("subject", "either") and subject.lower() in chosen and obj:
+                hits.append((subject.lower(), predicate, effect, weight, obj, via))
+        # The question already chose: "week 3" matches Week 3 and Week. Week would expand to all six weeks, but the
+        # question named the one it wants, so that expansion is dropped.
+        decided = {(anchor, predicate) for anchor, predicate, effect, _, target, _ in hits
+                   if effect == "expand" and target.lower() in chosen}
+        found = {}
+        for anchor, predicate, effect, weight, target, via in hits:
+            if target.lower() in chosen or (effect == "expand" and (anchor, predicate) in decided):
+                continue
+            entry = found.setdefault(target.lower(), {"concept_id": target, "expand": False, "up": 0.0, "down": 0.0, "via": []})
+            entry["expand"] = entry["expand"] or effect == "expand"
+            if effect == "suppress":
+                entry["down"] = max(entry["down"], weight)
+            else:
+                entry["up"] = max(entry["up"], weight)
+            entry["via"].append(via)
+        out = []
+        for entry in found.values():
+            weight = round(entry["up"] - entry["down"], 3)
+            effect = "expand" if entry["expand"] else "boost" if weight > 0 else "suppress" if weight < 0 else None
+            if effect:
+                out.append({"concept_id": entry["concept_id"], "effect": effect, "weight": weight, "via": entry["via"]})
+        return out
 
     def _illustrating_concepts(self, selected):
-        """Concepts the ontology says illustrate a selected concept.
-
-        A relationship such as "spotlight illustrates career_development" means questions about
-        the object can draw on the subject. The search filter keeps a chunk only when it carries a
-        selected concept, so without this a Spotlight page (tagged "spotlight") can never appear
-        for a career question. Returns subject ids not already selected.
-        """
-        chosen = {str(c).lower() for c in selected}
-        extra = []
-        for rel in self._load_catalog().get("relationships") or []:
-            if not isinstance(rel, dict) or str(rel.get("predicate", "")).lower() != "illustrates":
-                continue
-            subject, obj = str(rel.get("subject", "")).strip(), str(rel.get("object", "")).strip()
-            if subject and obj.lower() in chosen and subject.lower() not in chosen and subject not in extra:
-                extra.append(subject)
-        return extra
+        """Concepts that join the search filter through a relationship (see _relationship_effects, "expand")."""
+        return [e["concept_id"] for e in self._relationship_effects(selected) if e["effect"] == "expand"]
 
     def resolve_query(self, query, explicit_concepts=None, explicit_domains=None, purpose="search"):
         catalog = self._load_catalog()
@@ -330,7 +408,9 @@ class ConceptResolver:
                 "message": "No ontology concepts matched; broad search is intentionally disabled.",
             }
 
-        related = [c for c in self._illustrating_concepts(selected) if c.lower() in by_id]
+        # Relationships widen the filter (expand) or change the ranking (boost, suppress); see _relationship_effects.
+        effects = [e for e in self._relationship_effects(selected, catalog) if e["concept_id"].lower() in by_id]
+        related = [e["concept_id"] for e in effects if e["effect"] == "expand"]
         selected = list(dict.fromkeys(selected + related))
 
         domain_result = self.ontology.resolve_domains(selected, purpose)
@@ -378,6 +458,7 @@ class ConceptResolver:
                 }
                 for cid in selected
             ],
+            "relationship_effects": effects,
             "domains": list(dict.fromkeys(domains)),
             "status": "resolved",
             "purpose": purpose,

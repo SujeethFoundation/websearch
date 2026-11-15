@@ -168,6 +168,10 @@ class Settings:
     chunk_group_size = max(1, int(os.getenv("CHUNK_GROUP_SIZE", "50")))
     timeout = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
     max_query_concepts = int(os.getenv("MAX_QUERY_CONCEPTS", "5"))
+    # Ontology relationships can widen a search (expand) or change its ranking (boost, suppress), each predicate as its
+    # search_behavior in the ontology says (see ConceptResolver._relationship_effects). false keeps only the original
+    # behavior: a match on the object of an "illustrates" relationship brings in its subject, with no ranking weight.
+    relationship_effects = os.getenv("RELATIONSHIP_EFFECTS", "true").strip().lower() not in ("0", "false", "no")
 
     # Search results (these were read straight from the environment in function_app.py).
     spotlight_slots = _int("SPOTLIGHT_SLOTS", 3, 0, 3)

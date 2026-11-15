@@ -321,7 +321,9 @@ def test_a_failed_first_fetch_is_raised_and_not_kept(ttl):
 # ---------------------------------------------------------------------------------------------------------------
 
 def reference_score(query, item, terminology):
-    """The scoring as it was before the aliases were prepared in advance."""
+    """The scoring written out per class, without the prepared index: a whole-phrase match on word boundaries (plural s
+    accepted), else the share of the alias's topic words the question has, where one shared word of a longer phrase
+    does not count for much."""
     query_norm, query_tokens = cr.normalize(query), cr.tokens(query)
     concept_id = str(item.get("id") or item.get("name") or "").strip()
     values = [item.get("name", ""), item.get("id", ""), item.get("definition", "")]
@@ -344,12 +346,14 @@ def reference_score(query, item, terminology):
         alias_norm, alias_tokens = cr.normalize(alias), cr.tokens(alias)
         if not alias_norm:
             continue
-        if alias_norm in query_norm:
+        padded = f" {query_norm} "
+        if f" {alias_norm} " in padded or f" {alias_norm}s " in padded:
             score = 1.0 + min(len(alias_tokens), 4) * 0.1
         else:
-            overlap = len(query_tokens & alias_tokens)
-            score = overlap / max(1, len(alias_tokens)) * 0.65
-            if overlap == 1 and len(alias_tokens) > 2:
+            content = cr.content_tokens(alias_tokens)
+            overlap = len(query_tokens & content)
+            score = overlap / len(content) * 0.65 if len(content) >= 2 else 0.0
+            if overlap == 1:
                 score *= 0.45
         if score > best:
             best, matched = score, alias

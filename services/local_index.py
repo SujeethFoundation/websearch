@@ -43,6 +43,9 @@ VECTOR_FIELD = "contentVector"  # the key that carries a chunk's embedding in th
 BM25_K1 = 1.2
 BM25_B = 0.75
 RRF_K = 60
+# In a concept-weights dict, a key that starts with this names a concept the ontology relates to the question, not one
+# the question named. Its weight may be negative (rank the page lower). See concept_coverage.
+RELATED_PREFIX = "~"
 META_PARTITION = "index"
 META_ROW = "version"
 MAX_TEXT_CHARS = 30000  # a Table Storage string property holds at most 32,768 characters
@@ -508,18 +511,32 @@ class LocalIndex:
         return [int(rows[pos]) for pos in self._top(hamming(rows), count, False)]
 
     def concept_coverage(self, rows, concept_weights):
-        """For each of `rows`, the share (0 to 1) of the weighted concepts it is tagged with."""
-        total = sum(w for w in concept_weights.values() if w > 0)
+        """For each of `rows`, the share of the weighted concepts it is tagged with.
+
+        The question's own concepts give a share from 0 to 1. A key that starts with RELATED_PREFIX is a concept the
+        ontology relates to the question: its weight is added to the share as it stands when the chunk carries the
+        concept (positive lifts the chunk, negative lowers it), so it never changes what the question's own concepts
+        are worth. Without any concept of the question's own there is nothing to measure against, and every share is 0."""
+        total = sum(w for c, w in concept_weights.items() if w > 0 and not str(c).startswith(RELATED_PREFIX))
         cover = np.zeros(len(rows), dtype=np.float64)
         if total <= 0 or not len(rows):
             return cover
+        related = np.zeros(len(rows), dtype=np.float64)
         bits = self.concept_bits[rows]
         for concept, weight in concept_weights.items():
             c = str(concept).lower()
-            if weight > 0 and c in self.concept_names:
-                b = self.concept_names.index(c)
-                cover += weight * ((bits[:, b // 64] >> np.uint64(b % 64)) & np.uint64(1)).astype(np.float64)
-        return cover / total
+            is_related = c.startswith(RELATED_PREFIX)
+            if is_related:
+                c = c[len(RELATED_PREFIX):]
+            if (not is_related and weight <= 0) or not weight or c not in self.concept_names:
+                continue
+            b = self.concept_names.index(c)
+            carried = ((bits[:, b // 64] >> np.uint64(b % 64)) & np.uint64(1)).astype(np.float64)
+            if is_related:
+                related += weight * carried
+            else:
+                cover += weight * carried
+        return cover / total + related
 
     def term_idf(self, word):
         """(idf, chunks that have the word) for one lower-case word."""

@@ -81,6 +81,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | Setting | Default | Purpose |
 |---|---|---|
 | `AzureWebJobsStorage` | none | Queue and Table storage |
+| `RELATIONSHIP_EFFECTS` | `true` | Let ontology relationships expand, boost or suppress (see Search). `false` keeps only the original `illustrates` expansion |
 | `BLOB_STORAGE_CONNECTION_STRING`, `BLOB_CONTAINER` | none, `web-content` | Chunk storage |
 | `CRAWL_QUEUE_NAME`, `CRAWL_POISON_QUEUE_NAME` | `web-crawl-pages`, `web-crawl-pages-poison` | Queues |
 | `AzureFunctionsJobHost__extensions__queues__batchSize`, `AzureFunctionsJobHost__extensions__queues__newBatchThreshold` | `1`, `0` (the values in `host.json`) | How many crawl pages one instance works on at once: up to `batchSize` plus `newBatchThreshold` (`batchSize` is at most 32). The total at once is that times the number of running instances, which is set in Azure. An app setting with this name overrides `host.json` without a redeploy; changing it restarts the app |
@@ -209,6 +210,18 @@ matched by keyword or vector; it never adds one that matched nothing. `0` turns 
 the `www.` and bare copies of an address (`www.sujeeth.org/circle` and `sujeeth.org/circle/`) are one page. An answer holds fewer
 than `limit` results only when fewer pages match. Best bets and spotlights are placed first, and a page they share with the
 ordinary results appears once, as the curated copy.
+
+**How a question matches a concept.** A concept matches at full strength when one of its names, aliases or query phrases appears in the question as whole words (a plural `s` on the last word is accepted): "job" is not found in "jobbing". Otherwise it matches partly when the question shares at least two topic words with a phrase. One shared word of a longer phrase is not a match, so "first moon landing" does not reach First Job and "monthly car payment" does not reach "monthly gift". A concept that should answer to a single word ("resume", "salary") needs that word as an alias or query phrase in the ontology. Run the ontology at 1.13.3 or later with this rule; older versions relied on one-word matches and lose in-scope questions.
+
+**Relationships can widen a search or change its ranking.** Each predicate in the ontology can carry a `search_behavior` with a `matched_endpoint` (`subject`, `object` or `either`: the end the question has to match), an `effect` and a `weight` (0 to 1). The effect falls on the concept at the other end:
+
+| Effect | What it does |
+|---|---|
+| `expand` | The related concept joins the search filter, so pages tagged only with it can be returned, and it counts for `weight` in the ranking (0: filter only). |
+| `boost` | The filter is unchanged. A page already in the results that also carries the related concept ranks higher by `weight`. |
+| `suppress` | The filter is unchanged. A page that carries the related concept ranks lower by `weight`. It is not removed. |
+
+A weight is a share of what carrying everything the question named is worth. A single relationship can carry its own `search_behavior` to override its predicate, or `{"enabled": false}` to opt out. The rules: one hop only; a concept the question itself matched is never boosted or suppressed; when several relationships reach one concept it is expanded if any expands it, and its weight is the strongest boost less the strongest suppress; and when the question already matched one of the concepts an expansion would add ("week 3" matches Week 3 and Week), that expansion is dropped. The answer's `resolution.relationship_effects` lists what was applied, and `ranking.question_concepts` shows related concepts with a `~` in front. An ontology with no effects behaves as before: only `illustrates` acts, adding its subject to the filter. `RELATIONSHIP_EFFECTS=false` forces that.
 
 **Spotlights are boosted three ways.** The ontology says a Spotlight illustrates career development and the career skills (networking, interviewing, job applications, salary negotiation), so a question on any of them reserves up to `SPOTLIGHT_SLOTS` (3) places for Spotlight stories, placed first and flagged `spotlight`. A Spotlight added that way also counts toward the main ranking at `SPOTLIGHT_CONCEPT_WEIGHT` (1.0; 0 leaves it out), so Spotlight pages that are not in a reserved place rank higher too. The MCP server then tells the agent to offer a Spotlight as a real example, with its link.
 
