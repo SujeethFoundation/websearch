@@ -224,7 +224,14 @@ class PageWorker:
             canonical=soup.find('link',rel=lambda x:x and 'canonical' in x)
             if canonical and canonical.get('href'):
                 canonical_url=self.normalize(urljoin(final_url,canonical['href']))
-                if self.same_site(canonical_url,domain): final_url=canonical_url
+                # A page's canonical tag can name a URL the crawl rules do not allow (a wrong tag on the site, such as
+                # /author/<article> for an /advice page). Storing the page under it would put a blocked path in search
+                # results, so a canonical the path rules refuse is ignored and the fetched URL is kept.
+                if self.same_site(canonical_url,domain):
+                    if self.path_policy.is_excluded(domain,canonical_url):
+                        log.info("Ignoring canonical %s for %s: outside the crawl path rules for %s",canonical_url,final_url,domain)
+                    else:
+                        final_url=canonical_url
             for a in soup.find_all('a',href=True):
                 candidate=self.normalize(urljoin(final_url,a['href']))
                 if self.same_site(candidate,domain) and not self.path_policy.is_excluded(domain,candidate) and (not urlparse(candidate).path.rsplit('/',1)[-1].count('.') or urlparse(candidate).path.lower().endswith(tuple(settings.allowed_extensions))):
