@@ -12,7 +12,7 @@ Azure Functions app (Python v2) that crawls ontology-approved websites, stores t
 | Queue Storage | One message per page to crawl, plus backfill and re-tag tasks. Failed tasks go to the poison queue. |
 | Azure OpenAI / Foundry (`sf-embeddings`) | Embeds chunks at indexing time and each new search question (answers are remembered, see Search). |
 
-Every search must resolve to ontology concepts and approved domains first. If no concept matches, nothing is searched.
+The MCP server resolves the question through the ontology and sends the matched concepts and approved domains with each search request. Websearch uses those supplied values to filter indexed results and does not classify questions or authorize domains.
 
 ## Endpoints
 

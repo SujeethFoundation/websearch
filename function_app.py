@@ -175,48 +175,42 @@ def question_concept_weights(resolution):
     return weights
 
 
-def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ranking=None):
-    # Every search must resolve concepts and domains through the ontology.
-    resolution = concept_resolver.resolve_query(
-        query=query,
-        explicit_concepts=concepts or [],
-        explicit_domains=domains or [],
-        purpose=purpose,
-    )
-
-    if not resolution["matched_concepts"]:
+def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ranking=None, ontology_version=None):
+    # MCP owns ontology resolution and sends the approved filter. Websearch applies that filter to indexed results.
+    matched_concepts = list(dict.fromkeys(str(x) for x in (concepts or []) if str(x).strip()))
+    selected_domains = list(dict.fromkeys(str(x).lower() for x in (domains or []) if str(x).strip()))
+    if not matched_concepts:
         return {
             "query": query,
             "status": "no_ontology_concept_match",
-            "message": "The query could not be mapped to an ontology concept. No broad-domain search was performed.",
-            "ontology_version": resolution.get("ontology_version"),
+            "message": "MCP did not provide ontology-matched concepts. No search was performed.",
+            "ontology_version": None,
             "concepts": [],
             "domains": [],
             "count": 0,
             "results": [],
-            "resolution": resolution,
         }
-
-    selected_domains = resolution["domains"]
     if not selected_domains:
         return {
             "query": query,
             "status": "no_approved_domains_for_concepts",
-            "message": "Ontology matched concepts but returned no approved search domains.",
-            "ontology_version": resolution.get("ontology_version"),
-            "concepts": resolution["matched_concepts"],
+            "message": "MCP did not provide approved search domains. No search was performed.",
+            "ontology_version": None,
+            "concepts": matched_concepts,
             "domains": [],
             "count": 0,
             "results": [],
-            "resolution": resolution,
         }
+
+    resolution = {"status": "resolved", "matched_concepts": matched_concepts, "domains": selected_domains,
+                  "ontology_version": ontology_version, "concept_matches": []}
 
     # The main search and the two side searches (best bets, spotlights) ask the same question of the same index, so
     # they run together in one pass: the embedding, the keyword scores and the code distances are worked out once.
     bet_domains, bet_failed = plan_best_bets(selected_domains)
     spotlight_domains = plan_spotlights(resolution, selected_domains)
     jobs = [{
-        "concepts": resolution["matched_concepts"],
+        "concepts": matched_concepts,
         "domains": selected_domains,
         "limit": limit,
         "concept_weights": question_concept_weights(resolution),
@@ -233,7 +227,7 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ra
     result.update({
         "status": "completed",
         "ontology_version": resolution.get("ontology_version"),
-        "concepts": resolution["matched_concepts"],
+        "concepts": matched_concepts,
         "domains": selected_domains,
         "resolution": resolution,
     })
@@ -412,6 +406,7 @@ def search_post(req):
             purpose=body.get("purpose", "search"),
             limit=limit,
             ranking=body.get("ranking"),
+            ontology_version=body.get("ontology_version"),
         ))
     except LocalIndexLoading as exc:
         return index_loading_response(exc)
