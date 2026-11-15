@@ -9,7 +9,7 @@ import azure.functions as func
 from urllib.parse import urlparse
 
 from services.config import settings, VERSION
-from services.local_index import LocalIndexLoading
+from services.local_index import LocalIndexLoading, RELATED_PREFIX
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
@@ -161,6 +161,17 @@ def question_concept_weights(resolution):
         for match in resolution.get("concept_matches") or []:
             if str(match.get("concept_id") or "").lower() == "spotlight" and match.get("source") == "relationship":
                 weights["spotlight"] = boost
+    # What the ontology's relationships add: a related concept that should rank a page higher (positive) or lower
+    # (negative). They are kept apart from the question's own concepts by RELATED_PREFIX, so they never change what
+    # carrying the question's own concepts is worth.
+    for effect in resolution.get("relationship_effects") or []:
+        concept = str(effect.get("concept_id") or "").lower()
+        try:
+            weight = float(effect.get("weight") or 0)
+        except (TypeError, ValueError):
+            weight = 0.0
+        if concept and weight and concept not in weights:
+            weights[RELATED_PREFIX + concept] = weight
     return weights
 
 

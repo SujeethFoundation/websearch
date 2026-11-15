@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from services.config import settings
 from services.embedding_service import EmbeddingService
 from services.local_index import (
-    LocalIndexManager, LocalIndexUnavailable, VECTOR_FIELD, binary_code, entity_from_search_doc, query_terms,
+    LocalIndexManager, LocalIndexUnavailable, RELATED_PREFIX, VECTOR_FIELD, binary_code, entity_from_search_doc, query_terms,
     split_chunk_id,
 )
 
@@ -37,6 +37,21 @@ _query_lock = threading.Lock()
 # Bumped every time the cache is cleared. A search remembers the number it started under and stores its answer only if
 # the number is unchanged, so an answer computed from an index that has since been replaced is never kept.
 _query_generation = [0]
+
+
+def clean_concept_weights(weights):
+    """{concept: weight} in lower case. The question's own concepts keep positive weights only. A concept the ontology
+    relates to the question (its key starts with RELATED_PREFIX) may be negative: it ranks a page lower."""
+    out = {}
+    for concept, weight in (weights or {}).items():
+        try:
+            value = float(weight or 0)
+        except (TypeError, ValueError):
+            continue
+        key = str(concept).lower()
+        if value > 0 or (value < 0 and key.startswith(RELATED_PREFIX)):
+            out[key] = value
+    return out
 
 
 def normalize_query(query):
@@ -410,7 +425,7 @@ class SearchService:
         domains = sorted({str(x).lower() for x in (domains or [])})
         if not concepts or not domains:
             raise ValueError("Search requires ontology-resolved concepts and domains.")
-        concept_weights = {str(c).lower(): float(w) for c, w in (concept_weights or {}).items() if w and float(w) > 0}
+        concept_weights = clean_concept_weights(concept_weights)
         cache_key, generation = None, 0
         if settings.search_cache_seconds > 0:
             try:
@@ -555,7 +570,7 @@ class SearchService:
                 domains = sorted({str(x).lower() for x in (job.get("domains") or [])})
                 if not concepts or not domains:
                     raise ValueError("Search requires ontology-resolved concepts and domains.")
-                weights = {str(c).lower(): float(w) for c, w in (job.get("concept_weights") or {}).items() if w and float(w) > 0}
+                weights = clean_concept_weights(job.get("concept_weights"))
                 plans.append({"concepts": concepts, "domains": domains, "limit": int(job.get("limit", 5)),
                               "weights": weights, "ranking": job.get("ranking"), "key": None})
             except Exception as exc:
@@ -651,7 +666,7 @@ class SearchService:
         same settings as a real local search. Raises LocalIndexUnavailable when the index is not ready."""
         concepts = sorted({str(x).lower() for x in (concepts or [])})
         domains = sorted({str(x).lower() for x in (domains or [])})
-        weights = {str(c).lower(): float(w) for c, w in (concept_weights or {}).items() if w and float(w) > 0}
+        weights = clean_concept_weights(concept_weights)
         index = self.local.current()
         qcode, qvec, note = None, None, None
         try:
