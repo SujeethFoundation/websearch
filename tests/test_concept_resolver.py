@@ -30,3 +30,7 @@ def test_content_words_and_whole_phrases_still_match():
     assert _score_text("ways to give", "ways to give") >= 1.0
     assert _score_text("tell me about yourself answer", "tell me about yourself") >= 1.0
     assert _score_text("interview prep", "interview") >= 0.28
+
+
+def test_initial_match_normalizes_company_plural_in_research_phrase():
+    assert _score_text("how can I research a company", "research companies") >= 0.28
