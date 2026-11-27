@@ -130,6 +130,13 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `LOCAL_INDEX_POLL_SECONDS`, `LOCAL_INDEX_MIN_RELOAD_SECONDS` | `60`, `600` | How often an instance checks the version row, and the least time between rebuilds |
 | `LOCAL_INDEX_TITLE_WEIGHT` | `3` | How much a title word counts against a body word in keyword scoring. Used when a chunk is written, so changing it needs a backfill with `mode: all` |
 | `LOCAL_INDEX_PRELOAD` | `true` | Load the index when the worker starts, not at the first search |
+| `LOCAL_POSTING_WEIGHT_DTYPE` | `float16` | How the keyword weights are stored in memory (`float16` or `float32`). `float16` halves that array and changes a BM25 score by about 0.1%. Applies to the next index build; a snapshot built earlier keeps its own type |
+| `LOCAL_POSTING_MAX_DF` | `0` (off) | Words found in more than this share of the chunks (`0.3` = 30%) get no keyword postings. They score near zero anyway and are the largest lists. Check `tests/relevance_eval.py` before turning it on. Applies to the next index build |
+| `LOCAL_INDEX_PRELOAD_ON_HTTP` | `false` | `true`: do not preload the index when the worker starts; the first HTTP request starts the load. Queue and timer instances then never carry the index |
+| `LOCAL_INDEX_DROP_BEFORE_RELOAD` | `false` | `true`: a reload from the snapshot frees the old index first, so the instance never holds two. Searches in the few seconds the load takes wait, or fail fast with a 503 and `Retry-After` when `LOCAL_INDEX_FAIL_FAST` is on |
+| `LOCAL_INDEX_SNAPSHOT_ONLY` | `false` | `true`: loads and reloads that the app starts by itself use only a current snapshot and never scan the table (a scan peaks several hundred MB higher). Without a current snapshot a reload is skipped and the old index stays; a first load fails with a message. Build snapshots with `tools/build_snapshot.py` or `POST /api/index/snapshot` |
+| `LOCAL_INDEX_RELOAD_JITTER_SECONDS` | `0` | After an instance sees a changed table it waits a random 0 to this many seconds before reloading, so two instances are not both reloading at once. `300` is a good value for two instances |
+| `LOCAL_INDEX_FAIL_FAST`, `LOCAL_INDEX_RETRY_AFTER_SECONDS` | `false`, `3` | While the index is loading, `/search` and `/document` answer 503 with `Retry-After` instead of waiting. The MCP app retries that |
 | `INDEX_SNAPSHOT_ENABLED`, `INDEX_SNAPSHOT_AUTOBUILD` | `true`, `true` | Read a prebuilt copy of the index from Blob Storage instead of scanning the table, and save one after a table build (see Search). `false` for the first turns snapshots off entirely; `false` for the second leaves building to `POST /api/index/snapshot` |
 | `INDEX_SNAPSHOT_PREFIX`, `INDEX_SNAPSHOT_CONCURRENCY`, `INDEX_SNAPSHOT_KEEP_SECONDS` | `index-snapshot`, `4`, `3600` | Where in the blob container the snapshot lives (nothing else lists that prefix), parallel range requests per blob, and how long older builds are kept before they are deleted |
 | `LOCAL_INDEX_STOPWORDS` | `none` | `english` drops 33 common words from questions (not from chunks) |
@@ -320,6 +327,23 @@ instances run at 750 to 830 MB steady with a rebuild peak near 1,000 MB. If memo
 `LOCAL_INDEX_TEXT_IN_MEMORY=false` (each search then reads about five table rows, and a read costs a fraction of a cent per
 10,000; the phrase bonus is off then), or use 4,096 MB.
 
+**Running in 512 MB.** Steady memory is the index, so it is set by what is kept in memory. Settings, from the largest saving down:
+`LOCAL_INDEX_TEXT_IN_MEMORY` with text-cold domains in the ontology (about 1.8 KB a chunk of text kept out), `LOCAL_POSTING_MAX_DF=0.3`
+(on a synthetic Zipf corpus: postings 43% smaller together with float16, less on real text), `LOCAL_POSTING_WEIGHT_DTYPE=float16`
+(the default, a quarter off the postings), and the shared title, url and concept strings (always on). Rescoring stays on.
+A reload is the other peak: the old index and the new one are in memory together. For 512 MB instances:
+
+1. `INDEX_SNAPSHOT_ENABLED=true`, `LOCAL_INDEX_SNAPSHOT_ONLY=true` and `LOCAL_INDEX_DROP_BEFORE_RELOAD=true`, so a reload is a snapshot load with
+   nothing else in memory, and nothing ever scans the table.
+2. `LOCAL_INDEX_FAIL_FAST=true` (the MCP app retries the 503), and `LOCAL_INDEX_RELOAD_JITTER_SECONDS=300` with two always-ready instances,
+   so one answers while the other reloads. Raise `LOCAL_INDEX_MIN_RELOAD_SECONDS` (for example `3600`) so a crawl does not reload every 10 minutes.
+3. `LOCAL_INDEX_PRELOAD_ON_HTTP=true`, so queue and timer instances do not load the index.
+4. After a crawl, or a change to `LOCAL_POSTING_*`, run `python tools/build_snapshot.py` on a computer with about 1 GB free (it scans the table and
+   publishes the snapshot); the instances load it by themselves. Until then they keep answering from the index they have. The first time, build the
+   snapshot before lowering the instance size, because an instance without a current snapshot cannot load the index in 512 MB.
+
+Watch `process_memory_mb` in `/api/health` and `Watch-Websearch -InstanceMb 512`.
+
 ## Operating notes
 
 - **Searches answer by keywords only, or slowly:** a search question is embedded by Azure OpenAI, and the same deployment embeds chunks while crawling. Heavy indexing can throttle question embedding; searches then continue with keywords only (`search_mode: keyword`, counted in `local_index.keyword_only_searches`) and the endpoint is skipped for `EMBED_QUERY_COOLDOWN_SECONDS`. Mitigations: set `EMBED_MIN_INTERVAL_SECONDS`, cap the instance count (Flex Consumption: Settings → Scale and concurrency), give queries their own embedding deployment, and seed common questions with `Seed-EmbedCache`.
@@ -372,6 +396,7 @@ change them in the same commit as the thing they depend on.
 
 | Helper | What it does | Depends on |
 |---|---|---|
+| `tools/build_snapshot.py` | Builds the index snapshot from the table and saves it to Blob Storage, from any computer. For `LOCAL_INDEX_SNAPSHOT_ONLY` instances, which never scan the table (see Running in 512 MB) | |
 | `crawl-helper.ps1` | Table views and shortcuts for the crawl API: `Show-Crawl` (one row per domain, with a TOTAL row), `Show-CrawlPages`, `Show-CrawlPaths` (with a TOTAL row), `Show-CrawlTimeline`, `Start-Crawl`, `Wait-Crawl`, `Resume-Crawl`, `Stop-Crawl`, `Get-CrawlJobId`, `Show-LocalIndex`, `Start-LocalBackfill`, `Watch-LocalBackfill`, `Watch-Websearch`, `Seed-EmbedCache` (the index table and the health of each instance, see Search), and `Call` for any raw request. Load it with `. .\crawl-helper.ps1` | `GET /health`, `GET /crawl-dashboard` (the `latest_job` row of each domain), `POST /crawl` (its `jobs` and `skipped` lists), `GET /crawl/{job_id}/pages` (`?summary=true`, `?status=`, `?limit=`; fields `url`, `status`, `reason`, `attempts`, `error`, `created_utc`, `updated_utc`), `POST /crawl/{job_id}/cancel` and `/resume`, `GET /local-index/status` (`enabled`, `loaded`, `chunks`, `rescoring`, `embed_cache`, `table_rows`, `table_by_domain`, `queue_messages`), `POST /index/backfill` (`mode`, `domains`), `POST /embed-cache/seed`, and the `process`, `local_index`, `query_cache` and `embed_cache` sections of `GET /health` |
 | `Add-ManualPage.ps1` | Adds, replaces or removes one page by URL (`-Preview`, `-FromClipboard`, `-Delete`) | `POST /index/page`, `POST /index/page/delete`; the domain must be `search_enabled` and `manual_only` in the ontology |
 | `check_sitemap.py` | Shows what the crawler would collect from a domain's sitemaps and where the page limit lands. Read-only | Copies `services/sitemap.py` `collect_sitemap_urls` (collection order, `MAX_SITEMAPS_PER_DOMAIN`, `MAX_SITEMAP_BYTES`, each URL counted once, the crawler user agent) and reads `MAX_PAGES_PER_DOMAIN` like `services/config.py` |

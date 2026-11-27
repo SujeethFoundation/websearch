@@ -24,6 +24,7 @@ swap it in. A failed rebuild keeps the index it already has.
 import gc
 import hashlib
 import logging
+import random
 import re
 import threading
 import time
@@ -64,6 +65,26 @@ FUNCTION_WORDS = STOPWORDS | frozenset(
 )
 PHRASE_SPAN = 4  # two of the question's content words make a phrase when at most this many words apart in the question
 _TOKEN = re.compile(r"[^\W_]+")  # runs of letters and digits in any script
+
+
+class LocalIndexReloadSkipped(RuntimeError):
+    """An automatic reload was not done because only a current snapshot may be loaded and there is none yet."""
+
+
+def share_strings(values):
+    """The same list with equal strings replaced by one shared object, so the chunks of a page hold their title and url once."""
+    seen = {}
+    return [seen.setdefault(v, v) for v in values]
+
+
+def share_lists(values):
+    """The same list of lists with equal lists replaced by one shared list (callers only read them)."""
+    seen = {}
+    out = []
+    for v in values:
+        key = tuple(v)
+        out.append(seen.setdefault(key, v if isinstance(v, list) else list(v)))
+    return out
 
 
 class LocalIndexLoading(RuntimeError):
@@ -300,9 +321,9 @@ class LocalIndex:
         n = len(usable)
         self.n = n
         self.ids = [r["id"] for r in usable]
-        self.titles = [r["title"] for r in usable]
-        self.urls = [r["url"] for r in usable]
-        self.concepts = [list(r["concepts"]) for r in usable]
+        self.titles = share_strings(r["title"] for r in usable)
+        self.urls = share_strings(r["url"] for r in usable)
+        self.concepts = share_lists(list(r["concepts"]) for r in usable)
         # Domains whose chunk text stays in the table (ontology index_policy.text_in_memory is false): their rows get None
         # here and the text of the few chunks a search returns is read from the table. Their vectors and words are
         # in the index like any other domain's, so they are searched the same way.
@@ -378,17 +399,26 @@ class LocalIndex:
             weights /= tf
             del tf
             weights *= idf[cols]
+            max_df = settings.local_posting_max_df
+            if max_df > 0:
+                # Words found in more than this share of the chunks barely move a BM25 score and are the biggest
+                # postings lists; they get none. Document lengths above were worked out from every word.
+                keep = (df <= max(1, int(max_df * n)))[cols]
+                if not keep.all():
+                    all_docs, weights, cols = all_docs[keep], weights[keep], cols[keep]
+                    df = np.bincount(cols, minlength=len(self.vocab))
+                del keep
             order = np.argsort(cols, kind="stable")
             del cols
             self.post_docs = all_docs[order]
             del all_docs
-            self.post_weights = weights[order]
+            self.post_weights = weights[order].astype(np.dtype(settings.local_posting_weight_dtype), copy=False)
             del weights, order
             self.post_ptr = np.concatenate([[0], np.cumsum(df)]).astype(np.int64)
         else:
             self.vocab = np.zeros(0, dtype=np.uint64)
             self.post_docs = np.zeros(0, dtype=np.int32)
-            self.post_weights = np.zeros(0, dtype=np.float32)
+            self.post_weights = np.zeros(0, dtype=np.dtype(settings.local_posting_weight_dtype))
             self.post_ptr = np.zeros(1, dtype=np.int64)
 
         # Which rows pass a given set of domains and concepts. The same sets come back all the time (the ontology picks
@@ -1039,6 +1069,8 @@ class LocalIndexManager:
         self._failed_at = 0.0
         self._load_lock = threading.Lock()
         self._checking = threading.Lock()
+        self._reload_not_before = None   # monotonic time before which a changed table does not trigger a reload (jitter)
+        self._skip_logged = None         # the last "reload skipped" message, so it is logged once, not every poll
         self.on_swap = None  # called after a rebuilt index replaces the old one (the search service clears its answers)
         self.stats = {"loads": 0, "load_seconds": None, "build_seconds": None, "last_error": None, "searches": 0,
                       "embed_ms_total": 0.0, "search_ms_total": 0.0, "keyword_only": 0, "rescored": 0,
@@ -1096,17 +1128,25 @@ class LocalIndexManager:
             if time.monotonic() - self._failed_at < self.FAILURE_COOLDOWN_SECONDS and self._failed_at:
                 raise LocalIndexUnavailable(self.stats["last_error"] or "the local index could not be loaded")
             try:
-                self._reload_locked()
+                self._reload_locked(allow_scan=not settings.local_index_snapshot_only)
             except Exception as exc:
                 self._failed_at = time.monotonic()
                 self.stats["last_error"] = f"{type(exc).__name__}: {exc}"[:300]
                 log.warning("Local index could not be loaded: %s", self.stats["last_error"])
                 raise LocalIndexUnavailable(self.stats["last_error"]) from exc
 
-    def _reload_locked(self, use_snapshot=True, publish=None):
+    def _drop_index(self):
+        """Free the index this instance holds, so a reload does not hold two at once. Searches meanwhile wait for the
+        load lock, or fail fast (LOCAL_INDEX_FAIL_FAST)."""
+        self._index, self._version = None, None
+        release_memory()
+
+    def _reload_locked(self, use_snapshot=True, publish=None, allow_scan=True, drop_old=False):
         """Build the index and swap it in. From the prebuilt snapshot when one is current, else from the table.
         publish: None saves a snapshot after a table build when INDEX_SNAPSHOT_AUTOBUILD is on (in the background);
-        True saves one now and waits (the snapshot route)."""
+        True saves one now and waits (the snapshot route).
+        allow_scan=False refuses a table scan (raises LocalIndexReloadSkipped when no current snapshot can be read), because
+        a scan peaks far above a small instance's memory. drop_old frees the old index just before a snapshot load."""
         began = time.perf_counter()
         store = self.store()
         version = store.get_version()  # read first: a write during the scan then shows up as a newer token
@@ -1114,10 +1154,14 @@ class LocalIndexManager:
         index, skip, source, rows = None, None, "table", None
         read_done = {}
         if use_snapshot:
-            loaded = self._load_from_snapshot(version, keep_text)
+            loaded = self._load_from_snapshot(version, keep_text, drop_old=drop_old)
             if loaded:
                 index, skip = loaded
                 source = "snapshot"
+        if index is None and not allow_scan:
+            reason = self.stats.get("snapshot_error") or self.stats.get("snapshot_skipped") or "no snapshot"
+            raise LocalIndexReloadSkipped(f"no current snapshot to load ({reason}); build one with tools/build_snapshot.py "
+                                          "or POST /api/index/snapshot")
         if index is None:
             skip = self._current_text_skip()
             rows = (row_from_entity(e) for e in store.scan(keep_text, skip))
@@ -1168,7 +1212,7 @@ class LocalIndexManager:
                 self._snapshots = None
         return self._snapshots
 
-    def _load_from_snapshot(self, version, keep_text):
+    def _load_from_snapshot(self, version, keep_text, drop_old=False):
         """(index, text_skip) from the current snapshot, or None when there is none or it cannot stand in for a scan.
         Never raises: whatever goes wrong, the caller scans the table."""
         snaps = self._snapshot_store()
@@ -1188,6 +1232,8 @@ class LocalIndexManager:
                 self.stats["snapshot_skipped"] = why
                 log.info("Index snapshot not used: %s", why)
                 return None
+            if drop_old:
+                self._drop_index()
             index = snaps.load(manifest, LocalIndex, keep_text=keep_text, text_skip=skip, rescore=settings.local_rescore)
         except Exception as exc:
             self.stats["snapshot_error"] = f"{type(exc).__name__}: {exc}"[:300]
@@ -1252,11 +1298,29 @@ class LocalIndexManager:
                 skip = self._current_text_skip()  # an ontology change to which domains keep their text out reloads too
                 due = now - self._loaded_at >= settings.local_index_min_reload_seconds
                 changed = bool(token and token != self._version) or skip != self._text_skip
-                if changed and due and self._load_lock.acquire(blocking=False):
+                if not changed:
+                    self._reload_not_before = None
+                    return
+                # Wait a random while after first seeing a change, so instances that see it together do not reload together.
+                jitter = settings.local_index_reload_jitter_seconds
+                if jitter and self._reload_not_before is None:
+                    self._reload_not_before = now + random.uniform(0, jitter)
+                    log.info("Index changed; this instance reloads in about %.0f s", self._reload_not_before - now)
+                if self._reload_not_before is not None and now < self._reload_not_before:
+                    return
+                if due and self._load_lock.acquire(blocking=False):
                     try:
-                        self._reload_locked()
+                        snapshot_only = settings.local_index_snapshot_only
+                        self._reload_locked(allow_scan=not snapshot_only,
+                                            drop_old=settings.local_index_drop_before_reload)
+                        self._reload_not_before = None
                     finally:
                         self._load_lock.release()
+            except LocalIndexReloadSkipped as exc:
+                self.stats["last_error"] = str(exc)[:300]
+                if self._skip_logged != str(exc):
+                    self._skip_logged = str(exc)
+                    log.info("Index reload skipped; the earlier index stays in use: %s", exc)
             except Exception as exc:
                 self.stats["last_error"] = f"{type(exc).__name__}: {exc}"[:300]
                 log.warning("Local index refresh failed; the earlier index stays in use: %s", self.stats["last_error"])

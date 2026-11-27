@@ -183,7 +183,10 @@ def restore(index_cls, manifest, arrays, meta, *, keep_text, text_skip, rescore)
     index = index_cls.__new__(index_cls)
     index.n = n
     index.skipped = int(s["skipped"])
-    index.ids, index.titles, index.urls, index.concepts = meta["ids"], meta["titles"], meta["urls"], meta["concepts"]
+    from services.local_index import share_lists, share_strings
+    index.ids = meta["ids"]
+    index.titles, index.urls = share_strings(meta["titles"]), share_strings(meta["urls"])
+    index.concepts = share_lists(meta["concepts"])
     index.domain_names, index.concept_names = meta["domain_names"], meta["concept_names"]
     for name in ("domain_codes", "page_codes", "chunk_numbers", "concept_bits", "codes", "vocab", "post_docs",
                  "post_weights", "post_ptr"):

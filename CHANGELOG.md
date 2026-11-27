@@ -2,6 +2,13 @@
 
 Moved out of the README.
 
+## Running in 512 MB
+
+- Keyword weights are stored as float16 (`LOCAL_POSTING_WEIGHT_DTYPE`), and `LOCAL_POSTING_MAX_DF` can leave words found in most chunks out of the postings (off by default).
+- Chunks of one page share their title, url and concept list in memory, in built and restored indexes.
+- `LOCAL_INDEX_SNAPSHOT_ONLY`: the app never scans the table by itself; `LOCAL_INDEX_DROP_BEFORE_RELOAD`: a snapshot reload frees the old index first; `LOCAL_INDEX_RELOAD_JITTER_SECONDS`: instances reload at different times; `LOCAL_INDEX_PRELOAD_ON_HTTP`: queue and timer instances do not preload. `/document` now answers 503 with `Retry-After` while the index loads and `LOCAL_INDEX_FAIL_FAST` is on, like `/search`.
+- `tools/build_snapshot.py` builds and publishes a snapshot from any computer.
+
 ## Slim catalog
 
 - The concept resolver builds its catalog from one call to the ontology app's `/api/ontology/catalog` (classes, predicates, relationships and preferred terminology, about 255 KB) instead of four (`/api/ontology`, `/classes`, `/terminology`, `/relationships`, which downloaded the classes and relationships twice). An ontology app without the route is read the old way.

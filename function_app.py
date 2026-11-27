@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import os
@@ -29,6 +30,22 @@ logging.getLogger("azure").setLevel(logging.WARNING)
 from services.queue_worker import QueueProcessor
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+
+
+def http_route(**kwargs):
+    """app.route, plus: with LOCAL_INDEX_PRELOAD_ON_HTTP the first HTTP request starts the index load (see start_preload_once)."""
+    register = app.route(**kwargs)
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kw):
+            if settings.local_index_preload_on_http:
+                start_preload_once()
+            return fn(*args, **kw)
+        return register(wrapper)
+    return decorate
+
+
 log = logging.getLogger("sujeeth-web-search")
 
 storage = StorageService()
@@ -390,7 +407,7 @@ def index_available():
     return bool(searcher.local.enabled)
 
 
-@app.route(route="health", methods=["GET"])
+@http_route(route="health", methods=["GET"])
 def health(req):
     return response({
         "status": "healthy",
@@ -415,7 +432,7 @@ def health(req):
     })
 
 
-@app.route(route="search", methods=["GET"])
+@http_route(route="search", methods=["GET"])
 def search_get(req):
     query = (req.params.get("q") or "").strip()
     if not query:
@@ -432,7 +449,7 @@ def search_get(req):
         return response({"error": str(exc), "stage": "concept_resolution_or_search"}, 502)
 
 
-@app.route(route="search", methods=["POST"])
+@http_route(route="search", methods=["POST"])
 def search_post(req):
     body = read_body(req)
     query = str(body.get("query", "")).strip()
@@ -460,7 +477,7 @@ def search_post(req):
         return response({"error": str(exc), "stage": "concept_resolution_or_search"}, 502)
 
 
-@app.route(route="search/explain", methods=["POST"])
+@http_route(route="search/explain", methods=["POST"])
 def search_explain(req):
     """Why the local search answers a question as it does, and where the page it should have found stands.
 
@@ -491,7 +508,7 @@ def search_explain(req):
         return response({"error": f"{exc.__class__.__name__}: {exc}"}, 502)
 
 
-@app.route(route="domain-resolution", methods=["POST"])
+@http_route(route="domain-resolution", methods=["POST"])
 def domain_resolution(req):
     """Diagnostic endpoint: performs the same mandatory query-to-concept resolution as search."""
     body = read_body(req)
@@ -510,7 +527,7 @@ def domain_resolution(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="sources", methods=["GET"])
+@http_route(route="sources", methods=["GET"])
 def sources(req):
     try:
         return response({
@@ -522,7 +539,7 @@ def sources(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="index-status", methods=["GET"])
+@http_route(route="index-status", methods=["GET"])
 def index_status(req):
     try:
         count_blobs = str(req.params.get("count_blobs") or "").lower() in ("1", "true", "yes")
@@ -532,7 +549,7 @@ def index_status(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="index/tags", methods=["GET"])
+@http_route(route="index/tags", methods=["GET"])
 def index_tags(req):
     """Which ontology tags (concepts) are on the indexed content.
 
@@ -560,7 +577,7 @@ def index_tags(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="index/backfill", methods=["POST"])
+@http_route(route="index/backfill", methods=["POST"])
 def index_backfill(req):
     """Start a queue-driven, resumable copy of the stored Blob documents into the index table.
 
@@ -603,7 +620,7 @@ def index_backfill(req):
         return response({"error": str(exc)}, 500)
 
 
-@app.route(route="index/page", methods=["POST"])
+@http_route(route="index/page", methods=["POST"])
 def index_page(req):
     """Add or replace one page. The server crawls it and infers the description from what it finds.
 
@@ -674,7 +691,7 @@ def index_page(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="index/page/delete", methods=["POST"])
+@http_route(route="index/page/delete", methods=["POST"])
 def index_page_delete(req):
     """Remove one page (all its chunks) from the search index and Blob Storage. Body: {"url": "https://..."}"""
     body = read_body(req)
@@ -689,7 +706,7 @@ def index_page_delete(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="index/retag", methods=["POST"])
+@http_route(route="index/retag", methods=["POST"])
 def index_retag(req):
     """Queue a resumable re-tag of stored documents using the current ontology.
 
@@ -719,7 +736,7 @@ def index_retag(req):
         return response({"error": str(exc)}, 500)
 
 
-@app.route(route="index/retag-preview", methods=["POST"])
+@http_route(route="index/retag-preview", methods=["POST"])
 def index_retag_preview(req):
     """Read-only sample of how many stored documents a re-tag would change."""
     if not storage.container or not queue_processor:
@@ -733,7 +750,7 @@ def index_retag_preview(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="index/purge-preview", methods=["POST"])
+@http_route(route="index/purge-preview", methods=["POST"])
 def index_purge_preview(req):
     """Read-only sample of how many stored chunks fall under the ontology's excluded paths."""
     if not storage.container or not queue_processor:
@@ -747,7 +764,7 @@ def index_purge_preview(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="index/purge", methods=["POST"])
+@http_route(route="index/purge", methods=["POST"])
 def index_purge(req):
     """Queue a resumable purge of stored chunks under the ontology's excluded paths.
 
@@ -775,7 +792,7 @@ def index_purge(req):
         return response({"error": str(exc)}, 500)
 
 
-@app.route(route="document", methods=["POST"])
+@http_route(route="document", methods=["POST"])
 def document(req):
     """Return one indexed page, or a passage with its neighbors, within size limits.
 
@@ -833,6 +850,8 @@ def document(req):
         return response(payload)
     except ValueError as exc:
         return response({"error": str(exc)}, 400)
+    except LocalIndexLoading as exc:
+        return index_loading_response(exc)
     except Exception as exc:
         log.exception("Document lookup failed")
         return response({"error": str(exc)}, 502)
@@ -888,7 +907,7 @@ def _start_crawls(label, wanted, entries=None):
     return created, skipped
 
 
-@app.route(route="crawl", methods=["POST"])
+@http_route(route="crawl", methods=["POST"])
 def crawl_start(req):
     """Create page-level crawl jobs. Work is executed by the Storage Queue trigger."""
     if not crawl_state:
@@ -907,7 +926,7 @@ def crawl_start(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="crawl/all", methods=["POST"])
+@http_route(route="crawl/all", methods=["POST"])
 def crawl_all(req):
     """Start crawl jobs for every crawl-enabled domain that has no open job."""
     try:
@@ -921,14 +940,14 @@ def crawl_all(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="crawl-status", methods=["GET"])
+@http_route(route="crawl-status", methods=["GET"])
 def crawl_status(req):
     if not crawl_state: return response({"error":"Crawl state is not configured"},503)
     jobs=crawl_state.list_jobs(100)
     return response({"count":len(jobs),"jobs":jobs})
 
 
-@app.route(route="crawl-dashboard", methods=["GET"])
+@http_route(route="crawl-dashboard", methods=["GET"])
 def crawl_dashboard(req):
     if not crawl_state: return response({"error":"Crawl state is not configured"},503)
     jobs=crawl_state.list_jobs(100)
@@ -955,7 +974,7 @@ _JOB_COUNTERS = ("pages_discovered", "pages_processed", "pages_skipped", "pages_
                  "chunks_indexed", "chunks_tagged", "chunks_untagged")
 
 
-@app.route(route="crawl/domain-stats", methods=["GET"])
+@http_route(route="crawl/domain-stats", methods=["GET"])
 def crawl_domain_stats(req):
     """Per-domain totals from the job rows alone. Reading every page row of every job is not needed:
     each job already carries its page and chunk counters. For one job's pages by state, use
@@ -993,19 +1012,19 @@ def crawl_domain_stats(req):
         return response({"error": str(exc)}, 500)
 
 
-@app.route(route="crawl/{job_id}", methods=["GET"])
+@http_route(route="crawl/{job_id}", methods=["GET"])
 def crawl_get(req):
     if not crawl_state: return response({"error":"Crawl state is not configured"},503)
     job=crawl_state.get_job(req.route_params.get("job_id"))
     return response(job or {"error":"Crawl job not found"},200 if job else 404)
 
-@app.route(route="crawl/{job_id}/cancel", methods=["POST"])
+@http_route(route="crawl/{job_id}/cancel", methods=["POST"])
 def crawl_cancel(req):
     if not crawl_state: return response({"error":"Crawl state is not configured"},503)
     job=crawl_state.cancel_job(req.route_params.get("job_id"))
     return response(job or {"error":"Crawl job not found"},200 if job else 404)
 
-@app.route(route="crawl/{job_id}/resume", methods=["POST"])
+@http_route(route="crawl/{job_id}/resume", methods=["POST"])
 def crawl_resume(req):
     if not crawl_state: return response({"error":"Crawl state is not configured"},503)
     try:
@@ -1019,7 +1038,7 @@ _PAGE_COLUMNS = ["url", "depth", "status", "reason", "attempts", "error", "last_
                  "created_utc", "updated_utc"]
 
 
-@app.route(route="crawl/{job_id}/pages", methods=["GET"])
+@http_route(route="crawl/{job_id}/pages", methods=["GET"])
 def crawl_pages(req):
     """A job's pages. Optional: ?status=failed, ?limit=N (up to 10000), ?summary=true for counts by status and reason."""
     if not crawl_state:
@@ -1049,7 +1068,7 @@ def crawl_pages(req):
     return response({"job_id": job_id, "count": len(pages), "limit": limit or None, "pages": pages})
 
 
-@app.route(route="crawl/{job_id}/reconcile", methods=["POST"])
+@http_route(route="crawl/{job_id}/reconcile", methods=["POST"])
 def crawl_reconcile(req):
     if not crawl_state:
         return response({"error": "Crawl state is not configured"}, 503)
@@ -1061,7 +1080,7 @@ def crawl_reconcile(req):
         return response({"error": str(exc)}, 500)
 
 
-@app.route(route="crawl/{job_id}/recover", methods=["POST"])
+@http_route(route="crawl/{job_id}/recover", methods=["POST"])
 def crawl_recover(req):
     if not crawl_state:
         return response({"error": "Crawl state is not configured"}, 503)
@@ -1256,7 +1275,7 @@ def scheduled_index_reconcile(timer: func.TimerRequest) -> None:
 # ---------------------------------------------------------------------------------------------------------------
 # Local index: load it when the worker starts, so the first search does not wait for the table scan.
 # ---------------------------------------------------------------------------------------------------------------
-@app.route(route="local-index/status", methods=["GET"])
+@http_route(route="local-index/status", methods=["GET"])
 def local_index_status(req):
     """What this instance has loaded, and with ?count=true what the table holds right now: rows in all and per domain
     (a read of keys and domains only, a few seconds on a large table) and the messages waiting on the queue, which is
@@ -1279,7 +1298,7 @@ def local_index_status(req):
     return response(out)
 
 
-@app.route(route="embed-cache/seed", methods=["POST"])
+@http_route(route="embed-cache/seed", methods=["POST"])
 def embed_cache_seed(req):
     """Embed questions ahead of time and store their codes in the shared question cache, so visitors never wait for them.
     Body: {"questions": ["How do I volunteer?", ...]} (up to 500 a call). Already remembered questions are skipped."""
@@ -1294,7 +1313,7 @@ def embed_cache_seed(req):
     return response({**searcher.embedder.seed_questions(questions), "embed_cache": _embed_cache_stats()})
 
 
-@app.route(route="local-index/reload", methods=["POST"])
+@http_route(route="local-index/reload", methods=["POST"])
 def local_index_reload(req):
     """Rebuild this instance's in-memory index from the table now and say how long it took. (Other instances reload
     by themselves a few minutes after the table's version row changes.)"""
@@ -1308,7 +1327,7 @@ def local_index_reload(req):
         return response({"error": str(exc)}, 502)
 
 
-@app.route(route="index/snapshot", methods=["GET", "POST"])
+@http_route(route="index/snapshot", methods=["GET", "POST"])
 def index_snapshot(req):
     """GET: what this instance did with the prebuilt index snapshot and what the container holds now.
     POST: read the table on this instance and save a new snapshot for every instance to load (it runs in the
@@ -1337,5 +1356,21 @@ def _preload_local_index():
         log.warning("Local index preload did not finish; the first search will try again", exc_info=True)
 
 
-if settings.local_index_preload and searcher.local.enabled:
+_preload_started = threading.Lock()
+_preload_done = False
+
+
+def start_preload_once():
+    """Start the background index load, once per process. Called at import, or (LOCAL_INDEX_PRELOAD_ON_HTTP) by the first
+    HTTP request, so an instance that only runs queue or timer functions never loads the index."""
+    global _preload_done
+    if _preload_done or not (settings.local_index_preload and searcher.local.enabled):
+        return
+    if not _preload_started.acquire(blocking=False):
+        return
+    _preload_done = True
     threading.Thread(target=_preload_local_index, name="local-index-preload", daemon=True).start()
+
+
+if not settings.local_index_preload_on_http:
+    start_preload_once()
