@@ -42,6 +42,7 @@ def http_route(**kwargs):
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kw):
+            diagnostics.tick()
             if settings.local_index_preload_on_http:
                 start_preload_once()
             return fn(*args, **kw)
@@ -174,7 +175,10 @@ def gated(fn):
             diagnostics.counters.bump("searches")
             if settings.slow_search_seconds and took >= settings.slow_search_seconds:
                 diagnostics.counters.bump("slow")
-                diagnostics.emit("slow_search", route=fn.__name__, took_s=round(took, 1), **diagnostics_state())
+                facts = process_info()
+                diagnostics.emit("slow_search", route=fn.__name__, took_s=round(took, 1), pid=facts["pid"],
+                                 instance=facts["instance"], rss_mb=facts["rss_mb"], mem_limit_mb=facts.get("mem_limit_mb"),
+                                 **diagnostics_state())
     return wrapper
 
 

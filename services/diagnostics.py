@@ -49,27 +49,38 @@ def emit(event, **fields):
     log.warning("%s %s", event, " ".join(parts))
 
 
+_state = {"announced": False, "last": 0.0}
+_state_lock = threading.Lock()
+
+
 def start(info, interval, snapshot):
-    """Log process_start, register process_exit, and start the heartbeat thread (interval 0 turns the heartbeat off).
-    info() -> dict of process facts; snapshot() -> dict with `running`, `waiting`, `index` (loaded|loading|failed)."""
+    """Log process_start now and process_exit at exit. The Functions host forwards a worker's log lines only when they come
+    from a request thread, so the heartbeat is not a thread of its own: tick() sends it from whichever request comes in."""
     emit("process_start", **info())
     atexit.register(lambda: emit("process_exit", **info()))
+    _state.update(announced=True, last=time.monotonic(), interval=interval, info=info, snapshot=snapshot)
+
+
+def tick():
+    """Call at the start of every request. At most once per interval it logs a heartbeat (if anything happened since the
+    last one), and the first call after a start also repeats process_start, so both reach the host's log."""
+    interval = _state.get("interval") or 0
     if interval <= 0:
-        return None
-    thread = threading.Thread(target=_beat_forever, args=(info, interval, snapshot), name="heartbeat", daemon=True)
-    thread.start()
-    return thread
-
-
-def _beat_forever(info, interval, snapshot):
-    last_beat = time.monotonic()
-    while True:
-        time.sleep(interval)
-        try:
-            if beat(info, snapshot, time.monotonic() - last_beat >= IDLE_BEAT_SECONDS):
-                last_beat = time.monotonic()
-        except Exception:
-            log.debug("heartbeat failed", exc_info=True)
+        return
+    now = time.monotonic()
+    with _state_lock:
+        first = _state.pop("announced", False)
+        if not first and now - _state["last"] < interval:
+            return
+        idle_due = now - _state.get("last_logged", 0.0) >= IDLE_BEAT_SECONDS
+        _state["last"] = now
+    try:
+        if first:
+            emit("process_start", **_state["info"]())
+        if beat(_state["info"], _state["snapshot"], idle_due):
+            _state["last_logged"] = now
+    except Exception:
+        log.debug("heartbeat failed", exc_info=True)
 
 
 def beat(info, snapshot, idle_due=False):
