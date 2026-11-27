@@ -126,6 +126,7 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `FULL_TEXT_DOMAINS` | `sujeeth.org,topics.sujeeth.org` | Domains `/document` may return in full |
 | `EXCERPT_MAX_CHARS` | `3000` | Cap for every other domain |
 | `LOCAL_INDEX_CONNECTION_STRING`, `LOCAL_INDEX_TABLE` | the blob connection string, `searchchunks` | Where the index table lives (letters and digits only). A small `searchchunksmeta` table holds the version row |
+| `LOCAL_INDEX_TEXT_COMPRESS` | `true` | Keep the in-memory chunk text compressed (zlib, one chunk at a time, about half the size). Only the chunks a search reads are unpacked (about 10 microseconds each). `false` keeps plain UTF-8. Changing it rebuilds the snapshot. The plain constructor (`LOCAL_INDEX_LEAN_BUILD=false`) holds strings and packs on publish |
 | `LOCAL_INDEX_TEXT_IN_MEMORY` | `true` | Keep chunk text in memory (fast), or read the few chunks a search returns from the table (about a third of the memory). The phrase bonus needs it |
 | `LOCAL_INDEX_POLL_SECONDS`, `LOCAL_INDEX_MIN_RELOAD_SECONDS` | `60`, `600` | How often an instance checks the version row, and the least time between rebuilds |
 | `LOCAL_INDEX_TITLE_WEIGHT` | `3` | How much a title word counts against a body word in keyword scoring. Used when a chunk is written, so changing it needs a backfill with `mode: all` |

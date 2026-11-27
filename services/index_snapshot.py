@@ -6,10 +6,10 @@ instance, every time. One instance does it once, saves the finished arrays here,
 
 Layout, in the blob container the chunks already use, under a prefix nothing else lists:
   index-snapshot/latest.json                 the manifest: which build is current and what it holds (written last)
-  index-snapshot/<build>/meta.json.gz        ids, titles, urls, concepts and the domain and concept names, as JSON (gzip)
+  index-snapshot/<build>/meta.json.gz        page ids (chunk ids are page id + chunk number), titles, urls, concepts and the domain and concept names, as JSON (gzip)
   index-snapshot/<build>/<array>.bin         one raw numpy array each (codes, rvec, postings, text ...), shapes in the manifest
 
-The chunk text is three of those arrays, not JSON: text_blob (every chunk's UTF-8 text end to end), text_off (where each
+The chunk text is three of those arrays, not JSON: text_blob (every chunk's UTF-8 text end to end; zlib per chunk when the manifest says text_compressed), text_off (where each
 chunk starts and ends in it) and text_none (1 for a chunk whose text stays in the table). Loading them costs a read and a
 view; no Python string exists for a chunk until a search asks for it (see LazyTexts).
   index-snapshot/<build>/claim.json          who is building it, so that instances starting together build it once
@@ -22,6 +22,7 @@ a scan would be. Anything else (no snapshot, a different version, a different fo
 download) means the caller scans the table as before. Nothing here can make a search fail.
 """
 import gzip
+import zlib
 import hashlib
 import json
 import logging
@@ -36,7 +37,7 @@ from services.config import settings
 
 log = logging.getLogger("sujeeth-web-search.index-snapshot")
 
-FORMAT_VERSION = 2               # 2: the chunk text is in raw arrays (text_blob, text_off, text_none), not in meta.json.gz
+FORMAT_VERSION = 3               # 3: postings hold chunk numbers at 3 bytes, the text may be compressed (manifest text_compressed), chunk ids are page_ids in meta plus the id_page array; 2: the chunk text is in raw arrays (text_blob, text_off, text_none), not in meta.json.gz
 CLAIM_STALE_SECONDS = 20 * 60     # a claim this old belongs to a builder that died: take it over
 DOWNLOAD_WORKERS = 12             # most blobs fetched at once on a large instance; INDEX_SNAPSHOT_DOWNLOAD_WORKERS sets it (2 by default)
 
@@ -120,13 +121,27 @@ class SnapshotError(RuntimeError):
 # Chunk text without a Python string per chunk
 # ---------------------------------------------------------------------------------------------------------------
 
+TEXT_LEVEL = 3     # zlib level: most of the saving of the default at a third of the time to build
+
+
+def compress_text(text):
+    """A chunk's text as it is held when text compression is on: zlib over its UTF-8 (nothing at all for an empty text)."""
+    raw = str(text or "").encode("utf-8", "replace")
+    return zlib.compress(raw, TEXT_LEVEL) if raw else b""
+
+
+def decompress_text(data):
+    return zlib.decompress(data).decode("utf-8") if len(data) else ""
+
+
 class LazyTexts:
     """The chunk texts of a restored index. Reads like the list a table-built index holds: texts[i] is the text of row i,
     or None when that row's text stays in the table. The text sits in one byte buffer and a string is made only when a
     row is asked for (a search asks for about 10 rows, and up to LOCAL_PHRASE_POOL more for phrase scoring), so loading
     makes no per-chunk objects and the process holds the text once, as bytes."""
 
-    def __init__(self, blob, off, none):
+    def __init__(self, blob, off, none, compressed=False):
+        self.compressed = bool(compressed)
         self._view = memoryview(blob)
         self._off = off
         self._none = np.array(none, dtype=np.uint8)   # a copy: the loaded array is read-only, and rows can be hidden
@@ -147,7 +162,8 @@ class LazyTexts:
             raise IndexError(i)
         if self._none[i]:
             return None
-        return bytes(self._view[int(self._off[i]):int(self._off[i + 1])]).decode("utf-8")
+        data = bytes(self._view[int(self._off[i]):int(self._off[i + 1])])
+        return decompress_text(data) if self.compressed else data.decode("utf-8")
 
     def __setitem__(self, i, value):
         if value is not None:
@@ -171,13 +187,20 @@ class LazyTexts:
         return self._nbytes
 
 
+def texts_compressed(texts):
+    """Whether the packed text of an index is compressed: what it holds when packed already, else the setting."""
+    return texts.compressed if isinstance(texts, LazyTexts) else bool(settings.local_index_text_compress)
+
+
 def pack_texts(texts):
-    """(text_blob, text_off, text_none) arrays for a list of chunk texts (None for a row whose text stays in the table)."""
+    """(text_blob, text_off, text_none) arrays for a list of chunk texts (None for a row whose text stays in the table),
+    each chunk compressed when LOCAL_INDEX_TEXT_COMPRESS is on."""
     if isinstance(texts, LazyTexts):
         return texts.arrays()      # already packed: no second copy of the text
     n = len(texts)
     none = np.fromiter((t is None for t in texts), dtype=np.uint8, count=n)
-    encoded = [b"" if t is None else t.encode("utf-8", "replace") for t in texts]
+    pack_one = compress_text if settings.local_index_text_compress else (lambda t: str(t or "").encode("utf-8", "replace"))
+    encoded = [b"" if t is None else pack_one(t) for t in texts]
     off = np.zeros(n + 1, dtype=np.int64)
     if n:
         np.cumsum(np.fromiter((len(b) for b in encoded), dtype=np.int64, count=n), out=off[1:])
@@ -189,21 +212,26 @@ def pack_texts(texts):
 # Packing and restoring an index
 # ---------------------------------------------------------------------------------------------------------------
 
-def build_id(version, keep_text, text_skip, has_rvec, rescore_shape=()):
+def build_id(version, keep_text, text_skip, has_rvec, rescore_shape=(), text_compressed=False):
     """The directory name of one build: the table's version plus what the snapshot holds (including the shape the
     rescoring vectors are held in, so a change to LOCAL_RESCORE_BITS or LOCAL_RESCORE_DIMS makes a new build)."""
     fingerprint = json.dumps([bool(keep_text), sorted(str(d).lower() for d in text_skip or ()), bool(has_rvec)]
-                             + ([list(rescore_shape)] if rescore_shape else []))
+                             + ([list(rescore_shape)] if rescore_shape else []) + (['zlib'] if text_compressed and keep_text else []))
     return f"{version}-{hashlib.sha1(fingerprint.encode()).hexdigest()[:8]}"
 
 
 def pack(index):
     """(arrays, meta, scalars) for a built LocalIndex. Nothing is copied: the arrays are the index's own."""
     arrays = {name: getattr(index, name) for name in _ARRAYS}
+    from services.local_index import ChunkIds
     if index.rvec is not None:
         arrays["rvec"], arrays["rnorm"] = index.rvec, index.rnorm
-    meta = {"ids": index.ids, "titles": index.titles, "urls": index.urls, "concepts": index.concepts,
+    meta = {"titles": index.titles, "urls": index.urls, "concepts": index.concepts,
             "domain_names": index.domain_names, "concept_names": index.concept_names}
+    if isinstance(index.ids, ChunkIds):
+        meta["page_ids"], arrays["id_page"] = index.ids.page_ids, index.ids.id_page     # the numbers are chunk_numbers
+    else:
+        meta["ids"] = index.ids
     if index.texts is not None:
         # None rows (domains whose text stays in the table) are flagged in text_none
         arrays["text_blob"], arrays["text_off"], arrays["text_none"] = pack_texts(index.texts)
@@ -224,6 +252,8 @@ def compatible(manifest, *, version, keep_text, text_skip, rescore):
     if keep_text:
         if not manifest.get("keep_text"):
             return False, "the snapshot holds no chunk text"
+        if bool(manifest.get("text_compressed")) != bool(settings.local_index_text_compress):
+            return False, "the snapshot's chunk text is " + ("compressed" if manifest.get("text_compressed") else "not compressed") + ", the settings ask for the other"
         lacking = sorted(set(manifest.get("text_skip") or ()) - {str(d).lower() for d in text_skip or ()})
         if lacking:
             return False, "the snapshot has no text for " + ", ".join(lacking)
@@ -252,9 +282,11 @@ def restore(index_cls, manifest, arrays, meta, *, keep_text, text_skip, rescore)
 
     s = manifest["scalars"]
     n = int(s["n"])
-    for name in ("ids", "titles", "urls", "concepts"):
+    for name in ("titles", "urls", "concepts") + (() if "page_ids" in meta else ("ids",)):
         if len(meta[name]) != n:
             raise SnapshotError(f"{name} holds {len(meta[name])} entries, expected {n}")
+    if "page_ids" in meta and ("id_page" not in arrays or arrays["id_page"].shape[0] != n):
+        raise SnapshotError("the snapshot's chunk ids are incomplete")
     for name in ("domain_codes", "page_codes", "chunk_numbers", "codes", "concept_bits"):
         if arrays[name].shape[0] != n:
             raise SnapshotError(f"{name} holds {arrays[name].shape[0]} rows, expected {n}")
@@ -266,8 +298,8 @@ def restore(index_cls, manifest, arrays, meta, *, keep_text, text_skip, rescore)
     index = index_cls.__new__(index_cls)
     index.n = n
     index.skipped = int(s["skipped"])
-    from services.local_index import share_lists, share_strings
-    index.ids = meta["ids"]
+    from services.local_index import ChunkIds, share_lists, share_strings
+    index.ids = ChunkIds(meta["page_ids"], arrays["id_page"], arrays["chunk_numbers"]) if "page_ids" in meta else meta["ids"]
     index.titles, index.urls = share_strings(meta["titles"]), share_strings(meta["urls"])
     index.concepts = share_lists(meta["concepts"])
     index.domain_names, index.concept_names = meta["domain_names"], meta["concept_names"]
@@ -284,7 +316,8 @@ def restore(index_cls, manifest, arrays, meta, *, keep_text, text_skip, rescore)
         for name in _TEXT_ARRAYS:
             if name not in arrays:
                 raise SnapshotError(f"the snapshot has no {name}")
-        texts = LazyTexts(arrays["text_blob"], arrays["text_off"], arrays["text_none"])
+        texts = LazyTexts(arrays["text_blob"], arrays["text_off"], arrays["text_none"],
+                          compressed=bool(manifest.get("text_compressed")))
         if len(texts) != n:
             raise SnapshotError(f"the text holds {len(texts)} entries, expected {n}")
         extra = skip - set(manifest.get("text_skip") or ())
@@ -441,7 +474,8 @@ class SnapshotStore:
         from services.local_index import rescore_clip
         clip = rescore_clip(index.rescore_bits) if "rvec" in arrays else None
         build = build_id(version, keep_text, skip, "rvec" in arrays,
-                         (index.rescore_bits, index.rescore_dims, clip) if "rvec" in arrays else ())
+                         (index.rescore_bits, index.rescore_dims, clip) if "rvec" in arrays else (),
+                         text_compressed=keep_text and texts_compressed(index.texts))
         if not force and not self.claim(build):
             return None
         base = f"{self.prefix}/{build}"
@@ -456,7 +490,8 @@ class SnapshotStore:
                 files[name] = {"dtype": array.dtype.str, "shape": list(array.shape), "bytes": int(array.nbytes)}
             manifest = {"format": FORMAT_VERSION, "version": version, "build": build,
                         "built_at": datetime.now(timezone.utc).isoformat(), "keep_text": keep_text,
-                        "text_skip": skip, "has_rvec": "rvec" in arrays, "rescore_clip": clip, "scalars": scalars, "arrays": files}
+                        "text_skip": skip, "has_rvec": "rvec" in arrays, "rescore_clip": clip,
+                        "text_compressed": bool(keep_text and texts_compressed(index.texts)), "scalars": scalars, "arrays": files}
             self._put(self.manifest_name, json.dumps(manifest).encode("utf-8"))
         except Exception:
             try:

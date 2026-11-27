@@ -83,7 +83,7 @@ def _read_words(store, skip, split):
 def _build_postings(blocks, doc_len, n):
     """(vocab, post_ptr, post_docs, post_weights), the same arrays LocalIndex builds, one block at a time.
     A block's hashes are dropped once its postings are in place."""
-    from services.local_index import BM25_B, BM25_K1
+    from services.local_index import BM25_B, BM25_K1, POSTING_DOC_BYTES, pack_docs
 
     vocab = np.zeros(0, dtype=np.uint64)
     for hashes, _, _ in blocks:
@@ -103,7 +103,7 @@ def _build_postings(blocks, doc_len, n):
         df = np.where(keep_term, df, 0)
     post_ptr = np.concatenate([[0], np.cumsum(df)]).astype(np.int64)
     total = int(post_ptr[-1])
-    post_docs = np.empty(total, dtype=np.int32)
+    post_docs = np.empty((total, POSTING_DOC_BYTES), dtype=np.uint8)
     post_weights = np.empty(total, dtype=np.dtype(settings.local_posting_weight_dtype))
     fill = post_ptr[:-1].copy()
 
@@ -130,7 +130,7 @@ def _build_postings(blocks, doc_len, n):
         starts = np.flatnonzero(np.concatenate(([True], cols[1:] != cols[:-1])))
         sizes = np.diff(np.concatenate((starts, [len(cols)])))
         place = fill[cols] + (np.arange(len(cols)) - np.repeat(starts, sizes))
-        post_docs[place] = docs[order]
+        post_docs[place] = pack_docs(docs[order])
         post_weights[place] = weights[order]
         fill[cols[starts]] += sizes
     return vocab, post_ptr, post_docs, post_weights
@@ -140,9 +140,21 @@ def _build_postings(blocks, doc_len, n):
 # Pass 2: everything else, streamed into arrays of the final size
 # ---------------------------------------------------------------------------------------------------------------
 
+def _compact_ids(keys, chunk_numbers):
+    """The ids as ChunkIds sharing the index's chunk_numbers array (or the plain list when an id would not read back)."""
+    from services.local_index import ChunkIds
+    compact = ChunkIds.compact(keys)
+    if compact is None:
+        return list(keys)
+    if not np.array_equal(compact.numbers, chunk_numbers):
+        return list(keys)
+    compact.numbers = chunk_numbers
+    return compact
+
+
 def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
     from services.local_index import RescoreBuilder, chunk_number, page_key, share_lists
-    from services.index_snapshot import LazyTexts
+    from services.index_snapshot import LazyTexts, compress_text
 
     n = len(keys)
     keyset = set(keys)
@@ -153,6 +165,7 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
     concept_words = max(1, (len(concept_names) + 63) // 64)
     skip_set = frozenset(str(d).lower() for d in skip or ())
     rescore = settings.local_rescore
+    compress = bool(settings.local_index_text_compress)
 
     padded = (width + 7) // 8 * 8
     codes = np.zeros((n, padded), dtype=np.uint8)
@@ -204,7 +217,7 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
             if domain in skip_set:
                 text_none[row] = 1
             else:
-                text_blob += str(entity.get("text") or "").encode("utf-8", "replace")
+                text_blob += (compress_text(entity.get("text")) if compress else str(entity.get("text") or "").encode("utf-8", "replace"))
             text_off.append(len(text_blob))
         row += 1
     if row != n:
@@ -224,9 +237,9 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
     texts = None
     if keep_text:
         texts = LazyTexts(np.frombuffer(text_blob, dtype=np.uint8), np.frombuffer(text_off, dtype=np.int64),
-                          np.frombuffer(text_none, dtype=np.uint8))
+                          np.frombuffer(text_none, dtype=np.uint8), compressed=compress)
     return {
-        "ids": ids, "titles": titles, "urls": urls, "concepts": share_lists(concept_lists), "texts": texts,
+        "ids": _compact_ids(ids, chunk_numbers), "titles": titles, "urls": urls, "concepts": share_lists(concept_lists), "texts": texts,
         "domain_names": domain_names, "domain_codes": domain_codes, "page_codes": page_codes,
         "chunk_numbers": chunk_numbers, "distinct_pages": len(pages), "concept_names": concept_names,
         "concept_words": concept_words, "concept_bits": bits, "code_bytes": width,
