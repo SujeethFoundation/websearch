@@ -30,7 +30,7 @@ class FakeContainer:
             raise RuntimeError("the upload failed")
         if name in self.blobs and not overwrite:
             raise ResourceExistsError("the blob exists")
-        self.blobs[name] = (bytes(data), datetime.now(timezone.utc))
+        self.blobs[name] = (data.read() if hasattr(data, "read") else bytes(data), datetime.now(timezone.utc))
         self.uploads.append(name)
 
     def download_blob(self, name, **kwargs):

@@ -6,7 +6,8 @@ Moved out of the README.
 
 - Keyword weights are stored as float16 (`LOCAL_POSTING_WEIGHT_DTYPE`), and `LOCAL_POSTING_MAX_DF` can leave words found in most chunks out of the postings (off by default).
 - Chunks of one page share their title, url and concept list in memory, in built and restored indexes.
-- `LOCAL_INDEX_SNAPSHOT_ONLY`: the app never scans the table by itself; `LOCAL_INDEX_DROP_BEFORE_RELOAD`: a snapshot reload frees the old index first; `LOCAL_INDEX_RELOAD_JITTER_SECONDS`: instances reload at different times; `LOCAL_INDEX_PRELOAD_ON_HTTP`: queue and timer instances do not preload. `/document` now answers 503 with `Retry-After` while the index loads and `LOCAL_INDEX_FAIL_FAST` is on, like `/search`.
+- `LOCAL_INDEX_LEAN_BUILD`: a build from the table reads it twice and streams into arrays of the final size (`services/lean_index.py`), so it needs about 35 MB beyond the finished index instead of about 200 MB. Snapshot uploads no longer copy the largest array, and a table-built index keeps its text packed.
+- `LOCAL_INDEX_SNAPSHOT_ONLY` (optional): the app never scans the table by itself; `LOCAL_INDEX_DROP_BEFORE_RELOAD`: a snapshot reload frees the old index first; `LOCAL_INDEX_RELOAD_JITTER_SECONDS`: instances reload at different times; `LOCAL_INDEX_PRELOAD_ON_HTTP`: queue and timer instances do not preload. `/document` now answers 503 with `Retry-After` while the index loads and `LOCAL_INDEX_FAIL_FAST` is on, like `/search`.
 - `tools/build_snapshot.py` builds and publishes a snapshot from any computer.
 
 ## Slim catalog

@@ -48,6 +48,38 @@ _TEXT_ARRAYS = ("text_blob", "text_off", "text_none")   # only when the index ke
 _SCALARS = ("n", "skipped", "code_bytes", "concept_words", "distinct_pages", "vec_dims", "rows_without_vectors")
 
 
+class _ArrayStream:
+    """A read-only file object over the bytes of a contiguous numpy array, so an upload copies one piece at a time."""
+
+    def __init__(self, array):
+        self._view = memoryview(np.ascontiguousarray(array).reshape(-1).view(np.uint8))
+        self.size = self._view.nbytes
+        self._at = 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._at
+
+    def seek(self, offset, whence=0):
+        base = {0: 0, 1: self._at, 2: self.size}[whence]
+        self._at = max(0, min(self.size, base + offset))
+        return self._at
+
+    def read(self, size=-1):
+        end = self.size if size is None or size < 0 else min(self.size, self._at + size)
+        chunk = bytes(self._view[self._at:end])
+        self._at = end
+        return chunk
+
+    def __len__(self):
+        return self.size
+
+
 class SnapshotError(RuntimeError):
     """The snapshot is missing a piece, does not add up, or was written by another version of the format."""
 
@@ -98,6 +130,10 @@ class LazyTexts:
         """Mark these rows as having no text in memory (their text is read from the table)."""
         self._none[np.asarray(rows, dtype=np.int64)] = 1
 
+    def arrays(self):
+        """(text_blob, text_off, text_none) as they are held, without copying the text."""
+        return np.frombuffer(self._view, dtype=np.uint8), self._off, self._none
+
     def nbytes(self):
         """What this holds in memory. Cheap: nothing is decoded."""
         return self._nbytes
@@ -105,6 +141,8 @@ class LazyTexts:
 
 def pack_texts(texts):
     """(text_blob, text_off, text_none) arrays for a list of chunk texts (None for a row whose text stays in the table)."""
+    if isinstance(texts, LazyTexts):
+        return texts.arrays()      # already packed: no second copy of the text
     n = len(texts)
     none = np.fromiter((t is None for t in texts), dtype=np.uint8, count=n)
     encoded = [b"" if t is None else t.encode("utf-8", "replace") for t in texts]
@@ -221,19 +259,7 @@ def restore(index_cls, manifest, arrays, meta, *, keep_text, text_skip, rescore)
         index.vec8, index.norm8, index.vec_dims = None, None, 0
         index.rows_without_vectors = n if not rescore else int(s["rows_without_vectors"])
 
-    # The lookups the constructor derives from the ids and urls (cheap next to the postings).
-    index.by_id = {cid: i for i, cid in enumerate(index.ids)}
-    pages = {}
-    for i, cid in enumerate(index.ids):
-        page_id, number = split_chunk_id(cid)
-        pages.setdefault(page_id, []).append((number, i))
-    index.pages = {p: [i for _, i in sorted(items)] for p, items in pages.items()}
-    by_url = {}
-    for page_rows in index.pages.values():
-        for i in page_rows:
-            by_url.setdefault(index.urls[i], []).append(i)
-    index.by_url = by_url
-    index._rows_cache = {}
+    index._finish_lookups()   # the lookups the constructor derives from the ids and urls
     return index
 
 
@@ -266,6 +292,12 @@ class SnapshotStore:
 
     # -- small helpers ----------------------------------------------------------------------------------------
     def _put(self, name, data, overwrite=True):
+        if isinstance(data, np.ndarray):
+            # Read from the array in pieces: tobytes() would hold a second copy of the largest array (133 MB of vectors).
+            stream = _ArrayStream(data)
+            self.container.upload_blob(name, stream, overwrite=overwrite, length=stream.size,
+                                       max_concurrency=settings.index_snapshot_concurrency)
+            return
         self.container.upload_blob(name, data, overwrite=overwrite, max_concurrency=settings.index_snapshot_concurrency)
 
     def _get(self, name):
@@ -356,7 +388,7 @@ class SnapshotStore:
             files = {}
             for name, array in arrays.items():
                 array = np.ascontiguousarray(array)
-                self._put(f"{base}/{name}.bin", array.tobytes())
+                self._put(f"{base}/{name}.bin", array)
                 files[name] = {"dtype": array.dtype.str, "shape": list(array.shape), "bytes": int(array.nbytes)}
             manifest = {"format": FORMAT_VERSION, "version": version, "build": build,
                         "built_at": datetime.now(timezone.utc).isoformat(), "keep_text": keep_text,

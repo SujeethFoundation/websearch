@@ -425,7 +425,11 @@ class LocalIndex:
         # them), and a snapshot never changes, so each answer is kept for the life of the snapshot. Bounded.
         self._rows_cache = {}
 
-        # lookups for reading pages and single chunks
+        self._finish_lookups()
+
+    def _finish_lookups(self):
+        """The lookups for reading pages and single chunks, derived from the ids and urls."""
+        self._rows_cache = {}
         self.by_id = {cid: i for i, cid in enumerate(self.ids)}
         pages = {}
         for i, cid in enumerate(self.ids):
@@ -1011,14 +1015,22 @@ class LocalIndexStore:
         without it, so their text never crosses the wire at all."""
         select = ["id", "title", "url", "domain", "concepts", "vec", "tid", "tcnt"] + (["v8"] if settings.local_rescore else [])
         skip = sorted({str(d).lower() for d in text_skip_domains or () if d})
-        if not keep_text or not skip:
-            yield from self.chunks.list_entities(select=select + (["text"] if keep_text else []), results_per_page=1000)
+        yield from self.scan_columns(select, keep_text, skip, bool(keep_text and skip))
+
+    def scan_columns(self, select, with_text, text_skip=(), split=False):
+        """Rows with only the `select` columns (and text when with_text). With split, the table is read as two queries,
+        the domains outside text_skip first (carrying the text) and then those inside, which is the order scan() uses; the
+        lean index build reads the table twice and needs both reads in one order."""
+        select = list(select)
+        skip = sorted({str(d).lower() for d in text_skip or () if d})
+        if not split or not skip:
+            yield from self.chunks.list_entities(select=select + (["text"] if with_text else []), results_per_page=1000)
             return
         params = {f"d{i}": d for i, d in enumerate(skip)}
         others = " and ".join(f"domain ne @d{i}" for i in range(len(skip)))
         these = " or ".join(f"domain eq @d{i}" for i in range(len(skip)))
-        yield from self.chunks.query_entities(query_filter=others, select=select + ["text"], parameters=params,
-                                              results_per_page=1000)
+        yield from self.chunks.query_entities(query_filter=others, select=select + (["text"] if with_text else []),
+                                              parameters=params, results_per_page=1000)
         yield from self.chunks.query_entities(query_filter=these, select=select, parameters=params,
                                               results_per_page=1000)
 
@@ -1162,7 +1174,14 @@ class LocalIndexManager:
             reason = self.stats.get("snapshot_error") or self.stats.get("snapshot_skipped") or "no snapshot"
             raise LocalIndexReloadSkipped(f"no current snapshot to load ({reason}); build one with tools/build_snapshot.py "
                                           "or POST /api/index/snapshot")
-        if index is None:
+        if index is None and settings.local_index_lean_build:
+            skip = self._current_text_skip()
+            if drop_old:
+                self._drop_index()     # a lean build is sized for one index in memory, not two
+            from services.lean_index import build_lean
+            index = build_lean(store, keep_text, skip)
+            read_done["t"] = time.perf_counter()
+        elif index is None:
             skip = self._current_text_skip()
             rows = (row_from_entity(e) for e in store.scan(keep_text, skip))
 
@@ -1284,7 +1303,7 @@ class LocalIndexManager:
         """Rebuild now, on this instance, and wait for it. Used by the reload route and the preload.
         use_snapshot=False reads the table even when a snapshot is current; publish=True then saves a new snapshot."""
         with self._load_lock:
-            self._reload_locked(use_snapshot=use_snapshot, publish=publish)
+            self._reload_locked(use_snapshot=use_snapshot, publish=publish, drop_old=settings.local_index_drop_before_reload)
 
     def _maybe_refresh(self):
         now = time.monotonic()

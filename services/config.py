@@ -104,6 +104,9 @@ class Settings:
     local_posting_max_df = min(1.0, max(0.0, _float("LOCAL_POSTING_MAX_DF", 0.0)))
     local_index_preload_on_http = _flag("LOCAL_INDEX_PRELOAD_ON_HTTP", False)
     local_index_drop_before_reload = _flag("LOCAL_INDEX_DROP_BEFORE_RELOAD", False)
+    # - LOCAL_INDEX_LEAN_BUILD: a build from the table reads it twice and streams into arrays of the final size
+    #   (services/lean_index.py) instead of holding every row first, so it fits a 512 MB instance. Same index, same answers.
+    local_index_lean_build = _flag("LOCAL_INDEX_LEAN_BUILD", False)
     local_index_snapshot_only = _flag("LOCAL_INDEX_SNAPSHOT_ONLY", False)
     local_index_reload_jitter_seconds = _int("LOCAL_INDEX_RELOAD_JITTER_SECONDS", 0, 0, 86400)
     # While an instance is still loading its first index, a search normally waits for the load, and holds one of the
