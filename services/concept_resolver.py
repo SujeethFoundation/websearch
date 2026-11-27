@@ -102,20 +102,28 @@ class ConceptResolver:
 
     def _build_catalog(self):
 
-        ontology_doc = self.ontology.ontology()
-        classes = get_items(ontology_doc, ("classes", "ontology_classes"))
-        if not classes:
-            classes_payload = self.ontology.classes()
-            classes = get_items(classes_payload, ("classes", "ontology_classes"))
+        # One call for the slim catalog. An ontology app that does not have the route yet is read the old way.
+        slim = getattr(self.ontology, "catalog", lambda: None)()
+        if slim:
+            ontology_doc = slim
+            classes = get_items(slim, ("classes",))
+            terminology = get_items(slim, ("preferred_terminology",))
+            relationships = get_items(slim, ("relationships",))
+        else:
+            ontology_doc = self.ontology.ontology()
+            classes = get_items(ontology_doc, ("classes", "ontology_classes"))
+            if not classes:
+                classes_payload = self.ontology.classes()
+                classes = get_items(classes_payload, ("classes", "ontology_classes"))
 
-        terminology_payload = self.ontology.terminology()
-        terminology = get_items(
-            terminology_payload, ("terminology", "terms", "preferred_terminology")
-        )
-        relationships_payload = self.ontology.relationships()
-        relationships = get_items(
-            relationships_payload, ("relationships", "ontology_relationships")
-        )
+            terminology_payload = self.ontology.terminology()
+            terminology = get_items(
+                terminology_payload, ("terminology", "terms", "preferred_terminology")
+            )
+            relationships_payload = self.ontology.relationships()
+            relationships = get_items(
+                relationships_payload, ("relationships", "ontology_relationships")
+            )
 
         # Everything a search or a tagging pass needs from the aliases is worked out here, once per catalog: the
         # normalized text and word set of each alias. Before, every search rebuilt each class's alias list (reading the
