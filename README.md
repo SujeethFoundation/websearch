@@ -87,7 +87,7 @@ Note: the status and dashboard routes use a hyphen (`crawl-status`, `crawl-dashb
 
 | Function | Schedule | What it does |
 |---|---|---|
-| `scheduled_crawl_recovery` | Daily 10:00 | Reconciles and recovers unfinished jobs (up to 30 days old). Jobs that finished with errors are retried for 3 days only |
+| `scheduled_crawl_recovery` | Every 30 minutes | Reconciles and recovers unfinished jobs (up to 30 days old). Jobs that finished with errors are retried for 3 days only |
 | `scheduled_job_cleanup` | Daily 11:30 | Deletes crawl jobs, and their page rows, that nothing has touched for `JOB_RETENTION_DAYS` (default 30). The newest job of each domain is always kept. At most 20 jobs per run |
 | `scheduled_weekly_crawl` | Sundays 08:00 | Starts an incremental crawl for each domain in `WEEKLY_CRAWL_DOMAINS` (default `sujeeth.org,topics.sujeeth.org`; `*` means every crawl-enabled domain). Skips domains that already have an open job. A job nobody has touched for `OPEN_JOB_STALE_DAYS` no longer counts as open |
 | `scheduled_monthly_crawl` | 1st of the month, 09:00 | Starts an incremental crawl for every crawl-enabled domain that is not in `WEEKLY_CRAWL_DOMAINS`. Does nothing when the weekly list is `*` |
