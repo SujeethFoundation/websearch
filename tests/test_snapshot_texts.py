@@ -1,5 +1,6 @@
 """Tests for the chunk text kept as raw arrays in a snapshot (LazyTexts), the ordered download, and the fail-fast load."""
 import threading
+import time
 import types
 
 import numpy as np
@@ -218,3 +219,64 @@ def test_a_search_during_the_first_load_waits_when_fail_fast_is_off(monkeypatch)
 
 def test_loading_is_not_swallowed_as_unavailable():
     assert not issubclass(li.LocalIndexLoading, li.LocalIndexUnavailable)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# A request never loads the index itself when fail fast is on
+# ---------------------------------------------------------------------------------------------------------------
+
+def _plain_manager(monkeypatch, reload):
+    monkeypatch.setattr(settings, "local_index_fail_fast", True)
+    manager = li.LocalIndexManager(store=object(), snapshot_store=None, text_skip_provider=lambda: set())
+    manager._reload_locked = reload
+    return manager
+
+
+def test_the_first_request_is_refused_at_once_and_the_load_runs_in_the_background(monkeypatch):
+    gate, started = threading.Event(), threading.Event()
+
+    def slow_reload(*args, **kwargs):
+        started.set()
+        gate.wait(5)
+        manager._index = object()                      # the load finished
+
+    manager = _plain_manager(monkeypatch, slow_reload)
+    began = time.monotonic()
+    with pytest.raises(li.LocalIndexLoading):
+        manager.current()                              # no load lock held yet: this used to load in the request
+    assert time.monotonic() - began < 1.0
+    assert started.wait(5)
+    with pytest.raises(li.LocalIndexLoading):
+        manager.current()
+    gate.set()
+    manager._first_load_thread.join(5)
+    assert manager.current() is manager._index
+
+
+def test_many_early_requests_start_only_one_load(monkeypatch):
+    calls, gate = [], threading.Event()
+
+    def slow_reload(*args, **kwargs):
+        calls.append(1)
+        gate.wait(5)
+        raise RuntimeError("stop here")
+
+    manager = _plain_manager(monkeypatch, slow_reload)
+    for _ in range(20):
+        with pytest.raises(li.LocalIndexLoading):
+            manager.current()
+    gate.set()
+    manager._first_load_thread.join(5)
+    assert len(calls) == 1
+
+
+def test_a_failed_load_is_reported_as_unavailable_until_the_cooldown_ends(monkeypatch):
+    def failing_reload(*args, **kwargs):
+        raise RuntimeError("table unreachable")
+
+    manager = _plain_manager(monkeypatch, failing_reload)
+    with pytest.raises((li.LocalIndexLoading, li.LocalIndexUnavailable)):   # the load may already have failed
+        manager.current()
+    manager._first_load_thread.join(5)
+    with pytest.raises(li.LocalIndexUnavailable):
+        manager.current()

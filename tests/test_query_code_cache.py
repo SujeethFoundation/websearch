@@ -41,7 +41,8 @@ def conf(monkeypatch):
     for name, value in dict(embedding_dimensions=DIMS, embedding_deployment="emb-a", embedding_endpoint="https://x",
                             embedding_key="k", embed_cache_shared=True, embed_cache_memory_entries=1000,
                             embed_cache_ttl_days=30, embed_cache_cooldown=30, embed_query_cooldown=0, embed_query_attempts=2,
-                            embed_query_timeout=5, embed_query_max_wait=2).items():
+                            embed_query_timeout=5, embed_query_max_wait=2,
+                            local_index_fail_fast=False).items():     # these tests load the index in the request
         monkeypatch.setattr(settings, name, value, raising=False)
     return settings
 
