@@ -14,6 +14,7 @@ from services.config import settings, VERSION
 from services import local_index
 from services.local_index import LocalIndexLoading, RELATED_PREFIX
 from services.admission import AdmissionGate, SearchBusy
+from services import diagnostics
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
@@ -128,6 +129,16 @@ def process_info():
     }
 
 
+def diagnostics_state():
+    """What a heartbeat or slow-search line says about this instance besides memory and CPU."""
+    stats = gate.stats()
+    local = searcher.local
+    index = "loaded" if local._index is not None else ("failed" if local.stats.get("last_error") else "loading")
+    if not local.enabled:
+        index = "loaded"
+    return {"running": stats["running"], "waiting": stats["waiting"], "index": index}
+
+
 def response(data, status=200, headers=None):
     return func.HttpResponse(
         json.dumps(data, ensure_ascii=False, default=str),
@@ -152,18 +163,25 @@ def gated(fn):
         try:
             gate.acquire()
         except SearchBusy as exc:
-            log.warning("search_queue_timeout waited_s=%.1f %s", exc.waited, json.dumps(gate.stats()))
+            diagnostics.counters.bump("queue_refused")
             return busy_response(exc)
+        began = time.monotonic()
         try:
             return fn(*args, **kw)
         finally:
             gate.release()
+            took = time.monotonic() - began
+            diagnostics.counters.bump("searches")
+            if settings.slow_search_seconds and took >= settings.slow_search_seconds:
+                diagnostics.counters.bump("slow")
+                diagnostics.emit("slow_search", route=fn.__name__, took_s=round(took, 1), **diagnostics_state())
     return wrapper
 
 
 def index_loading_response(exc):
     """503 with Retry-After for a search that reached an instance still loading its index (LOCAL_INDEX_FAIL_FAST)."""
     wait = settings.local_index_retry_after
+    diagnostics.counters.bump("loading_refused")
     return response({"error": str(exc), "stage": "index_loading", "retry_after_seconds": wait}, 503,
                     headers={"Retry-After": str(wait)})
 
@@ -857,7 +875,7 @@ def document(req):
         limit = min(max_chars, settings.excerpt_max_chars) if excerpt_only else max_chars
         chosen, truncated = assemble_document(rows, focus, limit)
         timings["total_ms"] = round((time.perf_counter() - began) * 1000)
-        log.info("document timings_ms=%s url=%s", json.dumps(timings), url or chunk_id)
+        log.debug("document timings_ms=%s url=%s", json.dumps(timings), url or chunk_id)
         payload = {
             "status": "ok",
             "title": chosen[0].get("title"),
@@ -1412,3 +1430,6 @@ def start_preload_once():
 
 if not settings.local_index_preload_on_http:
     start_preload_once()
+
+
+diagnostics.start(process_info, settings.heartbeat_seconds, diagnostics_state)
