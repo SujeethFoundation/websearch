@@ -1,5 +1,7 @@
 import json
 import hashlib
+import logging
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from services.config import settings
@@ -13,7 +15,14 @@ except ImportError:
 class StorageService:
     def __init__(self):
         self.directory = Path(settings.local_data_dir)
-        self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # A relative folder inside a read-only app package (Flex Consumption runs from one) cannot be made, and
+            # that must not stop the app starting: Blob Storage is the real store there. Use a scratch folder instead.
+            self.directory = Path(tempfile.gettempdir()) / "websearch-data"
+            self.directory.mkdir(parents=True, exist_ok=True)
+            logging.getLogger(__name__).warning("Cannot create %s (%s); using %s for local files", settings.local_data_dir, exc, self.directory)
         self.container = None
         if settings.blob_connection_string and BlobServiceClient:
             service = BlobServiceClient.from_connection_string(settings.blob_connection_string)
