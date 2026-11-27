@@ -249,9 +249,26 @@ def test_no_preload_when_it_is_off(monkeypatch):
     assert started == []
 
 
-def test_the_new_settings_default_to_the_old_behaviour():
-    assert settings.local_posting_max_df == 0.0
-    assert settings.local_index_preload_on_http is False
-    assert settings.local_index_drop_before_reload is False
-    assert settings.local_index_snapshot_only is False
-    assert settings.local_index_reload_jitter_seconds == 0
+def test_the_new_behaviour_is_on_by_default_and_the_settings_turn_it_off(monkeypatch):
+    for name in ("LOCAL_INDEX_LEAN_BUILD", "LOCAL_INDEX_DROP_BEFORE_RELOAD", "LOCAL_INDEX_PRELOAD_ON_HTTP", "LOCAL_INDEX_FAIL_FAST",
+                 "LOCAL_INDEX_RELOAD_JITTER_SECONDS", "LOCAL_INDEX_SNAPSHOT_ONLY", "LOCAL_POSTING_MAX_DF", "LOCAL_POSTING_WEIGHT_DTYPE"):
+        monkeypatch.delenv(name, raising=False)
+    import importlib
+    from services import config
+    fresh = importlib.reload(config).settings
+    try:
+        assert fresh.local_index_lean_build and fresh.local_index_drop_before_reload and fresh.local_index_preload_on_http
+        assert fresh.local_index_fail_fast and fresh.local_index_reload_jitter_seconds == 300
+        assert fresh.local_posting_weight_dtype == "float16"
+        assert not fresh.local_index_snapshot_only and fresh.local_posting_max_df == 0.0
+        for name, value in (("LOCAL_INDEX_LEAN_BUILD", "false"), ("LOCAL_INDEX_DROP_BEFORE_RELOAD", "false"),
+                            ("LOCAL_INDEX_PRELOAD_ON_HTTP", "false"), ("LOCAL_INDEX_FAIL_FAST", "false"),
+                            ("LOCAL_INDEX_RELOAD_JITTER_SECONDS", "0"), ("LOCAL_POSTING_WEIGHT_DTYPE", "float32")):
+            monkeypatch.setenv(name, value)
+        off = importlib.reload(config).settings
+        assert not (off.local_index_lean_build or off.local_index_drop_before_reload or off.local_index_preload_on_http
+                    or off.local_index_fail_fast)
+        assert off.local_index_reload_jitter_seconds == 0 and off.local_posting_weight_dtype == "float32"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)

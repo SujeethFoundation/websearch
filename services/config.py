@@ -85,8 +85,8 @@ class Settings:
     local_index_min_reload_seconds = _int("LOCAL_INDEX_MIN_RELOAD_SECONDS", 600, 0)
     local_index_title_weight = _int("LOCAL_INDEX_TITLE_WEIGHT", 3, 1, 20)
     local_index_preload = _flag("LOCAL_INDEX_PRELOAD", True)
-    # Memory settings for small instances (512 MB). All default to the old behaviour except the weight dtype, which only
-    # changes how new index builds store the keyword weights (an older snapshot still loads as it is).
+    # Memory settings for small instances (512 MB). All are on by default except the pruning (LOCAL_POSTING_MAX_DF) and
+    # LOCAL_INDEX_SNAPSHOT_ONLY; set the setting to false (or 0) to get the old behaviour back.
     # - LOCAL_POSTING_WEIGHT_DTYPE: float16 halves the keyword-weight array; BM25 weights lose about 0.1% precision.
     # - LOCAL_POSTING_MAX_DF: words in more than this share of chunks (0.3 = 30%) get no postings. They score near zero
     #   anyway. 0 keeps every word. Check relevance (tests/relevance_eval.py) before turning it on.
@@ -102,17 +102,17 @@ class Settings:
     if local_posting_weight_dtype not in ("float16", "float32"):
         local_posting_weight_dtype = "float16"
     local_posting_max_df = min(1.0, max(0.0, _float("LOCAL_POSTING_MAX_DF", 0.0)))
-    local_index_preload_on_http = _flag("LOCAL_INDEX_PRELOAD_ON_HTTP", False)
-    local_index_drop_before_reload = _flag("LOCAL_INDEX_DROP_BEFORE_RELOAD", False)
+    local_index_preload_on_http = _flag("LOCAL_INDEX_PRELOAD_ON_HTTP", True)
+    local_index_drop_before_reload = _flag("LOCAL_INDEX_DROP_BEFORE_RELOAD", True)
     # - LOCAL_INDEX_LEAN_BUILD: a build from the table reads it twice and streams into arrays of the final size
     #   (services/lean_index.py) instead of holding every row first, so it fits a 512 MB instance. Same index, same answers.
-    local_index_lean_build = _flag("LOCAL_INDEX_LEAN_BUILD", False)
+    local_index_lean_build = _flag("LOCAL_INDEX_LEAN_BUILD", True)
     local_index_snapshot_only = _flag("LOCAL_INDEX_SNAPSHOT_ONLY", False)
-    local_index_reload_jitter_seconds = _int("LOCAL_INDEX_RELOAD_JITTER_SECONDS", 0, 0, 86400)
+    local_index_reload_jitter_seconds = _int("LOCAL_INDEX_RELOAD_JITTER_SECONDS", 300, 0, 86400)
     # While an instance is still loading its first index, a search normally waits for the load, and holds one of the
     # instance's concurrent request slots meanwhile. true: it fails at once (HTTP 503 with Retry-After) so the slot
     # stays free and the caller can retry or be sent elsewhere. Off by default.
-    local_index_fail_fast = _flag("LOCAL_INDEX_FAIL_FAST", False)
+    local_index_fail_fast = _flag("LOCAL_INDEX_FAIL_FAST", True)
     local_index_retry_after = _int("LOCAL_INDEX_RETRY_AFTER_SECONDS", 3, 1, 60)
     # The 1-bit codes find a shortlist of close chunks quickly, but they rank poorly among close neighbours. Each chunk
     # also keeps its vector at 8 bits a dimension (about 1.5 KB), and the best LOCAL_RESCORE_POOL chunks by code are

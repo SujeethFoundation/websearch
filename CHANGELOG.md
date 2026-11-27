@@ -4,6 +4,8 @@ Moved out of the README.
 
 ## Running in 512 MB
 
+On by default: `LOCAL_INDEX_LEAN_BUILD`, `LOCAL_INDEX_DROP_BEFORE_RELOAD`, `LOCAL_INDEX_PRELOAD_ON_HTTP`, `LOCAL_INDEX_FAIL_FAST`, `LOCAL_INDEX_RELOAD_JITTER_SECONDS=300` and float16 weights. Set each to `false` (the jitter to `0`, the weight type to `float32`) for the old behaviour. `LOCAL_POSTING_MAX_DF` and `LOCAL_INDEX_SNAPSHOT_ONLY` stay off.
+
 - Keyword weights are stored as float16 (`LOCAL_POSTING_WEIGHT_DTYPE`), and `LOCAL_POSTING_MAX_DF` can leave words found in most chunks out of the postings (off by default).
 - Chunks of one page share their title, url and concept list in memory, in built and restored indexes.
 - `LOCAL_INDEX_LEAN_BUILD`: a build from the table reads it twice and streams into arrays of the final size (`services/lean_index.py`), so it needs about 35 MB beyond the finished index instead of about 200 MB. Snapshot uploads no longer copy the largest array, and a table-built index keeps its text packed.
