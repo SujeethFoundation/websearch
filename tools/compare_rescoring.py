@@ -93,7 +93,7 @@ def main():
     parser.add_argument("--dims", type=int, default=1024, help="dimensions in the smaller copy; 0 for every dimension (default 1024)")
     parser.add_argument("--queries", type=int, default=500, help="how many chunks to use as questions (default 500)")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--clip", type=float, default=None, help="4-bit scaling: root-mean-squares of a row that reach the largest step (default %s)" % "3.5")
+    parser.add_argument("--clip", type=float, default=None, help="4-bit scaling: root-mean-squares of a row that reach the largest step (default: LOCAL_RESCORE_CLIP, 3.0)")
     parser.add_argument("--sweep", action="store_true", help="try 4 and 8 bits over 1,024 and every dimension, then four 4-bit clips, and print a table")
     args = parser.parse_args()
     loaded = load_settings(args.settings)
@@ -114,13 +114,13 @@ def main():
     print(f"{index.n:,} chunks, {index.vec_dims} dimensions, loaded in {time.perf_counter() - began:.0f} s")
     pool = settings.local_rescore_pool
     if args.sweep:
-        runs = [(8, 1024, None), (4, 0, None), (4, 1024, None)] + [(4, 1024, c) for c in (2.5, 3.0, 4.0, 5.0)]
+        runs = [(8, 1024, None), (4, 0, None), (4, 1024, None)] + [(4, 1024, c) for c in (2.5, 3.0, 3.5, 4.0)]
         print(f"\n{'bits':>4} {'dims':>5} {'clip':>5} {'MB':>7}  {'same best':>9} {'best in top10':>13} {'top10 kept':>10}   ({pool} shortlist, {args.queries} questions)")
         for bits, dims, clip in runs:
             r = compare(index, bits, dims, args.queries, pool, args.seed, clip=clip)
-            print(f"{r['bits']:>4} {r['dims']:>5} {('-' if r['bits'] == 8 else (clip or 3.5)):>5} {r['megabytes']:>7}  {r['top1']:>9.1%} {r['best_in_top10']:>13.1%} {r['recall']:>10.1%}")
+            print(f"{r['bits']:>4} {r['dims']:>5} {('-' if r['bits'] == 8 else (clip or settings.local_rescore_clip)):>5} {r['megabytes']:>7}  {r['top1']:>9.1%} {r['best_in_top10']:>13.1%} {r['recall']:>10.1%}")
         print("\nPick the smallest row whose numbers you are happy with. LOCAL_RESCORE_BITS and LOCAL_RESCORE_DIMS set bits and dims; "
-              "a clip other than 3.5 needs a change to RESCORE_CLIP in services/local_index.py.")
+              "set LOCAL_RESCORE_CLIP for a different clip.")
         return
     r = compare(index, args.bits, args.dims, args.queries, pool, args.seed, clip=args.clip)
     print(f"\n{r['bits']} bits over {r['dims']} dimensions, shortlist of {r['pool']}, {r['queries']} questions:")

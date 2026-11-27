@@ -433,3 +433,21 @@ def test_a_snapshot_in_another_shape_is_not_used(snaps, monkeypatch):
     monkeypatch.setattr(settings, "local_rescore_dims", 32)
     assert "32" in snap.compatible(manifest, **ok)[1]
     assert snap.compatible(manifest, **{**ok, "rescore": False}) == (True, "")   # without rescoring the shape does not matter
+
+
+def test_a_snapshot_scaled_with_another_clip_is_not_used(snaps, monkeypatch):
+    _, store = snaps
+    monkeypatch.setattr(settings, "local_rescore_bits", 4)
+    monkeypatch.setattr(settings, "local_rescore_dims", 0)
+    monkeypatch.setattr(settings, "local_rescore_clip", 3.0)
+    manifest = store.publish(build(), "v1", {"themuse.com"})
+    ok = dict(version="v1", keep_text=True, text_skip={"themuse.com"}, rescore=True)
+    assert manifest["rescore_clip"] == 3.0 and snap.compatible(manifest, **ok) == (True, "")
+    monkeypatch.setattr(settings, "local_rescore_clip", 3.5)
+    assert "clip" in snap.compatible(manifest, **ok)[1]
+    other = store.publish(build(), "v1", {"themuse.com"})
+    assert other["build"] != manifest["build"]                           # a new clip is a new build, not an overwrite
+    monkeypatch.setattr(settings, "local_rescore_bits", 8)
+    eight = store.publish(build(), "v1", {"themuse.com"})
+    assert eight["rescore_clip"] is None
+    assert snap.compatible(eight, **ok) == (True, "")                    # at 8 bits the clip plays no part

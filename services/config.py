@@ -150,6 +150,10 @@ class Settings:
     # LOCAL_RESCORE_DIMS=0 gives the old index exactly.
     local_rescore_bits = _int("LOCAL_RESCORE_BITS", 4, 4, 8)
     local_rescore_dims = _int("LOCAL_RESCORE_DIMS", 1024, 0)
+    #   LOCAL_RESCORE_CLIP  4-bit scaling: this many root-mean-squares of a vector's values reach the largest step (7); anything
+    #                       beyond is clipped. Lower packs the typical values finer but clips more outliers. 3.0 ranked best on the
+    #                       live index (tools/compare_rescoring.py --sweep). Changing it makes the instances rebuild their snapshot.
+    local_rescore_clip = max(1.0, min(10.0, _float("LOCAL_RESCORE_CLIP", 3.0)))
     # Every result is a different page: a page is returned once, as its best chunk, and the www. and bare copies of an
     # address count as one page. The answer holds fewer than `limit` results only when fewer pages match. false allows
     # several chunks of one page again (LOCAL_MAX_PER_PAGE applies).

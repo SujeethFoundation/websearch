@@ -177,7 +177,6 @@ def _popcount_rows(words):
 # ---------------------------------------------------------------------------------------------------------------
 
 RESCORE_BLOCK = 4096
-RESCORE_CLIP = 3.5     # (tools/compare_rescoring.py --sweep tries others on a real index) 4-bit rows are scaled so this many root-mean-squares of the row reach the largest step
 
 
 def rescore_params(source_dims):
@@ -186,6 +185,11 @@ def rescore_params(source_dims):
     dims = int(source_dims) if want <= 0 or want >= int(source_dims) else want
     bits = 8 if int(settings.local_rescore_bits) >= 8 else 4
     return dims, bits
+
+
+def rescore_clip(bits):
+    """The clip the packed vectors were made with: LOCAL_RESCORE_CLIP at 4 bits, None at 8 (where it plays no part)."""
+    return round(float(settings.local_rescore_clip), 3) if bits == 4 else None
 
 
 def rescore_width(dims, bits):
@@ -197,7 +201,7 @@ def pack_rescore(block, dims, bits, clip=None):
     """(packed, norms) for a block of stored int8 vectors, shape (m, source dims).
 
     The first `dims` dimensions are kept. At 8 bits they are used as stored. At 4 bits each row is rescaled so that
-    RESCORE_CLIP root-mean-squares of it fill the range of 7 steps (values beyond that are clipped), rounded, and two
+    LOCAL_RESCORE_CLIP root-mean-squares of it fill the range of 7 steps (values beyond that are clipped), rounded, and two
     dimensions go in a byte (each stored as value + 8, so zero is 8). Scaling to the row's largest value instead wastes
     most of the 15 levels on a few outliers and ranks close neighbours noticeably worse. `norms` is the length of the
     vector as it is held (1 for an all-zero row), which is what cosine similarity divides by; a row's overall scale does
@@ -209,7 +213,7 @@ def pack_rescore(block, dims, bits, clip=None):
         norms = np.sqrt((f * f).sum(axis=1))
     else:
         f = v.astype(np.float32)
-        ref = (RESCORE_CLIP if clip is None else clip) * np.sqrt((f * f).mean(axis=1))
+        ref = (settings.local_rescore_clip if clip is None else clip) * np.sqrt((f * f).mean(axis=1))
         scale = np.where(ref > 0, 7.0 / np.where(ref > 0, ref, 1.0), 0.0).astype(np.float32)
         q = np.clip(np.rint(f * scale[:, None]), -7, 7)
         norms = np.sqrt((q * q).sum(axis=1))
