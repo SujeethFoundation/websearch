@@ -36,3 +36,14 @@ def test_start_logs_process_start(caplog):
     with caplog.at_level(logging.WARNING):
         assert diagnostics.start(facts, 0, lambda: {}) is None
     assert any(r.getMessage().startswith("process_start pid=7") for r in caplog.records)
+
+
+def test_tick_sends_the_heartbeat_from_the_calling_thread(caplog):
+    diagnostics.counters.take()
+    diagnostics.start(facts, 15, lambda: {"running": 1, "waiting": 0, "index": "loaded"})
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        diagnostics.tick()                     # first call: process_start again, plus a beat (a search is running)
+        diagnostics.tick()                     # inside the interval: nothing
+    lines = [r.getMessage().split()[0] for r in caplog.records]
+    assert lines == ["process_start", "heartbeat"]
