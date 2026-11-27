@@ -1,5 +1,7 @@
 # Web search changelog
 
+- Rescoring vectors are held at 4 bits over the first 1,024 dimensions (`LOCAL_RESCORE_BITS=4`, `LOCAL_RESCORE_DIMS=1024`), down from 8 bits over all 1,536: 49 MB instead of 146 MB at 95,000 chunks, and a smaller snapshot. They are derived from the stored 8-bit vectors when the index loads, so no row changes and nothing is re-embedded; the question's vector is cut to the same dimensions. Each 4-bit row is scaled to 3.5 root-mean-squares and clipped, which ranks close neighbours better than scaling to the largest value. Set `LOCAL_RESCORE_BITS=8` and `LOCAL_RESCORE_DIMS=0` for the old index. A snapshot is only used by a reader with the same two settings; the first deploy rebuilds it. `tools/compare_rescoring.py` measures how often the smaller copies agree with the exact ranking on the real index. Renamed in the code: `vec8`/`norm8` are `rvec`/`rnorm`; the snapshot manifest says `has_rvec`.
+
 - `scheduled_crawl_recovery` runs every 30 minutes (was daily at 10:00 UTC), so pages stuck in flight are re-queued within about an hour instead of the next day. Pages are still re-queued only after 25 minutes without progress, and the run does nothing when no job is unfinished.
 
 - Snapshot restore downloads each array straight into its final buffer and fetches `INDEX_SNAPSHOT_DOWNLOAD_WORKERS` (default 2) at a time, instead of holding every blob twice at once. This lowers the memory peak while an instance loads, which was about 529 MB against a 512 MB limit.

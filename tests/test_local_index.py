@@ -433,6 +433,10 @@ def conf(monkeypatch):
     monkeypatch.setattr(settings, "local_index_reload_jitter_seconds", 0)
     monkeypatch.setattr(settings, "local_index_fail_fast", False)
     monkeypatch.setattr(settings, "local_index_snapshot_only", False)
+    # these tests pin exact rankings on tiny corpora with near-identical vectors, so they hold the vectors as the old index did
+    # (8 bits, every dimension); tests/test_local_rescoring.py covers the 4-bit, 1,024-dimension default
+    monkeypatch.setattr(settings, "local_rescore_bits", 8)
+    monkeypatch.setattr(settings, "local_rescore_dims", 0)
 
 
 def wait_for(predicate, seconds=5.0):

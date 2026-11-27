@@ -539,7 +539,7 @@ function Show-LocalIndex([switch]$Count, [switch]$CountBlobs, [switch]$Memory, [
     }
     $rs = $r.rescoring
     if ($rs) {
-        if ($rs.active) { Write-Host ("Rescoring: active (the 1-bit codes pick {0} candidates, 8-bit vectors rank them); {1:N0} searches rescored on this instance" -f $rs.pool, $rs.rescored_searches) }
+        if ($rs.active) { $shape = if ($rs.bits) { "{0}-bit vectors over {1:N0} dimensions" -f $rs.bits, $rs.dims } else { "8-bit vectors" }; Write-Host ("Rescoring: active (the 1-bit codes pick {0} candidates, {2} rank them); {1:N0} searches rescored on this instance" -f $rs.pool, $rs.rescored_searches, $shape) }
         elseif (-not $rs.enabled) { Write-Host "Rescoring: turned off (LOCAL_RESCORE=false)" -ForegroundColor Yellow }
         elseif ($r.loaded) { Write-Host ("Rescoring: OFF. {0:N0} rows have no 8-bit vector, so the codes alone rank results. Run Start-LocalBackfill -Mode all to write the vectors; instances reload on their own within about 10 minutes of the last batch (or POST /api/local-index/reload)." -f [int]$rs.rows_without_vectors) -ForegroundColor Yellow }
     }
@@ -715,7 +715,7 @@ function Show-WatchSummary($seen, [int]$InstanceMb, [int]$restarts, $restartLog)
     $known = @($list | Where-Object { $_.RescKnown })
     if ($known.Count) {
         $off = @($known | Where-Object { -not $_.Resc })
-        & $mark (-not $off.Count) $(if ($off.Count) { "rescoring is OFF on $($off.Count) instance(s): " + (($off | ForEach-Object { "{0} ({1:N0} rows without a vector)" -f (Short-Instance $_.Name), $_.RescMissing }) -join "; ") + ". Run Start-LocalBackfill -Mode all to write the vectors; instances reload on their own within about 10 minutes of the last batch." } else { "rescoring is active on every instance seen (the codes pick a shortlist, 8-bit vectors rank it)" })
+        & $mark (-not $off.Count) $(if ($off.Count) { "rescoring is OFF on $($off.Count) instance(s): " + (($off | ForEach-Object { "{0} ({1:N0} rows without a vector)" -f (Short-Instance $_.Name), $_.RescMissing }) -join "; ") + ". Run Start-LocalBackfill -Mode all to write the vectors; instances reload on their own within about 10 minutes of the last batch." } else { "rescoring is active on every instance seen (the codes pick a shortlist, the rescoring vectors rank it)" })
     }
     & $mark ($kw -eq 0) $(if ($kw) { "no searches ran keyword-only: $kw did" } else { "no searches ran keyword-only" })
     if ($lookups -gt 0) { & $mark ((& $sum "EmbErr") -eq 0) "the shared question cache table answered without errors" }

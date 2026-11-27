@@ -141,7 +141,7 @@ def _build_postings(blocks, doc_len, n):
 # ---------------------------------------------------------------------------------------------------------------
 
 def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
-    from services.local_index import chunk_number, page_key, share_lists
+    from services.local_index import RescoreBuilder, chunk_number, page_key, share_lists
     from services.index_snapshot import LazyTexts
 
     n = len(keys)
@@ -162,7 +162,7 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
     chunk_numbers = np.zeros(n, dtype=np.int32)
     ids, titles, urls, concept_lists = list(keys), [""] * n, [""] * n, [None] * n
     pages, shared_title, shared_url, shared_lists = {}, {}, {}, {}
-    vec8 = norm8 = None
+    builder = None
     dims, missing_v8 = 0, 0
     text_blob, text_off, text_none = bytearray(), array("q", [0]), bytearray(n)
 
@@ -193,11 +193,11 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
         chunk_numbers[row] = chunk_number(key)
         if rescore:
             v8 = _raw(entity.get("v8"))
-            if vec8 is None:
+            if builder is None and v8 and not missing_v8:
                 dims = len(v8)
-                vec8 = np.zeros((n, dims), dtype=np.int8) if dims else None
-            if vec8 is not None and len(v8) == dims:
-                vec8[row] = np.frombuffer(v8, dtype=np.int8)
+                builder = RescoreBuilder(n, dims)
+            if builder is not None and len(v8) == dims:
+                builder.add(v8)
             else:
                 missing_v8 += 1
         if keep_text:
@@ -211,15 +211,14 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
         raise Inconsistent(f"{n - row} row(s) were deleted since the first pass")
 
     rows_without_vectors = n
-    if rescore and vec8 is not None and not missing_v8:
+    rvec = rnorm = None
+    rescore_dims = rescore_bits = 0
+    if rescore and builder is not None and not missing_v8:
         rows_without_vectors = 0
-        norm8 = np.empty(n, dtype=np.float32)
-        for start in range(0, n, 4096):
-            block = vec8[start:start + 4096].astype(np.float32)
-            norm8[start:start + 4096] = np.sqrt((block * block).sum(axis=1))
-        norm8[norm8 == 0] = 1.0
+        rvec, rnorm = builder.finish()
+        rescore_dims, rescore_bits = builder.dims, builder.bits
     else:
-        vec8, dims = None, 0
+        dims = 0
         if rescore:
             rows_without_vectors = max(1, missing_v8) if n else 0
     texts = None
@@ -231,7 +230,8 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
         "domain_names": domain_names, "domain_codes": domain_codes, "page_codes": page_codes,
         "chunk_numbers": chunk_numbers, "distinct_pages": len(pages), "concept_names": concept_names,
         "concept_words": concept_words, "concept_bits": bits, "code_bytes": width,
-        "codes": np.ascontiguousarray(codes).view(np.uint64), "vec8": vec8, "norm8": norm8, "vec_dims": dims,
+        "codes": np.ascontiguousarray(codes).view(np.uint64), "rvec": rvec, "rnorm": rnorm, "vec_dims": dims,
+        "rescore_dims": rescore_dims, "rescore_bits": rescore_bits,
         "rows_without_vectors": rows_without_vectors,
     }
 

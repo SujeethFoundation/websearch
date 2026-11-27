@@ -43,7 +43,7 @@ def test_without_rescoring_there_are_no_8bit_vectors(conf, monkeypatch):
     monkeypatch.setattr(settings, "local_rescore", False)
     store = filled_store()
     index = lean.build_lean(store, True, ())
-    assert index.vec8 is None and index.norm8 is None
+    assert index.rvec is None and index.rnorm is None
     same_index(normal(store, True, ()), index)
 
 

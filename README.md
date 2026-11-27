@@ -142,7 +142,8 @@ Set these under **Function App → Settings → Environment variables**. Keep se
 | `INDEX_SNAPSHOT_PREFIX`, `INDEX_SNAPSHOT_CONCURRENCY`, `INDEX_SNAPSHOT_KEEP_SECONDS` | `index-snapshot`, `4`, `3600` | Where in the blob container the snapshot lives (nothing else lists that prefix), parallel range requests per blob, and how long older builds are kept before they are deleted |
 | `LOCAL_INDEX_STOPWORDS` | `none` | `english` drops 33 common words from questions (not from chunks) |
 | `SEARCH_VECTOR_K`, `LOCAL_TEXT_RECALL` | `0` (50), `0` (1,000) | How many vector and keyword results go into the rank fusion |
-| `LOCAL_RESCORE`, `LOCAL_RESCORE_POOL` | `true`, `300` | Re-rank the vector shortlist by cosine similarity on 8-bit vectors |
+| `LOCAL_RESCORE`, `LOCAL_RESCORE_POOL` | `true`, `300` | Re-rank the vector shortlist by cosine similarity on the rescoring vectors |
+| `LOCAL_RESCORE_BITS`, `LOCAL_RESCORE_DIMS` | `4`, `1024` | How the rescoring vectors are held in memory: 4 (two dimensions a byte) or 8 bits, over the first N dimensions (`0` = all). The table still stores the full 8-bit vector; the index derives the smaller copy when it loads, so nothing is re-embedded. At 95,000 chunks of 1,536 dimensions this is 49 MB instead of 146 MB. `LOCAL_RESCORE_BITS=8` with `LOCAL_RESCORE_DIMS=0` is the old behaviour. Changing either builds a new snapshot. Measure the effect on your own index with `python tools/compare_rescoring.py` first |
 | `LOCAL_CONCEPT_BOOST`, `LOCAL_PHRASE_BOOST`, `LOCAL_PHRASE_POOL` | `1.0`, `1.0`, `100` | The concept and phrase bonuses (`0` turns one off) |
 | `SEARCH_UNIQUE_PAGES`, `LOCAL_MAX_PER_PAGE` | `true`, `2` | Every result a different page; the per-page preference used only when that is off |
 | `SEARCH_CACHE_SECONDS`, `SEARCH_CACHE_MAX_ENTRIES` | `0` (off), `500` | Keep search answers briefly, keyed on the question, concepts, domains and limit |
@@ -161,7 +162,7 @@ written. Every instance scans the table into memory (a few seconds), then answer
 
 1. keeping the chunks in the listed domains that carry at least one of the concepts;
 2. keyword half: BM25 over the question's words (any word may match), the best 1,000 (`LOCAL_TEXT_RECALL`);
-3. vector half: the nearest 50 (`SEARCH_VECTOR_K`) by the 1-bit codes, re-ranked by cosine similarity on the 8-bit vectors;
+3. vector half: the nearest 50 (`SEARCH_VECTOR_K`) by the 1-bit codes, re-ranked by cosine similarity on the rescoring vectors (`LOCAL_RESCORE_BITS`, `LOCAL_RESCORE_DIMS`);
 4. reciprocal rank fusion of the two lists (1 / (60 + rank)), the concept and phrase bonuses below, and the best few, one per page.
 
 A one-row table holds a random version token that writers change after they write; instances check it every
@@ -200,9 +201,9 @@ and `GET /api/index/snapshot` say which happened and why.
   absent) and uploads it in the background; instances that start together build it once. A claim older than 20 minutes belongs
   to a builder that died and is taken over. The manifest, `latest.json`, is written last, so a reader never sees a half-written
   build. `POST /api/index/snapshot` builds one on demand.
-- **What it holds.** The arrays as raw `.bin` blobs (about 280 MB at 86,500 chunks, 133 MB of it the 8-bit vectors) and one
+- **What it holds.** The arrays as raw `.bin` blobs (about 280 MB at 86,500 chunks, 133 MB of it the rescoring vectors at 8 bits over every dimension; about 45 MB at the 4-bit, 1,024-dimension default) and one
   gzip JSON file for ids, titles, urls, concepts and the text of the domains that keep their text in memory. With rescoring off
-  the 8-bit vectors are not downloaded. A reader that keeps more domains' text in the table than the snapshot did drops that
+  the rescoring vectors are not downloaded. A snapshot built with other `LOCAL_RESCORE_BITS` or `LOCAL_RESCORE_DIMS` than the reader's is not used (the reader scans the table and publishes its own). A reader that keeps more domains' text in the table than the snapshot did drops that
   text on load; one that wants text the snapshot lacks scans instead.
 - **The ontology.** If the ontology cannot be read on a first load, the snapshot's own set of text-cold domains is used
   rather than loading every domain's text.
@@ -322,7 +323,7 @@ in-memory search time, keyword-only searches, and the result cache and question 
 it prints a summary with checks. `-InstanceMb` is the instance size the memory check is measured against.
 
 **Memory (measured on synthetic chunks, per 40,000 chunks).** Steady: about 230 MB with text in memory, about 90 MB without,
-plus the 8-bit vectors (about 61 MB per 40,000 chunks). While a rebuild runs there is a peak about 400 MB higher, with the old
+plus the rescoring vectors (about 61 MB per 40,000 chunks at 8 bits over 1,536 dimensions, about 20 MB at the 4-bit, 1,024-dimension default). While a rebuild runs there is a peak about 400 MB higher, with the old
 index still in use. `/api/health` shows `local_index.process_memory_mb`. On the live index (about 86,500 chunks) 2,048 MB
 instances run at 750 to 830 MB steady with a rebuild peak near 1,000 MB. If memory gets tight, set
 `LOCAL_INDEX_TEXT_IN_MEMORY=false` (each search then reads about five table rows, and a read costs a fraction of a cent per

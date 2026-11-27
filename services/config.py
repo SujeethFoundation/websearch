@@ -141,6 +141,15 @@ class Settings:
     local_phrase_boost = _float("LOCAL_PHRASE_BOOST", 1.0)
     local_phrase_pool = _int("LOCAL_PHRASE_POOL", 100, 10, 1000)
     local_rescore = _flag("LOCAL_RESCORE", True)
+    # How the rescoring vectors are held in memory. The table still stores the full 8-bit vector (v8); the index derives
+    # a smaller copy from it when it loads, so nothing is re-embedded and no table row changes.
+    #   LOCAL_RESCORE_BITS  4 (default) packs two dimensions to a byte; 8 keeps one byte a dimension (the old behaviour).
+    #   LOCAL_RESCORE_DIMS  rescore on the first N dimensions (1024 by default; text-embedding-3 vectors can be cut this
+    #                       way). 0, or a value at or above the vector's size, keeps every dimension.
+    # 4 bits and 1,024 of 1,536 dimensions take the vectors from 146 MB to 49 MB at 95,000 chunks. LOCAL_RESCORE_BITS=8 with
+    # LOCAL_RESCORE_DIMS=0 gives the old index exactly.
+    local_rescore_bits = _int("LOCAL_RESCORE_BITS", 4, 4, 8)
+    local_rescore_dims = _int("LOCAL_RESCORE_DIMS", 1024, 0)
     # Every result is a different page: a page is returned once, as its best chunk, and the www. and bare copies of an
     # address count as one page. The answer holds fewer than `limit` results only when fewer pages match. false allows
     # several chunks of one page again (LOCAL_MAX_PER_PAGE applies).
