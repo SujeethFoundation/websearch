@@ -11,6 +11,7 @@ import azure.functions as func
 from urllib.parse import urlparse
 
 from services.config import settings, VERSION
+from services import local_index
 from services.local_index import LocalIndexLoading, RELATED_PREFIX
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
@@ -1282,6 +1283,12 @@ def local_index_status(req):
     how a backfill is followed. Each call reaches one instance, so loaded figures differ between calls."""
     out = searcher.local.describe()
     out["embed_cache"] = _embed_cache_stats()
+    if str(req.params.get("memory") or "").lower() in ("1", "true", "yes", "trim"):
+        # ?memory=true: where the memory goes. ?memory=trim also hands freed heap back to the system and reports the change.
+        trim = str(req.params.get("memory")).lower() == "trim"
+        out["process"] = local_index.process_memory_detail(trim=trim)
+        index = searcher.local._index
+        out["memory_breakdown"] = index.memory_breakdown() if index else None
     if not searcher.local.enabled:
         return response({**out, "error": "Set LOCAL_INDEX_CONNECTION_STRING (or the blob storage connection string) first."}, 503)
     if str(req.params.get("count") or "").lower() in ("1", "true", "yes"):

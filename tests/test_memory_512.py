@@ -272,3 +272,12 @@ def test_the_new_behaviour_is_on_by_default_and_the_settings_turn_it_off(monkeyp
     finally:
         monkeypatch.undo()
         importlib.reload(config)
+
+
+def test_memory_breakdown_and_process_detail():
+    from services import local_index as li
+    index = index_of(corpus(pages=4, per_page=5))
+    b = index.memory_breakdown()
+    assert b["arrays_mb"]["codes"] >= 0 and "concepts" in b["python_objects_mb"]
+    assert b["arrays_total_mb"] >= 0 and b["python_objects_total_mb"] >= 0
+    assert isinstance(li.process_memory_detail(trim=True), dict)
