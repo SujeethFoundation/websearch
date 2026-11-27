@@ -36,7 +36,7 @@ from services.config import settings
 
 log = logging.getLogger("sujeeth-web-search.index-snapshot")
 
-FORMAT_VERSION = 2               # 2: the chunk text is in raw arrays (text_blob, text_off, text_none), not in meta.json.gz
+FORMAT_VERSION = 3               # 3: postings hold chunk numbers at 3 bytes; 2: the chunk text is in raw arrays (text_blob, text_off, text_none), not in meta.json.gz
 CLAIM_STALE_SECONDS = 20 * 60     # a claim this old belongs to a builder that died: take it over
 DOWNLOAD_WORKERS = 12             # most blobs fetched at once on a large instance; INDEX_SNAPSHOT_DOWNLOAD_WORKERS sets it (2 by default)
 

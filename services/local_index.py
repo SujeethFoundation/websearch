@@ -278,6 +278,27 @@ class RescoreBuilder:
         return self.data, self.norms
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Keyword postings: chunk numbers at 3 bytes each
+# ---------------------------------------------------------------------------------------------------------------
+
+POSTING_DOC_BYTES = 3     # a chunk number takes 3 bytes in the postings (up to 16.7 million chunks), not 4
+
+
+def pack_docs(docs):
+    """Chunk numbers (any integer array) as an (m, 3) uint8 array, least significant byte first."""
+    a = np.ascontiguousarray(np.asarray(docs), dtype="<u4")
+    if a.size and int(a.max()) >= 1 << (8 * POSTING_DOC_BYTES):
+        raise ValueError("a chunk number does not fit in 3 bytes: the index is limited to 16.7 million chunks")
+    return np.ascontiguousarray(a.view(np.uint8).reshape(-1, 4)[:, :POSTING_DOC_BYTES])
+
+
+def unpack_docs(packed):
+    """Chunk numbers (int64, ready to index with) from a slice of packed postings, shape (m, 3)."""
+    p = np.asarray(packed)
+    return p[:, 0].astype(np.int64) | (p[:, 1].astype(np.int64) << 8) | (p[:, 2].astype(np.int64) << 16)
+
+
 def page_key(url):
     """One key for a page however it was reached: no scheme, no leading www., no fragment, no trailing slash, host in
     lower case. https://www.sujeeth.org/circle/ and http://sujeeth.org/circle#top are the same page."""
@@ -514,14 +535,14 @@ class LocalIndex:
                 del keep
             order = np.argsort(cols, kind="stable")
             del cols
-            self.post_docs = all_docs[order]
+            self.post_docs = pack_docs(all_docs[order])
             del all_docs
             self.post_weights = weights[order].astype(np.dtype(settings.local_posting_weight_dtype), copy=False)
             del weights, order
             self.post_ptr = np.concatenate([[0], np.cumsum(df)]).astype(np.int64)
         else:
             self.vocab = np.zeros(0, dtype=np.uint64)
-            self.post_docs = np.zeros(0, dtype=np.int32)
+            self.post_docs = np.zeros((0, POSTING_DOC_BYTES), dtype=np.uint8)
             self.post_weights = np.zeros(0, dtype=np.dtype(settings.local_posting_weight_dtype))
             self.post_ptr = np.zeros(1, dtype=np.int64)
 
@@ -651,7 +672,7 @@ class LocalIndex:
             pos, wanted = pos[inside], terms[inside]
             for p in pos[self.vocab[pos] == wanted]:
                 a, z = self.post_ptr[p], self.post_ptr[p + 1]
-                scores[self.post_docs[a:z]] += self.post_weights[a:z]
+                scores[unpack_docs(self.post_docs[a:z])] += self.post_weights[a:z]
         return scores
 
     def _query_vector(self, qvec):

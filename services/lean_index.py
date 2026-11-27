@@ -83,7 +83,7 @@ def _read_words(store, skip, split):
 def _build_postings(blocks, doc_len, n):
     """(vocab, post_ptr, post_docs, post_weights), the same arrays LocalIndex builds, one block at a time.
     A block's hashes are dropped once its postings are in place."""
-    from services.local_index import BM25_B, BM25_K1
+    from services.local_index import BM25_B, BM25_K1, POSTING_DOC_BYTES, pack_docs
 
     vocab = np.zeros(0, dtype=np.uint64)
     for hashes, _, _ in blocks:
@@ -103,7 +103,7 @@ def _build_postings(blocks, doc_len, n):
         df = np.where(keep_term, df, 0)
     post_ptr = np.concatenate([[0], np.cumsum(df)]).astype(np.int64)
     total = int(post_ptr[-1])
-    post_docs = np.empty(total, dtype=np.int32)
+    post_docs = np.empty((total, POSTING_DOC_BYTES), dtype=np.uint8)
     post_weights = np.empty(total, dtype=np.dtype(settings.local_posting_weight_dtype))
     fill = post_ptr[:-1].copy()
 
@@ -130,7 +130,7 @@ def _build_postings(blocks, doc_len, n):
         starts = np.flatnonzero(np.concatenate(([True], cols[1:] != cols[:-1])))
         sizes = np.diff(np.concatenate((starts, [len(cols)])))
         place = fill[cols] + (np.arange(len(cols)) - np.repeat(starts, sizes))
-        post_docs[place] = docs[order]
+        post_docs[place] = pack_docs(docs[order])
         post_weights[place] = weights[order]
         fill[cols[starts]] += sizes
     return vocab, post_ptr, post_docs, post_weights
