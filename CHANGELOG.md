@@ -2,6 +2,10 @@
 
 Moved out of the README.
 
+## Slim catalog
+
+- The concept resolver builds its catalog from one call to the ontology app's `/api/ontology/catalog` (classes, predicates, relationships and preferred terminology, about 255 KB) instead of four (`/api/ontology`, `/classes`, `/terminology`, `/relationships`, which downloaded the classes and relationships twice). An ontology app without the route is read the old way.
+
 ## Version history (short)
 
 - 0.5.0: persistent page-level crawl jobs on queues and tables.

@@ -84,6 +84,16 @@ class OntologyClient:
     def ontology(self):
         return self.get("/api/ontology")
 
+    def catalog(self):
+        """The slim ontology: classes, predicates, relationships and preferred terminology in one answer, about a
+        quarter of what /api/ontology returns, with the edge defaults applied. None when the ontology app does not
+        have the route yet (an older deploy) or does not answer, so the caller falls back to the four older calls."""
+        try:
+            data = self.get("/api/ontology/catalog")
+        except Exception:
+            return None
+        return data if isinstance(data, dict) and isinstance(data.get("classes"), list) else None
+
     def summary(self):
         return self.get("/api/ontology/summary")
 
