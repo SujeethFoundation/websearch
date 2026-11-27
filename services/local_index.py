@@ -1525,6 +1525,7 @@ class LocalIndexManager:
                 return
             if time.monotonic() - self._failed_at < self.FAILURE_COOLDOWN_SECONDS and self._failed_at:
                 raise LocalIndexUnavailable(self.stats["last_error"] or "the local index could not be loaded")
+            log.info("Local index load started, process %s MB", process_memory_mb())
             try:
                 self._reload_locked(allow_scan=not settings.local_index_snapshot_only)
             except Exception as exc:
@@ -1594,8 +1595,8 @@ class LocalIndexManager:
         self.stats["load_seconds"] = round(now - began, 2)
         self.stats["build_seconds"] = round(now - read_done.get("t", began), 2) if source == "table" else None
         self.stats["last_error"] = None
-        log.info("Local index loaded from the %s: %d chunks, %d pages, %.1f MB, %.1f s", source, index.n,
-                 len(index.pages), index.memory_bytes() / 1e6, now - began)
+        log.info("Local index loaded from the %s: %d chunks, %d pages, %.1f MB, %.1f s, process %s MB", source, index.n,
+                 len(index.pages), index.memory_bytes() / 1e6, now - began, process_memory_mb())
         if source == "table" and version and (publish or (publish is None and settings.index_snapshot_autobuild)):
             if publish:
                 self._publish_snapshot(index, version, skip, force=True)

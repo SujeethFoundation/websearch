@@ -10,7 +10,7 @@
       "samplingSettings": {
         "isEnabled": true,
         "maxTelemetryItemsPerSecond": 5,
-        "excludedTypes": "Exception"
+        "excludedTypes": "Exception;Trace"
       }
     }
   },
