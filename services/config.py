@@ -230,6 +230,12 @@ class Settings:
     best_bet_max_rank = _int("BEST_BET_MAX_RANK", 5, 0, 100)
     # The most results one search request may ask for. The MCP server asks for a pool of candidates to choose from.
     search_max_limit = _int("SEARCH_MAX_LIMIT", 20, 1, 100)
+    # How many searches (and document reads) one instance runs at once, and the longest one waits for a slot. A request that
+    # has waited that long is refused with HTTP 503 and Retry-After instead of running late; the MCP app retries it.
+    # SEARCH_MAX_CONCURRENT=0 turns the limit off. SEARCH_QUEUE_TIMEOUT_SECONDS=0 refuses at once when no slot is free.
+    search_max_concurrent = _int("SEARCH_MAX_CONCURRENT", 4, 0, 256)
+    search_queue_timeout_seconds = max(0.0, _float("SEARCH_QUEUE_TIMEOUT_SECONDS", 10))
+    search_busy_retry_after = _int("SEARCH_BUSY_RETRY_AFTER_SECONDS", 1, 1, 60)
     full_text_domains = frozenset(_csv("FULL_TEXT_DOMAINS", "sujeeth.org,topics.sujeeth.org"))
     excerpt_max_chars = _int("EXCERPT_MAX_CHARS", 3000)
 

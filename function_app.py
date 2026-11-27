@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from services.config import settings, VERSION
 from services import local_index
 from services.local_index import LocalIndexLoading, RELATED_PREFIX
+from services.admission import AdmissionGate, SearchBusy
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
@@ -53,6 +54,7 @@ storage = StorageService()
 ontology = OntologyClient()
 concept_resolver = ConceptResolver(ontology)
 searcher = SearchService(storage)
+gate = AdmissionGate(settings.search_max_concurrent, settings.search_queue_timeout_seconds)
 crawl_state = None
 queue_processor = None
 try:
@@ -133,6 +135,30 @@ def response(data, status=200, headers=None):
         mimetype="application/json",
         headers=headers,
     )
+
+
+def busy_response(exc):
+    """503 with Retry-After for a request that waited the whole SEARCH_QUEUE_TIMEOUT_SECONDS for a free search slot."""
+    wait = settings.search_busy_retry_after
+    return response({"error": str(exc), "stage": "search_queue_timeout", "retry_after_seconds": wait}, 503,
+                    headers={"Retry-After": str(wait)})
+
+
+def gated(fn):
+    """Run a search or document read only once it holds one of this instance's SEARCH_MAX_CONCURRENT slots. It waits at most
+    SEARCH_QUEUE_TIMEOUT_SECONDS for one, and is then refused with a 503 (see busy_response)."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kw):
+        try:
+            gate.acquire()
+        except SearchBusy as exc:
+            log.warning("search_queue_timeout waited_s=%.1f %s", exc.waited, json.dumps(gate.stats()))
+            return busy_response(exc)
+        try:
+            return fn(*args, **kw)
+        finally:
+            gate.release()
+    return wrapper
 
 
 def index_loading_response(exc):
@@ -430,10 +456,12 @@ def health(req):
         "embed_cache": _embed_cache_stats(),
         "process": process_info(),
         "query_cache": query_cache_stats(),
+        "admission": gate.stats(),
     })
 
 
 @http_route(route="search", methods=["GET"])
+@gated
 def search_get(req):
     query = (req.params.get("q") or "").strip()
     if not query:
@@ -451,6 +479,7 @@ def search_get(req):
 
 
 @http_route(route="search", methods=["POST"])
+@gated
 def search_post(req):
     body = read_body(req)
     query = str(body.get("query", "")).strip()
@@ -479,6 +508,7 @@ def search_post(req):
 
 
 @http_route(route="search/explain", methods=["POST"])
+@gated
 def search_explain(req):
     """Why the local search answers a question as it does, and where the page it should have found stands.
 
@@ -794,6 +824,7 @@ def index_purge(req):
 
 
 @http_route(route="document", methods=["POST"])
+@gated
 def document(req):
     """Return one indexed page, or a passage with its neighbors, within size limits.
 
