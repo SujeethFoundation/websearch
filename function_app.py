@@ -1138,9 +1138,9 @@ def _job_age_days(job):
         return 0  # unknown age: treat as recent
 
 
-@app.timer_trigger(schedule="0 0 10 * * *", arg_name="timer", run_on_startup=False)
+@app.timer_trigger(schedule="0 */30 * * * *", arg_name="timer", run_on_startup=False)
 def scheduled_crawl_recovery(timer: func.TimerRequest) -> None:
-    """Daily 10:00 UTC: reconcile and recover unfinished crawl jobs. No-op when healthy."""
+    """Every 30 minutes: reconcile and recover unfinished crawl jobs. No-op when healthy."""
     if not crawl_state:
         log.error("Scheduled recovery skipped: crawl state is not configured")
         return
@@ -1161,11 +1161,11 @@ def scheduled_crawl_recovery(timer: func.TimerRequest) -> None:
             crawl_state.reconcile_job(job["job_id"])
             result = crawl_state.recover_job(job["job_id"], stale_minutes=25)
             examined += 1
-            log.info("Daily recovery job=%s domain=%s requeued=%s",
+            log.info("Scheduled recovery job=%s domain=%s requeued=%s",
                      job["job_id"], job.get("domain"), (result or {}).get("requeued"))
         except Exception:
-            log.exception("Daily recovery failed for job=%s", job.get("job_id"))
-    log.info("Daily crawl recovery finished; jobs examined: %d", examined)
+            log.exception("Scheduled recovery failed for job=%s", job.get("job_id"))
+    log.info("Scheduled crawl recovery finished; jobs examined: %d", examined)
 
 
 @app.timer_trigger(schedule="0 30 11 * * *", arg_name="timer", run_on_startup=False)

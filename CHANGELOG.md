@@ -1,5 +1,7 @@
 # Web search changelog
 
+- `scheduled_crawl_recovery` runs every 30 minutes (was daily at 10:00 UTC), so pages stuck in flight are re-queued within about an hour instead of the next day. Pages are still re-queued only after 25 minutes without progress, and the run does nothing when no job is unfinished.
+
 - Snapshot restore downloads each array straight into its final buffer and fetches `INDEX_SNAPSHOT_DOWNLOAD_WORKERS` (default 2) at a time, instead of holding every blob twice at once. This lowers the memory peak while an instance loads, which was about 529 MB against a 512 MB limit.
 
 Moved out of the README.
