@@ -20,6 +20,8 @@ from services.local_index import (
     split_chunk_id,
 )
 
+from services.deadline import check as check_deadline
+
 log = logging.getLogger("sujeeth-web-search.search")
 
 # Chunks are embedded once. The vector is stored next to the chunk (vectors/<id>.json) so a busy or
@@ -650,9 +652,11 @@ class SearchService:
         answer, or the exception that plan raised. Raises LocalIndexUnavailable when the index is not ready."""
         index = self.local.current()
         terms = query_terms(query)
+        check_deadline("embedding the question")
         began = time.perf_counter()
         qcode, qvec, keyword_only = self._embed_query(query)
         embed_ms = (time.perf_counter() - began) * 1000
+        check_deadline("scoring")
         began = time.perf_counter()
         work = index.begin(terms, qcode, qvec, query)
         hows, specs = [], []
@@ -669,6 +673,7 @@ class SearchService:
                 "phrase_boost": how["phrase_boost"], "phrase_pool": settings.local_phrase_pool,
                 "unique_pages": how["unique_pages"],
             })
+        check_deadline("ranking")
         found = index.search_many(work, specs)
         answers = []
         for plan, how, outcome in zip(plans, hows, found):

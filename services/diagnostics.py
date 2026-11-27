@@ -26,7 +26,7 @@ class Counters:
         self.reset()
 
     def reset(self):
-        self.searches = self.slow = self.loading_refused = self.queue_refused = self.errors = 0
+        self.searches = self.slow = self.loading_refused = self.queue_refused = self.deadline_refused = self.errors = 0
 
     def bump(self, name, n=1):
         with self._lock:
@@ -35,7 +35,7 @@ class Counters:
     def take(self):
         with self._lock:
             out = {"searches": self.searches, "slow": self.slow, "loading_503": self.loading_refused,
-                   "queue_503": self.queue_refused, "errors": self.errors}
+                   "queue_503": self.queue_refused, "deadline_503": self.deadline_refused, "errors": self.errors}
             self.reset()
             return out
 
