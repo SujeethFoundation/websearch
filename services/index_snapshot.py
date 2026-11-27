@@ -38,7 +38,7 @@ log = logging.getLogger("sujeeth-web-search.index-snapshot")
 
 FORMAT_VERSION = 2               # 2: the chunk text is in raw arrays (text_blob, text_off, text_none), not in meta.json.gz
 CLAIM_STALE_SECONDS = 20 * 60     # a claim this old belongs to a builder that died: take it over
-DOWNLOAD_WORKERS = 12             # blobs fetched at once (each one is also fetched in parallel ranges), biggest first
+DOWNLOAD_WORKERS = 12             # most blobs fetched at once on a large instance; INDEX_SNAPSHOT_DOWNLOAD_WORKERS sets it (2 by default)
 
 # Arrays of a LocalIndex that every snapshot holds, and the two that only the 8-bit rescoring needs.
 _ARRAYS = ("domain_codes", "page_codes", "chunk_numbers", "concept_bits", "codes",
@@ -46,6 +46,37 @@ _ARRAYS = ("domain_codes", "page_codes", "chunk_numbers", "concept_bits", "codes
 _VECTOR_ARRAYS = ("vec8", "norm8")
 _TEXT_ARRAYS = ("text_blob", "text_off", "text_none")   # only when the index keeps chunk text in memory
 _SCALARS = ("n", "skipped", "code_bytes", "concept_words", "distinct_pages", "vec_dims", "rows_without_vectors")
+
+
+class _ArraySink:
+    """A seekable write target over a numpy array, so a download lands in its final buffer with no copy of the whole."""
+
+    def __init__(self, array):
+        self._view = memoryview(array.reshape(-1).view(np.uint8)) if array.size else memoryview(b"")
+        self._pos = 0
+        self.written = 0
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=0):
+        self._pos = offset if whence == 0 else self._pos + offset if whence == 1 else len(self._view) + offset
+        return self._pos
+
+    def write(self, data):
+        end = self._pos + len(data)
+        if end > len(self._view):
+            raise SnapshotError("the blob is larger than the manifest says")
+        self._view[self._pos:end] = data
+        self._pos = end
+        self.written += len(data)
+        return len(data)
+
+    def flush(self):
+        pass
 
 
 class _ArrayStream:
@@ -303,6 +334,25 @@ class SnapshotStore:
     def _get(self, name):
         return self.container.download_blob(name, max_concurrency=settings.index_snapshot_concurrency).readall()
 
+    def _get_array(self, name, spec):
+        """One array, downloaded straight into its final buffer. readall() would hold the pieces and then the joined
+        bytes, so a blob is briefly in memory twice, and several blobs at once make the load peak far above the index."""
+        dtype, shape, size = np.dtype(spec["dtype"]), spec["shape"], int(spec["bytes"])
+        label = name.rsplit("/", 1)[-1].removesuffix(".bin")
+        downloader = self.container.download_blob(name, max_concurrency=settings.index_snapshot_concurrency)
+        if not hasattr(downloader, "readinto"):
+            data = downloader.readall()
+            if len(data) != size:
+                raise SnapshotError(f"{label} is {len(data)} bytes, the manifest says {size}")
+            return np.frombuffer(data, dtype=dtype).reshape(shape)
+        array = np.empty(shape, dtype=dtype)
+        sink = _ArraySink(array)
+        if size:
+            downloader.readinto(sink)
+        if sink.written != size:
+            raise SnapshotError(f"{label} is {sink.written} bytes, the manifest says {size}")
+        return array
+
     def _modified(self, name):
         """When a blob was last written (UTC), or None when it is not there."""
         for blob in self.container.list_blobs(name_starts_with=name):
@@ -335,22 +385,17 @@ class SnapshotStore:
         # The biggest blobs start first, so the slowest download does not wait behind the small ones.
         names.sort(key=lambda name: -int(specs[name]["bytes"]))
         began = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=max(1, min(DOWNLOAD_WORKERS, len(names) + 1))) as pool:
-            blobs = list(pool.map(self._get, [f"{base}/meta.json.gz"] + [f"{base}/{name}.bin" for name in names]))
-        downloaded = time.perf_counter()
-        meta = json.loads(gzip.decompress(blobs[0]))
-        blobs[0] = None
+        workers = max(1, min(int(settings.index_snapshot_download_workers), DOWNLOAD_WORKERS, len(names)))
+        meta = json.loads(gzip.decompress(self._get(f"{base}/meta.json.gz")))
         parsed = time.perf_counter()
-        arrays = {}
-        for name, data in zip(names, blobs[1:]):
-            spec = specs[name]
-            if len(data) != spec["bytes"]:
-                raise SnapshotError(f"{name} is {len(data)} bytes, the manifest says {spec['bytes']}")
-            arrays[name] = np.frombuffer(data, dtype=np.dtype(spec["dtype"])).reshape(spec["shape"])
-        del blobs
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            fetched = list(pool.map(lambda name: self._get_array(f"{base}/{name}.bin", specs[name]), names))
+        arrays = dict(zip(names, fetched))
+        del fetched
+        downloaded = time.perf_counter()
         index = restore(index_cls, manifest, arrays, meta, keep_text=keep_text, text_skip=text_skip, rescore=rescore)
-        log.info("Index snapshot read: download %.1f s, metadata %.1f s, restore %.1f s",
-                 downloaded - began, parsed - downloaded, time.perf_counter() - parsed)
+        log.info("Index snapshot read: metadata %.1f s, download %.1f s (%d at a time), restore %.1f s",
+                 parsed - began, downloaded - parsed, workers, time.perf_counter() - downloaded)
         return index
 
     # -- writing ----------------------------------------------------------------------------------------------

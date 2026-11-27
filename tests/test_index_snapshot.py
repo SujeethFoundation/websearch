@@ -373,3 +373,30 @@ def test_the_settings_default_to_on_with_a_prefix_nothing_else_lists():
     assert settings.index_snapshot_enabled and settings.index_snapshot_autobuild
     assert settings.index_snapshot_prefix == "index-snapshot"
     assert not "index-snapshot/".startswith(("documents/", "vectors/"))
+
+
+def test_a_restore_downloads_straight_into_the_arrays_and_matches_the_normal_one(snaps, monkeypatch):
+    container, store = snaps
+    table = filled_store()
+    built = manager(table, store).current()
+    assert published(container)
+    plain = manager(table, store).current()               # readall path (the fake has no readinto)
+
+    plain_download = container.download_blob
+
+    def download(name, **kwargs):
+        data = plain_download(name).readall()
+
+        def readinto(sink):
+            step = max(1, len(data) // 3)                 # pieces, last first, as parallel ranges arrive
+            for start in reversed(range(0, len(data), step)):
+                sink.seek(start)
+                sink.write(data[start:start + step])
+            return len(data)
+        return types.SimpleNamespace(readall=lambda: data, readinto=readinto)
+
+    monkeypatch.setattr(container, "download_blob", download)
+    direct = manager(table, store).current()
+    assert direct.n == plain.n == built.n
+    assert np.array_equal(direct.codes, plain.codes) and np.array_equal(direct.post_docs, plain.post_docs)
+    assert direct.codes.flags.writeable
