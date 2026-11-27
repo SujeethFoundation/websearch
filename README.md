@@ -2,6 +2,26 @@
 
 Azure Functions app (Python v2) that crawls ontology-approved websites, stores the text in Blob Storage, indexes it in a Table Storage table, and serves ontology-gated hybrid search (keywords and vectors) from memory to the MCP server and other clients.
 
+## Platform architecture
+
+The Sujeeth Foundation helps college students network into their first job through Career Circles, a six-week mentorship program. Students, mentors and partners use two front ends, the static site at sujeeth.org and a Power Pages portal, both on one Dataverse environment. Azure Function apps add chat, knowledge search, payments, short links and texting. The Dataverse side (Base Camp, circles, book requests, surveys, credentials, the Career Ascent course) ships as Dataverse solutions and has no repo.
+
+| Repo (README) | Role |
+|---|---|
+| [`sujeethfoundation.github.io`](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/README.md) | Website at sujeeth.org, wiki, Discussions, course player and Power Pages CSS |
+| [`chat`](https://github.com/SujeethFoundation/chat/blob/main/README.md) | Chat API behind the site's assistant widget |
+| [`mcp`](https://github.com/SujeethFoundation/mcp/blob/main/README.md) | MCP server (the "Sujeeth Foundation Graph") that AI assistants use to search Foundation knowledge |
+| [`ontology`](https://github.com/SujeethFoundation/ontology/blob/main/README.md) | Concept graph and governance: concepts, approved domains, Feelings API |
+| [`websearch`](https://github.com/SujeethFoundation/websearch/blob/main/README.md) | Crawler and hybrid search over ontology-approved websites |
+| [`wikisearch`](https://github.com/SujeethFoundation/wikisearch/blob/main/README.md) | Keyword search over the GitHub wiki |
+| [`payments`](https://github.com/SujeethFoundation/payments/blob/main/README.md) | PayPal checkout and webhook for online courses |
+| [`shortner`](https://github.com/SujeethFoundation/shortner/blob/main/README.md) | Link shortener for go.sujeeth.org |
+| [`acs-sms-bot`](https://github.com/SujeethFoundation/acs-sms-bot/blob/main/readme.md) | Texting through Azure Communication Services |
+
+Architecture docs, in the website repo's `architecture/` folder: [platform architecture](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/architecture/platform-architecture.md) (repos, Azure apps, how they connect), [data model and portal](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/architecture/platform-data-model-and-portal.md) (Dataverse tables, solutions, Power Pages) and [business architecture](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/architecture/business-architecture.md) (vision, assumptions, tests). This block is the same in every repo's README; the canonical copy is in the platform architecture doc.
+
+**This repo:** called by the `mcp` server and its admin scripts. It reads the ontology's crawl and search manifests to decide what to crawl and search.
+
 ## How it fits together
 
 | Piece | Role |
@@ -70,6 +90,7 @@ Note: the status and dashboard routes use a hyphen (`crawl-status`, `crawl-dashb
 | `scheduled_crawl_recovery` | Daily 10:00 | Reconciles and recovers unfinished jobs (up to 30 days old). Jobs that finished with errors are retried for 3 days only |
 | `scheduled_job_cleanup` | Daily 11:30 | Deletes crawl jobs, and their page rows, that nothing has touched for `JOB_RETENTION_DAYS` (default 30). The newest job of each domain is always kept. At most 20 jobs per run |
 | `scheduled_weekly_crawl` | Sundays 08:00 | Starts an incremental crawl for each domain in `WEEKLY_CRAWL_DOMAINS` (default `sujeeth.org,topics.sujeeth.org`; `*` means every crawl-enabled domain). Skips domains that already have an open job. A job nobody has touched for `OPEN_JOB_STALE_DAYS` no longer counts as open |
+| `scheduled_monthly_crawl` | 1st of the month, 09:00 | Starts an incremental crawl for every crawl-enabled domain that is not in `WEEKLY_CRAWL_DOMAINS`. Does nothing when the weekly list is `*` |
 | `scheduled_index_reconcile` | Daily 11:00 | Queues a `missing`-mode backfill so any chunk that is stored but absent from the index table gets written, when the table holds clearly fewer chunks than Blob Storage. Skipped when the queue already holds more than `INDEX_RECONCILE_MAX_QUEUE` messages or `INDEX_RECONCILE_ENABLED` is false |
 
 Incremental crawls use ETag and Last-Modified conditional requests and content hashes. Unchanged pages are not re-embedded or re-written, but every crawl still creates new job rows and queue messages for every page it visits.
@@ -299,17 +320,6 @@ instances run at 750 to 830 MB steady with a rebuild peak near 1,000 MB. If memo
 `LOCAL_INDEX_TEXT_IN_MEMORY=false` (each search then reads about five table rows, and a read costs a fraction of a cent per
 10,000; the phrase bonus is off then), or use 4,096 MB.
 
-**Upgrading from the version that used Azure AI Search.** Azure AI Search is no longer used. These settings are ignored if
-still set, and can be deleted: `AZURE_SEARCH_ENDPOINT`, `AZURE_SEARCH_API_KEY`, `AZURE_SEARCH_INDEX_NAME`,
-`AZURE_SEARCH_API_VERSION`, `AZURE_SEARCH_BATCH_SIZE`, `AZURE_SEARCH_VECTOR_FIELD`, `AZURE_SEARCH_NULL_VECTOR_FIELDS`,
-`AZURE_SEARCH_BLOB_BACKED`, `SEARCH_BACKEND`, `AI_SEARCH_WRITES`, `LOCAL_INDEX_WRITE`, `LOCAL_SEARCH_FALLBACK`,
-`LOCAL_SHADOW_SAMPLE`, `LOCAL_SHADOW_DIAGNOSE`, `LOCAL_SHADOW_DIAGNOSE_MIN_SECONDS`, `SEARCH_MAX_TEXT_RECALL`, `SEARCH_COUNT`,
-`SEARCH_FIELDS`, `SEARCH_UNIQUE_OVERFETCH`, `SEARCH_MIN_INTERVAL_SECONDS`, `SEARCH_WRITE_ATTEMPTS`, `BLOB_CACHE_SECONDS`,
-`BLOB_CACHE_MAX_ENTRIES`, `INDEX_CONCEPTS_FACETABLE`. A caller that still sends `backend` to `/api/search` is ignored. The
-`/api/local-index/shadow-diffs` route and the shadow columns of `Watch-Websearch` are gone, and `/api/health` no longer reports
-`ai_search_*`, `search_backend`, `blob_cache` or `search_tuning`. Before the first deploy of this version, check that the index
-table is full (`Show-LocalIndex -Count`); the Azure AI Search service and its index can be deleted once you are satisfied.
-
 ## Operating notes
 
 - **Searches answer by keywords only, or slowly:** a search question is embedded by Azure OpenAI, and the same deployment embeds chunks while crawling. Heavy indexing can throttle question embedding; searches then continue with keywords only (`search_mode: keyword`, counted in `local_index.keyword_only_searches`) and the endpoint is skipped for `EMBED_QUERY_COOLDOWN_SECONDS`. Mitigations: set `EMBED_MIN_INTERVAL_SECONDS`, cap the instance count (Flex Consumption: Settings → Scale and concurrency), give queries their own embedding deployment, and seed common questions with `Seed-EmbedCache`.
@@ -379,7 +389,7 @@ its row and any mention of it in this file.
 1. Push to `main`. The GitHub Actions workflow builds and deploys.
 2. Wait for the run to finish, then check `GET /api/health`: `index_configured` and `embedding_configured` should be `true`, and `local_index.loaded` becomes `true` after the first search or the preload.
 3. If the ontology changed, deploy it first, then restart this app.
-4. Confirm both timers appear under **Functions**.
+4. Confirm the five timers appear under **Functions**: `scheduled_crawl_recovery`, `scheduled_job_cleanup`, `scheduled_weekly_crawl`, `scheduled_monthly_crawl` and `scheduled_index_reconcile`.
 
 ## Tests
 
@@ -400,13 +410,4 @@ then set the variable to its connection string); the file's header has the exact
 - The public-IP check is defense in depth, not a replacement for network egress controls.
 - Re-tag runs read every blob, and so does `GET /api/index-status?count_blobs=true`; avoid calling either in a loop.
 
-## Version history (short)
-
-- 0.5.0: persistent page-level crawl jobs on queues and tables.
-- 0.6.x: page claims, leases, reconcile, and recover.
-- 0.7.0: Azure AI Search hybrid retrieval, backfill (since replaced).
-- 0.7.x reliability patch: job rows carry `job_id` (the daily recovery timer reads it), one job-start path with an open-job check for the manual, bulk and scheduled crawls, a deleted page (404/410) leaves the index, robots.txt is cached per host, and the nightly reconcile checks the index before it reads blobs.
-- 0.7.x: the page limit comes only from `MAX_PAGES_PER_DOMAIN`; `MAX_PAGES_BY_DOMAIN` is removed and ignored if still set.
-- 0.7.x memory patch: the old crawler and the `/refresh`, `/enrich` and `/reindex` routes are removed; page, manifest and job rows are read a page at a time; `crawl/domain-stats` sums job counters; `crawl/{job_id}/pages` takes `status`, `limit` and `summary`; `scheduled_job_cleanup` deletes old jobs; ontology answers are cached briefly; every tunable setting is read in `services/config.py`.
-- After 0.7.0: embedding retry and throttle; permanent failures skipped; explicit-domain validation fix; scheduled recovery and weekly crawl; re-tag and document routes; app-wide page limits.
-- After 0.7.x: search runs inside the app over a Table Storage index; Azure AI Search, shadow mode and the Compute Unit tracking are removed. Added: 8-bit rescoring, the concept and phrase bonuses, one result per page, the shared question cache, `search/explain`, and the relevance scorer.
+Release history and the notes for upgrading from Azure AI Search are in [CHANGELOG.md](CHANGELOG.md).
