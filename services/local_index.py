@@ -26,6 +26,7 @@ import hashlib
 import logging
 import random
 import re
+import sys
 import threading
 import time
 import uuid
@@ -457,6 +458,39 @@ class LocalIndex:
         total += text_bytes + sum(len(s) for s in self.ids) + sum(len(s) for s in self.urls)
         total += sum(len(s) for s in self.titles)
         return total
+
+    def memory_breakdown(self):
+        """Where this index's memory goes, in MB: each numpy array by name, the chunk text, and the Python objects
+        (strings, dicts, lists) that memory_bytes() does not see. For diagnosing a process that is larger than the index."""
+        mb = lambda b: round(b / 1e6, 2)
+        arrays = {}
+        for name in ("codes", "concept_bits", "domain_codes", "page_codes", "chunk_numbers", "vocab", "post_docs", "post_weights", "post_ptr", "vec8", "norm8"):
+            a = getattr(self, name, None)
+            if a is not None and hasattr(a, "nbytes"):
+                arrays[name] = mb(a.nbytes)
+        texts = self.texts
+        text_mb = 0 if texts is None else (mb(texts.nbytes()) if hasattr(texts, "nbytes") else mb(sum(sys.getsizeof(s) for s in texts if s)))
+
+        def strings(seq):
+            seen, total = set(), 0
+            for s in seq:
+                if id(s) not in seen:
+                    seen.add(id(s))
+                    total += sys.getsizeof(s)
+            return total + sys.getsizeof(seq)
+
+        def lists_total(values):
+            return sum(sys.getsizeof(v) for v in values)
+
+        objects = {
+            "ids": mb(strings(self.ids)), "urls": mb(strings(self.urls)), "titles": mb(strings(self.titles)),
+            "concepts": mb(sys.getsizeof(self.concepts) + lists_total(self.concepts) + sum(sys.getsizeof(t) for t in {id(t): t for c in self.concepts for t in c}.values())),
+            "by_id": mb(sys.getsizeof(self.by_id)),
+            "pages": mb(sys.getsizeof(self.pages) + lists_total(self.pages.values())),
+            "by_url": mb(sys.getsizeof(self.by_url) + lists_total(self.by_url.values())),
+        }
+        return {"arrays_mb": arrays, "arrays_total_mb": round(sum(arrays.values()), 1), "text_mb": text_mb,
+                "python_objects_mb": objects, "python_objects_total_mb": round(sum(objects.values()), 1)}
 
     # -- filtering -------------------------------------------------------------------------------------------
     def _mask(self, domains, concepts):
@@ -1049,6 +1083,37 @@ def release_memory():
         pass  # not Linux, or no glibc: nothing to do
 
 
+def process_memory_detail(trim=False):
+    """Where the process's resident memory sits (Linux): anonymous (heap, arrays) against file-backed (libraries, mapped
+    files), the peak, and the thread count. With trim=True it hands freed heap back first and reports before and after,
+    which shows how much of the process is memory Python and malloc were holding but not using."""
+    def read():
+        out = {}
+        try:
+            with open("/proc/self/smaps_rollup", encoding="utf-8") as handle:
+                for line in handle:
+                    key = line.split(":")[0]
+                    if key in ("Rss", "Pss", "Anonymous", "Shared_Clean", "Private_Clean", "Private_Dirty", "Swap"):
+                        out[key.lower() + "_mb"] = round(int(line.split()[1]) / 1024)
+            with open("/proc/self/status", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmHWM:"):
+                        out["peak_rss_mb"] = round(int(line.split()[1]) / 1024)
+                    elif line.startswith("Threads:"):
+                        out["threads"] = int(line.split()[1])
+        except Exception:
+            pass
+        return out
+    detail = read()
+    if trim:
+        release_memory()
+        after = read()
+        detail["after_trim"] = after
+        if "rss_mb" in detail and "rss_mb" in after:
+            detail["trim_freed_mb"] = detail["rss_mb"] - after["rss_mb"]
+    return detail
+
+
 def process_memory_mb():
     """The process's resident memory, from /proc (Linux), or None."""
     try:
@@ -1371,6 +1436,7 @@ class LocalIndexManager:
             "skipped_rows": index.skipped if index else 0,
             "memory_mb": round(index.memory_bytes() / 1e6, 1) if index else 0,
             "process_memory_mb": process_memory_mb(),
+            "process": process_memory_detail(),
             "text_in_memory": settings.local_index_text_in_memory,
             "text_not_in_memory_domains": sorted(self._text_skip),
             "load_source": s["source"],

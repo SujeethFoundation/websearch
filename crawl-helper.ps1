@@ -26,6 +26,7 @@
 #     Call GET "/api/health"     any raw call
 #
 # Local search (the index kept in Table Storage; needs the local search patch on the app):
+#     Show-LocalIndex -Memory    where one instance's memory goes (-Trim also hands freed heap back and shows the change)
 #     Show-LocalIndex            settings in force and what one instance has loaded (-Count adds the table rows per domain and the queue backlog; -CountBlobs adds the stored chunks)
 #     Start-LocalBackfill        write the stored chunks into the index table: -Mode missing (the default) only what the table lacks, -Mode all rewrites every chunk; asks first (Start-LocalBackfill muse for one domain; -Follow watches it fill)
 #     Watch-LocalBackfill        follow a backfill: rows, rows added, rows per minute, queue backlog (-CountBlobs for a progress bar and ETA)
@@ -508,12 +509,12 @@ function Short-Instance($name) {
     if ($s.Length -gt 12) { $s.Substring(0, 6) + ".." + $s.Substring($s.Length - 4) } else { $s }
 }
 
-function Show-LocalIndex([switch]$Count, [switch]$CountBlobs) {
+function Show-LocalIndex([switch]$Count, [switch]$CountBlobs, [switch]$Memory, [switch]$Trim) {
     # The local index at a glance. Each call reaches one instance, so the "loaded" figures belong to that instance.
     #   Show-LocalIndex                 settings in force and what this instance has loaded
     #   Show-LocalIndex -Count          also what the table holds now (rows in all and per domain) and the queue backlog
     #   Show-LocalIndex -Count -CountBlobs   also the stored chunks in Blob Storage, to see how much is copied (slow: lists every blob)
-    $q = "/api/local-index/status" + $(if ($Count) { "?count=true" } else { "" })
+    $q = "/api/local-index/status" + $(if ($Trim) { "?memory=trim" } elseif ($Memory) { "?memory=true" } elseif ($Count) { "?count=true" } else { "" })
     $r = Call GET $q
     if (-not $r -or $r -is [string]) { Write-Warning "No usable answer from $q. Is the websearch app deployed with the local search patch? Response: $r"; return }
     if (-not $r.enabled) { Write-Host "The app has no index table connection (LOCAL_INDEX_CONNECTION_STRING)." -ForegroundColor Red }
@@ -525,6 +526,17 @@ function Show-LocalIndex([switch]$Count, [switch]$CountBlobs) {
         Write-Host "This instance has not loaded the index yet." -ForegroundColor Yellow
     }
     if ($r.last_error) { Write-Host "Last error: $($r.last_error)" -ForegroundColor Red }
+    if ($Memory -or $Trim) {
+        # Where the process memory goes: -Memory reads it; -Trim also hands freed heap back to the system and shows the change
+        $p = $r.process; $b = $r.memory_breakdown
+        if ($p) { Write-Host ("Process: RSS {0} MB = anonymous {1} MB + file-backed rest; peak {2} MB; {3} threads" -f $p.rss_mb, $p.anonymous_mb, $p.peak_rss_mb, $p.threads) }
+        if ($p -and $null -ne $p.trim_freed_mb) { Write-Host ("After handing freed heap back: RSS {0} MB (freed {1} MB)" -f $p.after_trim.rss_mb, $p.trim_freed_mb) }
+        if ($b) {
+            Write-Host ("Index arrays {0} MB, chunk text {1} MB, Python objects {2} MB" -f $b.arrays_total_mb, $b.text_mb, $b.python_objects_total_mb)
+            Write-Host "  arrays (MB):";  $b.arrays_mb.PSObject.Properties | Sort-Object Value -Descending | ForEach-Object { Write-Host ("    {0,-14} {1,8}" -f $_.Name, $_.Value) }
+            Write-Host "  objects (MB):"; $b.python_objects_mb.PSObject.Properties | Sort-Object Value -Descending | ForEach-Object { Write-Host ("    {0,-14} {1,8}" -f $_.Name, $_.Value) }
+        }
+    }
     $rs = $r.rescoring
     if ($rs) {
         if ($rs.active) { Write-Host ("Rescoring: active (the 1-bit codes pick {0} candidates, 8-bit vectors rank them); {1:N0} searches rescored on this instance" -f $rs.pool, $rs.rescored_searches) }
