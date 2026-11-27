@@ -4,6 +4,8 @@ Azure Functions app (Python v2) that crawls ontology-approved websites, stores t
 
 ## How it fits together
 
+Callers are the MCP server (`mcp` repo) and its admin scripts. The platform map, including the Dataverse side, is in [`architecture/`](https://github.com/SujeethFoundation/sujeethfoundation.github.io/tree/main/architecture) in the website repo.
+
 | Piece | Role |
 |---|---|
 | Ontology app | Decides which domains may be crawled or searched and which concepts a query maps to. Crawl size limits are **not** in the ontology. |
@@ -70,6 +72,7 @@ Note: the status and dashboard routes use a hyphen (`crawl-status`, `crawl-dashb
 | `scheduled_crawl_recovery` | Daily 10:00 | Reconciles and recovers unfinished jobs (up to 30 days old). Jobs that finished with errors are retried for 3 days only |
 | `scheduled_job_cleanup` | Daily 11:30 | Deletes crawl jobs, and their page rows, that nothing has touched for `JOB_RETENTION_DAYS` (default 30). The newest job of each domain is always kept. At most 20 jobs per run |
 | `scheduled_weekly_crawl` | Sundays 08:00 | Starts an incremental crawl for each domain in `WEEKLY_CRAWL_DOMAINS` (default `sujeeth.org,topics.sujeeth.org`; `*` means every crawl-enabled domain). Skips domains that already have an open job. A job nobody has touched for `OPEN_JOB_STALE_DAYS` no longer counts as open |
+| `scheduled_monthly_crawl` | 1st of the month, 09:00 | Starts an incremental crawl for every crawl-enabled domain that is not in `WEEKLY_CRAWL_DOMAINS`. Does nothing when the weekly list is `*` |
 | `scheduled_index_reconcile` | Daily 11:00 | Queues a `missing`-mode backfill so any chunk that is stored but absent from the index table gets written, when the table holds clearly fewer chunks than Blob Storage. Skipped when the queue already holds more than `INDEX_RECONCILE_MAX_QUEUE` messages or `INDEX_RECONCILE_ENABLED` is false |
 
 Incremental crawls use ETag and Last-Modified conditional requests and content hashes. Unchanged pages are not re-embedded or re-written, but every crawl still creates new job rows and queue messages for every page it visits.
@@ -379,7 +382,7 @@ its row and any mention of it in this file.
 1. Push to `main`. The GitHub Actions workflow builds and deploys.
 2. Wait for the run to finish, then check `GET /api/health`: `index_configured` and `embedding_configured` should be `true`, and `local_index.loaded` becomes `true` after the first search or the preload.
 3. If the ontology changed, deploy it first, then restart this app.
-4. Confirm both timers appear under **Functions**.
+4. Confirm the five timers appear under **Functions**: `scheduled_crawl_recovery`, `scheduled_job_cleanup`, `scheduled_weekly_crawl`, `scheduled_monthly_crawl` and `scheduled_index_reconcile`.
 
 ## Tests
 
