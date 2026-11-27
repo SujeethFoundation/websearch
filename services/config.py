@@ -236,6 +236,7 @@ class Settings:
     search_max_concurrent = _int("SEARCH_MAX_CONCURRENT", 4, 0, 256)
     search_queue_timeout_seconds = max(0.0, _float("SEARCH_QUEUE_TIMEOUT_SECONDS", 10))
     search_busy_retry_after = _int("SEARCH_BUSY_RETRY_AFTER_SECONDS", 1, 1, 60)
+    search_deadline_seconds = max(0.0, _float("SEARCH_DEADLINE_SECONDS", 10))
     heartbeat_seconds = _int("HEARTBEAT_SECONDS", 15, 0, 3600)
     slow_search_seconds = max(0.0, _float("SLOW_SEARCH_SECONDS", 5))
     full_text_domains = frozenset(_csv("FULL_TEXT_DOMAINS", "sujeeth.org,topics.sujeeth.org"))

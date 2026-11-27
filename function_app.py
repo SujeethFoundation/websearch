@@ -15,6 +15,9 @@ from services import local_index
 from services.local_index import LocalIndexLoading, RELATED_PREFIX
 from services.admission import AdmissionGate, SearchBusy
 from services import diagnostics
+from services import deadline
+from services.deadline import SearchDeadline
+import contextvars
 from services.ontology_client import OntologyClient
 from services.concept_resolver import ConceptResolver
 from services.storage_service import StorageService
@@ -156,20 +159,35 @@ def busy_response(exc):
                     headers={"Retry-After": str(wait)})
 
 
+def deadline_response(exc):
+    """503 with Retry-After for a search stopped by SEARCH_DEADLINE_SECONDS."""
+    diagnostics.counters.bump("deadline_refused")
+    wait = settings.search_busy_retry_after
+    return response({"error": str(exc), "stage": "search_deadline", "retry_after_seconds": wait}, 503,
+                    headers={"Retry-After": str(wait)})
+
+
 def gated(fn):
     """Run a search or document read only once it holds one of this instance's SEARCH_MAX_CONCURRENT slots. It waits at most
     SEARCH_QUEUE_TIMEOUT_SECONDS for one, and is then refused with a 503 (see busy_response)."""
     @functools.wraps(fn)
     def wrapper(*args, **kw):
+        arrived = time.monotonic()
+        token = deadline.start(settings.search_deadline_seconds, arrived)
         try:
             gate.acquire()
         except SearchBusy as exc:
+            deadline.clear(token)
             diagnostics.counters.bump("queue_refused")
             return busy_response(exc)
         began = time.monotonic()
         try:
+            deadline.check("starting")
             return fn(*args, **kw)
+        except SearchDeadline as exc:
+            return deadline_response(exc)
         finally:
+            deadline.clear(token)
             gate.release()
             took = time.monotonic() - began
             diagnostics.counters.bump("searches")
@@ -334,9 +352,9 @@ def run_search_batch(query, queries, concepts=None, domains=None, purpose="searc
                           ranking=ranking, ontology_version=ontology_version)
 
     with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
-        answers = list(pool.map(lambda text: run_search(query=text, concepts=concepts, domains=domains,
-                                                        purpose=purpose, limit=limit, ranking=ranking,
-                                                        ontology_version=ontology_version), candidates))
+        answers = list(pool.map(lambda text: contextvars.copy_context().run(
+            run_search, query=text, concepts=concepts, domains=domains, purpose=purpose, limit=limit, ranking=ranking,
+            ontology_version=ontology_version), candidates))
     results = []
     for text, answer in zip(candidates, answers):
         for item in answer.get("results", []) or []:
@@ -495,6 +513,8 @@ def search_get(req):
         return response(run_search(query, concepts, domains, "search", limit))
     except LocalIndexLoading as exc:
         return index_loading_response(exc)
+    except SearchDeadline as exc:
+        return deadline_response(exc)
     except Exception as exc:
         log.exception("Search failed")
         return response({"error": str(exc), "stage": "concept_resolution_or_search"}, 502)
@@ -524,6 +544,8 @@ def search_post(req):
         return response(run_search(query=query, **args))
     except LocalIndexLoading as exc:
         return index_loading_response(exc)
+    except SearchDeadline as exc:
+        return deadline_response(exc)
     except Exception as exc:
         log.exception("Search failed")
         return response({"error": str(exc), "stage": "concept_resolution_or_search"}, 502)
