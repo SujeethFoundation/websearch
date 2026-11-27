@@ -7,7 +7,7 @@ instance, every time. One instance does it once, saves the finished arrays here,
 Layout, in the blob container the chunks already use, under a prefix nothing else lists:
   index-snapshot/latest.json                 the manifest: which build is current and what it holds (written last)
   index-snapshot/<build>/meta.json.gz        ids, titles, urls, concepts and the domain and concept names, as JSON (gzip)
-  index-snapshot/<build>/<array>.bin         one raw numpy array each (codes, vec8, postings, text ...), shapes in the manifest
+  index-snapshot/<build>/<array>.bin         one raw numpy array each (codes, rvec, postings, text ...), shapes in the manifest
 
 The chunk text is three of those arrays, not JSON: text_blob (every chunk's UTF-8 text end to end), text_off (where each
 chunk starts and ends in it) and text_none (1 for a chunk whose text stays in the table). Loading them costs a read and a
@@ -40,12 +40,13 @@ FORMAT_VERSION = 2               # 2: the chunk text is in raw arrays (text_blob
 CLAIM_STALE_SECONDS = 20 * 60     # a claim this old belongs to a builder that died: take it over
 DOWNLOAD_WORKERS = 12             # most blobs fetched at once on a large instance; INDEX_SNAPSHOT_DOWNLOAD_WORKERS sets it (2 by default)
 
-# Arrays of a LocalIndex that every snapshot holds, and the two that only the 8-bit rescoring needs.
+# Arrays of a LocalIndex that every snapshot holds, and the two that only the rescoring needs.
 _ARRAYS = ("domain_codes", "page_codes", "chunk_numbers", "concept_bits", "codes",
            "vocab", "post_docs", "post_weights", "post_ptr")
-_VECTOR_ARRAYS = ("vec8", "norm8")
+_VECTOR_ARRAYS = ("rvec", "rnorm")
 _TEXT_ARRAYS = ("text_blob", "text_off", "text_none")   # only when the index keeps chunk text in memory
-_SCALARS = ("n", "skipped", "code_bytes", "concept_words", "distinct_pages", "vec_dims", "rows_without_vectors")
+_SCALARS = ("n", "skipped", "code_bytes", "concept_words", "distinct_pages", "vec_dims", "rows_without_vectors",
+            "rescore_dims", "rescore_bits")
 
 
 class _ArraySink:
@@ -188,17 +189,19 @@ def pack_texts(texts):
 # Packing and restoring an index
 # ---------------------------------------------------------------------------------------------------------------
 
-def build_id(version, keep_text, text_skip, has_vec8):
-    """The directory name of one build: the table's version plus what the snapshot holds."""
-    fingerprint = json.dumps([bool(keep_text), sorted(str(d).lower() for d in text_skip or ()), bool(has_vec8)])
+def build_id(version, keep_text, text_skip, has_rvec, rescore_shape=()):
+    """The directory name of one build: the table's version plus what the snapshot holds (including the shape the
+    rescoring vectors are held in, so a change to LOCAL_RESCORE_BITS or LOCAL_RESCORE_DIMS makes a new build)."""
+    fingerprint = json.dumps([bool(keep_text), sorted(str(d).lower() for d in text_skip or ()), bool(has_rvec)]
+                             + ([list(rescore_shape)] if rescore_shape else []))
     return f"{version}-{hashlib.sha1(fingerprint.encode()).hexdigest()[:8]}"
 
 
 def pack(index):
     """(arrays, meta, scalars) for a built LocalIndex. Nothing is copied: the arrays are the index's own."""
     arrays = {name: getattr(index, name) for name in _ARRAYS}
-    if index.vec8 is not None:
-        arrays["vec8"], arrays["norm8"] = index.vec8, index.norm8
+    if index.rvec is not None:
+        arrays["rvec"], arrays["rnorm"] = index.rvec, index.rnorm
     meta = {"ids": index.ids, "titles": index.titles, "urls": index.urls, "concepts": index.concepts,
             "domain_names": index.domain_names, "concept_names": index.concept_names}
     if index.texts is not None:
@@ -224,8 +227,15 @@ def compatible(manifest, *, version, keep_text, text_skip, rescore):
         lacking = sorted(set(manifest.get("text_skip") or ()) - {str(d).lower() for d in text_skip or ()})
         if lacking:
             return False, "the snapshot has no text for " + ", ".join(lacking)
-    if rescore and not manifest.get("has_vec8"):
-        return False, "the snapshot has no 8-bit vectors"
+    if rescore:
+        if not manifest.get("has_rvec"):
+            return False, "the snapshot has no rescoring vectors"
+        from services.local_index import rescore_params
+        scalars = manifest.get("scalars") or {}
+        want = rescore_params(int(scalars.get("vec_dims") or 0))
+        if (int(scalars.get("rescore_dims") or 0), int(scalars.get("rescore_bits") or 0)) != want:
+            return False, (f"the snapshot's rescoring vectors are {scalars.get('rescore_bits')} bits over "
+                           f"{scalars.get('rescore_dims')} dimensions, the settings ask for {want[1]} bits over {want[0]}")
     return True, ""
 
 
@@ -282,12 +292,14 @@ def restore(index_cls, manifest, arrays, meta, *, keep_text, text_skip, rescore)
     else:
         index.texts = None
 
-    if rescore and "vec8" in arrays:
-        index.vec8, index.norm8, index.vec_dims = arrays["vec8"], arrays["norm8"], int(s["vec_dims"])
+    if rescore and "rvec" in arrays:
+        index.rvec, index.rnorm, index.vec_dims = arrays["rvec"], arrays["rnorm"], int(s["vec_dims"])
+        index.rescore_dims, index.rescore_bits = int(s["rescore_dims"]), int(s["rescore_bits"])
         index.rows_without_vectors = int(s["rows_without_vectors"])
     else:
-        # What the constructor leaves when rescoring is off: no 8-bit vectors, and every row counted as without one.
-        index.vec8, index.norm8, index.vec_dims = None, None, 0
+        # What the constructor leaves when rescoring is off: no rescoring vectors, and every row counted as without one.
+        index.rvec, index.rnorm, index.vec_dims = None, None, 0
+        index.rescore_dims, index.rescore_bits = 0, 0
         index.rows_without_vectors = n if not rescore else int(s["rows_without_vectors"])
 
     index._finish_lookups()   # the lookups the constructor derives from the ids and urls
@@ -370,7 +382,7 @@ class SnapshotStore:
             return None
 
     def load(self, manifest, index_cls, *, keep_text, text_skip, rescore):
-        """The LocalIndex a manifest describes. Without rescoring the 8-bit vectors (the largest blob) are not fetched."""
+        """The LocalIndex a manifest describes. Without rescoring the rescoring vectors (the largest blob) are not fetched."""
         base = f"{self.prefix}/{manifest['build']}"
         specs = manifest["arrays"]
         names = [name for name in specs
@@ -422,7 +434,8 @@ class SnapshotStore:
         arrays, meta, scalars = pack(index)
         keep_text = index.texts is not None
         skip = sorted(str(d).lower() for d in text_skip or ())
-        build = build_id(version, keep_text, skip, "vec8" in arrays)
+        build = build_id(version, keep_text, skip, "rvec" in arrays,
+                         (index.rescore_bits, index.rescore_dims) if "rvec" in arrays else ())
         if not force and not self.claim(build):
             return None
         base = f"{self.prefix}/{build}"
@@ -437,7 +450,7 @@ class SnapshotStore:
                 files[name] = {"dtype": array.dtype.str, "shape": list(array.shape), "bytes": int(array.nbytes)}
             manifest = {"format": FORMAT_VERSION, "version": version, "build": build,
                         "built_at": datetime.now(timezone.utc).isoformat(), "keep_text": keep_text,
-                        "text_skip": skip, "has_vec8": "vec8" in arrays, "scalars": scalars, "arrays": files}
+                        "text_skip": skip, "has_rvec": "rvec" in arrays, "scalars": scalars, "arrays": files}
             self._put(self.manifest_name, json.dumps(manifest).encode("utf-8"))
         except Exception:
             try:

@@ -13,7 +13,7 @@ What is stored, one table row per chunk (PartitionKey = the page id, RowKey = th
 How a search works (a hybrid of keywords and vectors):
   1. keep the chunks whose domain is in the list and that carry at least one of the concepts
   2. keyword half: BM25 over the question's words (any word may match), the best 1,000
-  3. vector half: the nearest 50 by the 1-bit codes, re-ranked by cosine similarity on the 8-bit vectors
+  3. vector half: the nearest 50 by the 1-bit codes, re-ranked by cosine similarity on smaller copies of the stored vectors (4 bits, first 1,024 dimensions)
   4. merge the two lists by reciprocal rank fusion (1 / (60 + rank)), add the concept and phrase bonuses, and
      return the best few, one per page
 
@@ -170,6 +170,108 @@ def _popcount_rows(words):
     if hasattr(np, "bitwise_count"):
         return np.bitwise_count(words).sum(axis=1, dtype=np.int32)
     return _POP8[words.view(np.uint8)].sum(axis=1, dtype=np.int32)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The vectors that re-rank the shortlist
+# ---------------------------------------------------------------------------------------------------------------
+
+RESCORE_BLOCK = 4096
+RESCORE_CLIP = 3.5     # 4-bit rows are scaled so this many root-mean-squares of the row reach the largest step
+
+
+def rescore_params(source_dims):
+    """(dimensions, bits) the rescoring vectors are held at for stored vectors of `source_dims` dimensions."""
+    want = int(settings.local_rescore_dims)
+    dims = int(source_dims) if want <= 0 or want >= int(source_dims) else want
+    bits = 8 if int(settings.local_rescore_bits) >= 8 else 4
+    return dims, bits
+
+
+def rescore_width(dims, bits):
+    """Bytes one rescoring vector takes."""
+    return int(dims) if bits == 8 else (int(dims) + 1) // 2
+
+
+def pack_rescore(block, dims, bits):
+    """(packed, norms) for a block of stored int8 vectors, shape (m, source dims).
+
+    The first `dims` dimensions are kept. At 8 bits they are used as stored. At 4 bits each row is rescaled so that
+    RESCORE_CLIP root-mean-squares of it fill the range of 7 steps (values beyond that are clipped), rounded, and two
+    dimensions go in a byte (each stored as value + 8, so zero is 8). Scaling to the row's largest value instead wastes
+    most of the 15 levels on a few outliers and ranks close neighbours noticeably worse. `norms` is the length of the
+    vector as it is held (1 for an all-zero row), which is what cosine similarity divides by; a row's overall scale does
+    not matter to it."""
+    v = np.asarray(block)[:, :dims]
+    if bits == 8:
+        data = np.ascontiguousarray(v, dtype=np.int8)
+        f = data.astype(np.float32)
+        norms = np.sqrt((f * f).sum(axis=1))
+    else:
+        f = v.astype(np.float32)
+        ref = RESCORE_CLIP * np.sqrt((f * f).mean(axis=1))
+        scale = np.where(ref > 0, 7.0 / np.where(ref > 0, ref, 1.0), 0.0).astype(np.float32)
+        q = np.clip(np.rint(f * scale[:, None]), -7, 7)
+        norms = np.sqrt((q * q).sum(axis=1))
+        nib = (q + 8).astype(np.uint8)
+        if nib.shape[1] % 2:
+            nib = np.concatenate([nib, np.full((nib.shape[0], 1), 8, dtype=np.uint8)], axis=1)
+        data = (nib[:, 0::2] << 4) | nib[:, 1::2]
+    norms = norms.astype(np.float32)
+    norms[norms == 0] = 1.0
+    return data, norms
+
+
+def unpack_rescore(packed, dims, bits):
+    """The rows of `packed` as float32, shape (m, dims)."""
+    if bits == 8:
+        return packed.astype(np.float32)
+    out = np.empty((packed.shape[0], packed.shape[1] * 2), dtype=np.float32)
+    out[:, 0::2] = (packed >> 4).astype(np.float32) - 8.0
+    out[:, 1::2] = (packed & 15).astype(np.float32) - 8.0
+    return out[:, :dims]
+
+
+class RescoreBuilder:
+    """Packs stored vectors into the rescoring array one row at a time, in row order, a block at a time, so the full
+    8-bit matrix is never held. A row without a vector (empty, or another size) makes the result None: a mix of rows
+    with and without vectors would rank some chunks on a different scale from the rest."""
+
+    def __init__(self, n, source_dims):
+        self.n, self.source_dims = int(n), int(source_dims)
+        self.dims, self.bits = rescore_params(self.source_dims)
+        self.data = np.zeros((self.n, rescore_width(self.dims, self.bits)), dtype=np.int8 if self.bits == 8 else np.uint8)
+        self.norms = np.ones(self.n, dtype=np.float32)
+        self.missing = 0
+        self._buf = np.zeros((min(RESCORE_BLOCK, max(1, self.n)), self.source_dims), dtype=np.int8)
+        self._fill, self._start = 0, 0
+
+    def add(self, raw):
+        """The next row's stored vector (bytes), or None/empty when it has none."""
+        if self.missing:
+            return
+        if raw is None or len(raw) != self.source_dims:
+            self.missing += 1
+            return
+        self._buf[self._fill] = np.frombuffer(raw, dtype=np.int8)
+        self._fill += 1
+        if self._fill == len(self._buf):
+            self._flush()
+
+    def _flush(self):
+        if not self._fill:
+            return
+        packed, norms = pack_rescore(self._buf[:self._fill], self.dims, self.bits)
+        end = self._start + self._fill
+        self.data[self._start:end], self.norms[self._start:end] = packed, norms
+        self._start, self._fill = end, 0
+
+    def finish(self):
+        """(data, norms), or (None, None) when any row lacked a vector."""
+        if self.missing or self._start + self._fill != self.n:
+            return None, None
+        self._flush()
+        return self.data, self.norms
 
 
 def page_key(url):
@@ -357,21 +459,18 @@ class LocalIndex:
         self.code_bytes = width
         self.codes = _words([r["vec"] for r in usable], width) if n else np.zeros((0, 1), dtype=np.uint64)
 
-        # Each vector at 8 bits a dimension, to re-rank the shortlist the codes pick. All or nothing: a mix of rows with
-        # and without vectors would rank some chunks on a different scale from the rest.
-        self.vec8, self.norm8, self.vec_dims = None, None, 0
+        # The vectors that re-rank the shortlist the codes pick, held smaller than they are stored (see rescore_params).
+        # All or nothing: a mix of rows with and without vectors would rank some chunks on a different scale from the rest.
+        self.rvec, self.rnorm, self.vec_dims = None, None, 0
+        self.rescore_dims, self.rescore_bits = 0, 0
         dims = len(usable[0].get("v8") or b"") if n else 0
         self.rows_without_vectors = n - sum(1 for r in usable if dims and len(r.get("v8") or b"") == dims)
         if n and dims and not self.rows_without_vectors and settings.local_rescore:
-            vec8 = np.empty((n, dims), dtype=np.int8)
-            for i, r in enumerate(usable):
-                vec8[i] = np.frombuffer(r["v8"], dtype=np.int8)
-            norm8 = np.empty(n, dtype=np.float32)
-            for start in range(0, n, 4096):
-                block = vec8[start:start + 4096].astype(np.float32)
-                norm8[start:start + 4096] = np.sqrt((block * block).sum(axis=1))
-            norm8[norm8 == 0] = 1.0
-            self.vec8, self.norm8, self.vec_dims = vec8, norm8, dims
+            builder = RescoreBuilder(n, dims)
+            for r in usable:
+                builder.add(r["v8"])
+            self.rvec, self.rnorm = builder.finish()
+            self.vec_dims, self.rescore_dims, self.rescore_bits = dims, builder.dims, builder.bits
 
         # keyword postings, as a column-compressed matrix: for each word, the chunks that contain it and their weights
         arrays = [np.frombuffer(r["tid"], dtype="<u8") for r in usable]
@@ -447,7 +546,7 @@ class LocalIndex:
     def memory_bytes(self):
         arrays = (self.codes, self.concept_bits, self.domain_codes, self.vocab, self.post_docs, self.post_weights, self.post_ptr)
         total = sum(a.nbytes for a in arrays)
-        total += (self.vec8.nbytes + self.norm8.nbytes) if self.vec8 is not None else 0
+        total += (self.rvec.nbytes + self.rnorm.nbytes) if self.rvec is not None else 0
         texts = self.texts
         if texts is None:
             text_bytes = 0
@@ -464,7 +563,7 @@ class LocalIndex:
         (strings, dicts, lists) that memory_bytes() does not see. For diagnosing a process that is larger than the index."""
         mb = lambda b: round(b / 1e6, 2)
         arrays = {}
-        for name in ("codes", "concept_bits", "domain_codes", "page_codes", "chunk_numbers", "vocab", "post_docs", "post_weights", "post_ptr", "vec8", "norm8"):
+        for name in ("codes", "concept_bits", "domain_codes", "page_codes", "chunk_numbers", "vocab", "post_docs", "post_weights", "post_ptr", "rvec", "rnorm"):
             a = getattr(self, name, None)
             if a is not None and hasattr(a, "nbytes"):
                 arrays[name] = mb(a.nbytes)
@@ -551,11 +650,20 @@ class LocalIndex:
                 scores[self.post_docs[a:z]] += self.post_weights[a:z]
         return scores
 
+    def _query_vector(self, qvec):
+        """(the question's vector cut to the dimensions the index rescores on, its length)."""
+        q = np.frombuffer(qvec, dtype=np.int8)[:self.rescore_dims].astype(np.float32)
+        return q, float(np.sqrt((q * q).sum())) or 1.0
+
+    def _similarity(self, rows, q, norm):
+        """Cosine similarity of the question to each of `rows` on the rescoring vectors."""
+        return (unpack_rescore(self.rvec[rows], self.rescore_dims, self.rescore_bits) @ q) / (self.rnorm[rows] * norm)
+
     def vector_ranking(self, rows, qcode, qvec, count, pool=None, distance=None):
         """The `count` best of `rows` for a question, best first, as row numbers.
 
         The 1-bit codes pick a shortlist of `pool` chunks (all of them when fewer pass the filters); the shortlist is
-        then ranked by cosine similarity on the 8-bit vectors. Without a question vector, or without vectors in the
+        then ranked by cosine similarity on the rescoring vectors. Without a question vector, or without vectors in the
         index, the codes alone rank (Hamming distance, which has many ties and ranks close neighbours poorly).
 
         `distance`, when given, is QueryWork.distance_for: it supplies the Hamming distances of `rows` (reusing what an
@@ -567,14 +675,13 @@ class LocalIndex:
             compute = lambda: _popcount_rows(self.codes[chosen] ^ query)
             return distance(chosen, compute) if distance is not None else compute()
 
-        if qvec is not None and self.vec8 is not None and len(qvec) == self.vec_dims:
+        if qvec is not None and self.rvec is not None and len(qvec) == self.vec_dims:
             if len(rows) > max(pool, count):
                 shortlist = rows[self._top(hamming(rows), max(pool, count), False)]
             else:
                 shortlist = rows
-            q = np.frombuffer(qvec, dtype=np.int8).astype(np.float32)
-            norm = float(np.sqrt((q * q).sum())) or 1.0
-            similarity = (self.vec8[shortlist].astype(np.float32) @ q) / (self.norm8[shortlist] * norm)
+            q, norm = self._query_vector(qvec)
+            similarity = self._similarity(shortlist, q, norm)
             return [int(shortlist[i]) for i in self._top(similarity, count, True)]
         return [int(rows[pos]) for pos in self._top(hamming(rows), count, False)]
 
@@ -772,15 +879,14 @@ class LocalIndex:
         return out
 
     def _vector_closeness(self, rows, qcode, qvec, block=4096):
-        """How close every one of `rows` is to the question (higher is closer): cosine on the 8-bit vectors when the
+        """How close every one of `rows` is to the question (higher is closer): cosine on the rescoring vectors when the
         index has them, else minus the Hamming distance of the codes. Worked out a block at a time to stay small."""
-        if qvec is not None and self.vec8 is not None and len(qvec) == self.vec_dims:
-            q = np.frombuffer(qvec, dtype=np.int8).astype(np.float32)
-            norm = float(np.sqrt((q * q).sum())) or 1.0
+        if qvec is not None and self.rvec is not None and len(qvec) == self.vec_dims:
+            q, norm = self._query_vector(qvec)
             out = np.empty(len(rows), dtype=np.float32)
             for start in range(0, len(rows), block):
                 part = rows[start:start + block]
-                out[start:start + block] = (self.vec8[part].astype(np.float32) @ q) / (self.norm8[part] * norm)
+                out[start:start + block] = self._similarity(part, q, norm)
             return out
         query = _words([qcode[: self.code_bytes].ljust(self.code_bytes, b"\0")], self.code_bytes)[0]
         return -_popcount_rows(self.codes[rows] ^ query).astype(np.float32)
@@ -1358,7 +1464,7 @@ class LocalIndexManager:
                 out["current"] = None if m is None else {
                     "version": m["version"], "build": m["build"], "built_at": m["built_at"], "chunks": m["scalars"]["n"],
                     "megabytes": round(sum(a["bytes"] for a in m["arrays"].values()) / 1e6, 1),
-                    "text_not_in_memory_domains": m["text_skip"], "has_8bit_vectors": m["has_vec8"],
+                    "text_not_in_memory_domains": m["text_skip"], "has_rescoring_vectors": m["has_rvec"], "rescore_bits": m["scalars"].get("rescore_bits"), "rescore_dims": m["scalars"].get("rescore_dims"),
                     "matches_table": m["version"] == self.store().get_version()}
             except Exception as exc:
                 out["current_error"] = f"{type(exc).__name__}: {exc}"[:300]
@@ -1454,9 +1560,11 @@ class LocalIndexManager:
             "keyword_only_searches": s["keyword_only"],
             "rescoring": {
                 "enabled": settings.local_rescore,
-                "active": bool(index is not None and index.vec8 is not None),
+                "active": bool(index is not None and index.rvec is not None),
                 "rows_without_vectors": index.rows_without_vectors if index else None,
                 "pool": settings.local_rescore_pool,
+                "bits": index.rescore_bits if index is not None and index.rvec is not None else None,
+                "dims": index.rescore_dims if index is not None and index.rvec is not None else None,
                 "rescored_searches": s["rescored"],
             },
             "last_error": s["last_error"],

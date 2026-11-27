@@ -506,7 +506,7 @@ class SearchService:
                                       phrase_pool=settings.local_phrase_pool, unique_pages=unique)
         answer = self._answer(index, query, hits, matching, keyword_only, concept_weights, how)
         self.local.record_search(embed_ms, (time.perf_counter() - began) * 1000, keyword_only,
-                                 rescored=bool(qvec is not None and index.vec8 is not None and not keyword_only))
+                                 rescored=bool(qvec is not None and index.rvec is not None and not keyword_only))
         return answer
 
     def _embed_query(self, query):
@@ -658,7 +658,7 @@ class SearchService:
             except Exception as exc:
                 answers.append(exc)
         self.local.record_search(embed_ms, (time.perf_counter() - began) * 1000, keyword_only,
-                                 rescored=bool(qvec is not None and index.vec8 is not None and not keyword_only))
+                                 rescored=bool(qvec is not None and index.rvec is not None and not keyword_only))
         return answers
 
     def explain_local(self, query, concepts, domains, expect, concept_weights=None, limit=5, ranking=None):
@@ -690,7 +690,7 @@ class SearchService:
                     "filter_domains": domains, "note": note,
                     "settings": {"concept_boost": boost, "phrase_boost": how["phrase_boost"], "max_per_page": how["max_per_page"],
                                  "unique_pages": how["unique_pages"],
-                                 "rescoring": bool(index.vec8 is not None), "text_in_memory": index.texts is not None,
+                                 "rescoring": bool(index.rvec is not None), "text_in_memory": index.texts is not None,
                                  "text_recall": settings.local_text_recall or 1000}})
         return out
 

@@ -91,7 +91,7 @@ def ask(index, text="w5 w60 w120", concepts=("circle", "mentor"), domains=("suje
 
 
 ARRAYS = ("domain_codes", "page_codes", "chunk_numbers", "concept_bits", "codes", "vocab", "post_docs", "post_weights",
-          "post_ptr", "vec8", "norm8")
+          "post_ptr", "rvec", "rnorm")
 PLAIN = ("n", "skipped", "ids", "titles", "urls", "concepts", "texts", "domain_names", "concept_names", "code_bytes",
          "concept_words", "distinct_pages", "vec_dims", "rows_without_vectors", "text_skip_domains", "pages", "by_url", "by_id")
 
@@ -146,7 +146,7 @@ def test_the_manifest_goes_last_and_lists_what_it_holds(snaps):
     container, store = snaps
     manifest = store.publish(build(), "v1", {"themuse.com"})
     assert container.uploads[-1] == "index-snapshot/latest.json"
-    assert manifest["version"] == "v1" and manifest["scalars"]["n"] == 100 and manifest["has_vec8"] is True
+    assert manifest["version"] == "v1" and manifest["scalars"]["n"] == 100 and manifest["has_rvec"] is True
     assert manifest["text_skip"] == ["themuse.com"] and manifest["keep_text"] is True
     for name, spec in manifest["arrays"].items():
         assert len(container.blobs[f"index-snapshot/{manifest['build']}/{name}.bin"][0]) == spec["bytes"]
@@ -159,9 +159,9 @@ def test_restoring_for_a_reader_that_drops_more_text_or_the_vectors(snaps):
     same_index(build(skip=("themuse.com",)), more)
     container.downloads.clear()
     plain = store.load(manifest, li.LocalIndex, keep_text=False, text_skip=set(), rescore=False)
-    assert plain.texts is None and plain.vec8 is None and plain.norm8 is None and plain.vec_dims == 0
+    assert plain.texts is None and plain.rvec is None and plain.rnorm is None and plain.vec_dims == 0
     assert plain.rows_without_vectors == plain.n                       # as a scan leaves it with rescoring off
-    assert not any(name.endswith(("vec8.bin", "norm8.bin")) for name in container.downloads)   # the biggest blob is not fetched
+    assert not any(name.endswith(("rvec.bin", "rnorm.bin")) for name in container.downloads)   # the biggest blob is not fetched
 
 
 def test_compatibility_says_why_not(snaps):
@@ -173,7 +173,7 @@ def test_compatibility_says_why_not(snaps):
     assert "version row" in snap.compatible(manifest, **{**ok, "version": None})[1]
     assert "no text for themuse.com" in snap.compatible(manifest, **{**ok, "text_skip": set()})[1]
     assert snap.compatible({**manifest, "keep_text": False}, **ok)[0] is False
-    assert snap.compatible({**manifest, "has_vec8": False}, **ok)[0] is False
+    assert snap.compatible({**manifest, "has_rvec": False}, **ok)[0] is False
     assert "format" in snap.compatible({**manifest, "format": 99}, **ok)[1]
     assert snap.compatible(None, **ok)[0] is False
 
@@ -231,13 +231,13 @@ def test_a_reader_without_rescoring_skips_the_vectors_and_one_with_it_needs_them
     table = filled_store()
     monkeypatch.setattr(settings, "local_rescore", False)
     manager(table, store).current()                                    # built without 8-bit vectors
-    assert published(container) and json.loads(container.blobs["index-snapshot/latest.json"][0])["has_vec8"] is False
+    assert published(container) and json.loads(container.blobs["index-snapshot/latest.json"][0])["has_rvec"] is False
     scans = count_scans(table)
     plain = manager(table, store)
-    assert plain.current().vec8 is None and scans == []
+    assert plain.current().rvec is None and scans == []
     monkeypatch.setattr(settings, "local_rescore", True)
     rescoring = manager(table, store)
-    assert rescoring.current().vec8 is not None and len(scans) == 1    # the snapshot could not serve it
+    assert rescoring.current().rvec is not None and len(scans) == 1    # the snapshot could not serve it
 
 
 def test_a_damaged_snapshot_falls_back_to_the_table(snaps):
@@ -400,3 +400,36 @@ def test_a_restore_downloads_straight_into_the_arrays_and_matches_the_normal_one
     assert direct.n == plain.n == built.n
     assert np.array_equal(direct.codes, plain.codes) and np.array_equal(direct.post_docs, plain.post_docs)
     assert direct.codes.flags.writeable
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The rescoring vectors' shape is part of the snapshot
+# ---------------------------------------------------------------------------------------------------------------
+
+def test_a_four_bit_cut_snapshot_restores_as_itself_and_is_smaller(snaps, monkeypatch):
+    container, store = snaps
+    exact = store.publish(build(), "v1", {"themuse.com"})
+    monkeypatch.setattr(settings, "local_rescore_bits", 4)
+    monkeypatch.setattr(settings, "local_rescore_dims", 32)
+    original = build()
+    manifest = store.publish(original, "v1", {"themuse.com"})
+    assert manifest["build"] != exact["build"]                         # another shape is another build, not an overwrite
+    assert manifest["scalars"]["rescore_bits"] == 4 and manifest["scalars"]["rescore_dims"] == 32
+    assert manifest["arrays"]["rvec"]["bytes"] == 100 * 16 and exact["arrays"]["rvec"]["bytes"] == 100 * 64
+    restored = store.load(manifest, li.LocalIndex, keep_text=True, text_skip={"themuse.com"}, rescore=True)
+    same_index(original, restored)
+    assert (restored.rescore_bits, restored.rescore_dims, restored.vec_dims) == (4, 32, 64)
+    assert ask(original, "w5 w60 w120") == ask(restored, "w5 w60 w120")
+
+
+def test_a_snapshot_in_another_shape_is_not_used(snaps, monkeypatch):
+    _, store = snaps
+    manifest = store.publish(build(), "v1", {"themuse.com"})           # 8 bits, every dimension (the test default)
+    ok = dict(version="v1", keep_text=True, text_skip={"themuse.com"}, rescore=True)
+    assert snap.compatible(manifest, **ok) == (True, "")
+    monkeypatch.setattr(settings, "local_rescore_bits", 4)
+    assert "4 bits" in snap.compatible(manifest, **ok)[1]
+    monkeypatch.setattr(settings, "local_rescore_bits", 8)
+    monkeypatch.setattr(settings, "local_rescore_dims", 32)
+    assert "32" in snap.compatible(manifest, **ok)[1]
+    assert snap.compatible(manifest, **{**ok, "rescore": False}) == (True, "")   # without rescoring the shape does not matter
