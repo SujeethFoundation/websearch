@@ -177,7 +177,7 @@ def _popcount_rows(words):
 # ---------------------------------------------------------------------------------------------------------------
 
 RESCORE_BLOCK = 4096
-RESCORE_CLIP = 3.5     # 4-bit rows are scaled so this many root-mean-squares of the row reach the largest step
+RESCORE_CLIP = 3.5     # (tools/compare_rescoring.py --sweep tries others on a real index) 4-bit rows are scaled so this many root-mean-squares of the row reach the largest step
 
 
 def rescore_params(source_dims):
@@ -193,7 +193,7 @@ def rescore_width(dims, bits):
     return int(dims) if bits == 8 else (int(dims) + 1) // 2
 
 
-def pack_rescore(block, dims, bits):
+def pack_rescore(block, dims, bits, clip=None):
     """(packed, norms) for a block of stored int8 vectors, shape (m, source dims).
 
     The first `dims` dimensions are kept. At 8 bits they are used as stored. At 4 bits each row is rescaled so that
@@ -209,7 +209,7 @@ def pack_rescore(block, dims, bits):
         norms = np.sqrt((f * f).sum(axis=1))
     else:
         f = v.astype(np.float32)
-        ref = RESCORE_CLIP * np.sqrt((f * f).mean(axis=1))
+        ref = (RESCORE_CLIP if clip is None else clip) * np.sqrt((f * f).mean(axis=1))
         scale = np.where(ref > 0, 7.0 / np.where(ref > 0, ref, 1.0), 0.0).astype(np.float32)
         q = np.clip(np.rint(f * scale[:, None]), -7, 7)
         norms = np.sqrt((q * q).sum(axis=1))
