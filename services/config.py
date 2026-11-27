@@ -176,6 +176,9 @@ class Settings:
     index_snapshot_prefix = os.getenv("INDEX_SNAPSHOT_PREFIX", "index-snapshot").strip().strip("/") or "index-snapshot"
     # Parallel range requests per blob download or upload.
     index_snapshot_concurrency = _int("INDEX_SNAPSHOT_CONCURRENCY", 4, 1, 16)
+    # Blobs downloaded at the same time when an instance restores the index. Each one is held in its final array, so
+    # more at once is faster and no larger in memory, but 2 keeps the network buffers small on a 512 MB instance.
+    index_snapshot_download_workers = _int("INDEX_SNAPSHOT_DOWNLOAD_WORKERS", 2, 1, 12)
     # Files of older builds are deleted once nothing has written to them for this long (a reader may be mid-download).
     index_snapshot_keep_seconds = _int("INDEX_SNAPSHOT_KEEP_SECONDS", 3600, 0)
 
