@@ -1432,6 +1432,8 @@ class LocalIndexManager:
         self._last_check = float("-inf")
         self._failed_at = 0.0
         self._load_lock = threading.Lock()
+        self._first_load_start = threading.Lock()   # guards starting the background first load (fail-fast mode)
+        self._first_load_thread = None
         self._checking = threading.Lock()
         self._reload_not_before = None   # monotonic time before which a changed table does not trigger a reload (jitter)
         self._skip_logged = None         # the last "reload skipped" message, so it is logged once, not every poll
@@ -1475,7 +1477,13 @@ class LocalIndexManager:
     def current(self):
         index = self._index
         if index is None:
-            if settings.local_index_fail_fast and self._load_lock.locked():
+            if settings.local_index_fail_fast:
+                # Only an instance that holds the index answers searches. A request never loads it itself, however early
+                # it arrives (it could reach here before the preload thread has taken the load lock): it makes sure the
+                # load is running in the background and is refused at once, so it can be tried again on another instance.
+                self._start_first_load()
+                if self._failed_at and time.monotonic() - self._failed_at < self.FAILURE_COOLDOWN_SECONDS:
+                    raise LocalIndexUnavailable(self.stats["last_error"] or "the local index could not be loaded")
                 raise LocalIndexLoading("the local index is still loading on this instance")
             self._load_first()
             index = self._index
@@ -1484,6 +1492,32 @@ class LocalIndexManager:
         else:
             self._maybe_refresh()
         return index
+
+    def load_first(self):
+        """Load the index now and wait for it, if this instance does not hold one. Used by the preload thread."""
+        if self._index is None:
+            self._load_first()
+
+    def _start_first_load(self):
+        """Start the first load on a background thread unless it is already running, or has just failed (then the cooldown
+        applies, as for a waiting search). Never waits for the load."""
+        with self._first_load_start:
+            if self._index is not None or self._load_lock.locked():
+                return
+            thread = self._first_load_thread
+            if thread is not None and thread.is_alive():
+                return
+            if self._failed_at and time.monotonic() - self._failed_at < self.FAILURE_COOLDOWN_SECONDS:
+                return
+            self._first_load_thread = threading.Thread(target=self._first_load_in_background, name="local-index-first-load",
+                                                       daemon=True)
+            self._first_load_thread.start()
+
+    def _first_load_in_background(self):
+        try:
+            self._load_first()
+        except Exception:
+            pass   # _load_first has recorded and logged the failure; searches report it
 
     def _load_first(self):
         with self._load_lock:

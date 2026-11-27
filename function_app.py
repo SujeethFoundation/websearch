@@ -1358,7 +1358,7 @@ def index_snapshot(req):
 
 def _preload_local_index():
     try:
-        searcher.local.current()
+        searcher.local.load_first()
     except Exception:
         log.warning("Local index preload did not finish; the first search will try again", exc_info=True)
 

@@ -360,6 +360,7 @@ def test_an_unreadable_manifest_marks_best_bets_unavailable_and_still_searches(c
     svc = service()
     wire(monkeypatch, svc)
     monkeypatch.undo()                                                                       # back to the real planner, with a broken ontology
+    monkeypatch.setattr(settings, "local_index_fail_fast", False)                            # undo() also reset the settings; the test loads the index in the request
     monkeypatch.setattr(fa, "searcher", svc)
 
     def broken():

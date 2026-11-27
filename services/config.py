@@ -111,7 +111,8 @@ class Settings:
     local_index_reload_jitter_seconds = _int("LOCAL_INDEX_RELOAD_JITTER_SECONDS", 300, 0, 86400)
     # While an instance is still loading its first index, a search normally waits for the load, and holds one of the
     # instance's concurrent request slots meanwhile. true: it fails at once (HTTP 503 with Retry-After) so the slot
-    # stays free and the caller can retry or be sent elsewhere. Off by default.
+    # stays free and the caller can retry or be sent elsewhere. No request loads the index itself: the first one starts
+    # the load on a background thread and is refused too. On by default.
     local_index_fail_fast = _flag("LOCAL_INDEX_FAIL_FAST", True)
     local_index_retry_after = _int("LOCAL_INDEX_RETRY_AFTER_SECONDS", 3, 1, 60)
     # The 1-bit codes find a shortlist of close chunks quickly, but they rank poorly among close neighbours. Each chunk
