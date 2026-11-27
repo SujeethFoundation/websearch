@@ -142,7 +142,7 @@ def _build_postings(blocks, doc_len, n):
 
 def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
     from services.local_index import RescoreBuilder, chunk_number, page_key, share_lists
-    from services.index_snapshot import LazyTexts
+    from services.index_snapshot import LazyTexts, compress_text
 
     n = len(keys)
     keyset = set(keys)
@@ -153,6 +153,7 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
     concept_words = max(1, (len(concept_names) + 63) // 64)
     skip_set = frozenset(str(d).lower() for d in skip or ())
     rescore = settings.local_rescore
+    compress = bool(settings.local_index_text_compress)
 
     padded = (width + 7) // 8 * 8
     codes = np.zeros((n, padded), dtype=np.uint8)
@@ -204,7 +205,7 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
             if domain in skip_set:
                 text_none[row] = 1
             else:
-                text_blob += str(entity.get("text") or "").encode("utf-8", "replace")
+                text_blob += (compress_text(entity.get("text")) if compress else str(entity.get("text") or "").encode("utf-8", "replace"))
             text_off.append(len(text_blob))
         row += 1
     if row != n:
@@ -224,7 +225,7 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
     texts = None
     if keep_text:
         texts = LazyTexts(np.frombuffer(text_blob, dtype=np.uint8), np.frombuffer(text_off, dtype=np.int64),
-                          np.frombuffer(text_none, dtype=np.uint8))
+                          np.frombuffer(text_none, dtype=np.uint8), compressed=compress)
     return {
         "ids": ids, "titles": titles, "urls": urls, "concepts": share_lists(concept_lists), "texts": texts,
         "domain_names": domain_names, "domain_codes": domain_codes, "page_codes": page_codes,

@@ -140,6 +140,9 @@ class Settings:
     #   LOCAL_PHRASE_POOL candidates; needs the text in memory (LOCAL_INDEX_TEXT_IN_MEMORY). 0 turns it off.
     local_phrase_boost = _float("LOCAL_PHRASE_BOOST", 1.0)
     local_phrase_pool = _int("LOCAL_PHRASE_POOL", 100, 10, 1000)
+    # Chunk text held in memory is compressed one chunk at a time (zlib) and unpacked for the few chunks a search reads (the
+    # results and the phrase-bonus candidates), about 2x smaller. false keeps it as plain UTF-8. Changing it rebuilds the snapshot.
+    local_index_text_compress = _flag("LOCAL_INDEX_TEXT_COMPRESS", True)
     local_rescore = _flag("LOCAL_RESCORE", True)
     # How the rescoring vectors are held in memory. The table still stores the full 8-bit vector (v8); the index derives
     # a smaller copy from it when it loads, so nothing is re-embedded and no table row changes.

@@ -12,26 +12,37 @@ from test_index_snapshot import FakeContainer, build, snaps, same_index, text_te
 from test_local_index import conf, corpus, entities, filled_store  # noqa: F401
 
 
-def test_pack_texts_round_trips_unicode_empty_and_none():
+@pytest.fixture(params=[True, False], ids=["compressed", "plain"])
+def compress(request, monkeypatch):
+    monkeypatch.setattr(settings, "local_index_text_compress", request.param)
+    return request.param
+
+
+def lazy_of(texts):
+    """LazyTexts over pack_texts(texts), read the way the setting packed it."""
+    return snap.LazyTexts(*snap.pack_texts(texts), compressed=bool(settings.local_index_text_compress))
+
+
+def test_pack_texts_round_trips_unicode_empty_and_none(compress):
     texts = ["plain", "", None, "caf\u00e9 \u2014 \u65e5\u672c\u8a9e", "emoji \U0001F600", None, "last"]
-    lazy = snap.LazyTexts(*snap.pack_texts(texts))
+    lazy = lazy_of(texts)
     assert len(lazy) == len(texts)
     assert list(lazy) == texts
     assert lazy[-1] == "last" and lazy[2] is None and lazy[1] == ""
 
 
-def test_pack_texts_of_nothing():
-    lazy = snap.LazyTexts(*snap.pack_texts([]))
+def test_pack_texts_of_nothing(compress):
+    lazy = lazy_of([])
     assert len(lazy) == 0 and list(lazy) == []
 
 
-def test_an_unencodable_character_is_replaced_not_fatal():
-    lazy = snap.LazyTexts(*snap.pack_texts(["bad \ud800 surrogate"]))
+def test_an_unencodable_character_is_replaced_not_fatal(compress):
+    lazy = lazy_of(["bad \ud800 surrogate"])
     assert "bad" in lazy[0]
 
 
-def test_lazy_texts_can_hide_rows_but_not_change_them():
-    lazy = snap.LazyTexts(*snap.pack_texts(["a", "b", "c"]))
+def test_lazy_texts_can_hide_rows_but_not_change_them(compress):
+    lazy = lazy_of(["a", "b", "c"])
     lazy[1] = None
     lazy.hide_rows([2])
     assert list(lazy) == ["a", None, None]
@@ -49,10 +60,40 @@ def test_lazy_texts_refuses_offsets_that_do_not_fit():
         snap.LazyTexts(blob, off[:-1], none)
 
 
-def test_nbytes_counts_without_decoding():
+def test_nbytes_counts_without_decoding(compress):
     texts = ["x" * 1000] * 50
-    lazy = snap.LazyTexts(*snap.pack_texts(texts))
-    assert lazy.nbytes() >= 50_000
+    lazy = lazy_of(texts)
+    assert (lazy.nbytes() >= 50_000) is (not compress)       # plain text counts every byte; compressed text counts what it holds
+
+
+PROSE = ("The Career Circles program pairs students with working professionals for six weeks of structured mentoring. "
+         "Each week has an agenda, a set of questions, and a short exercise to complete before the next meeting. ")
+
+
+def test_compressed_text_is_much_smaller_and_reads_back_exactly(monkeypatch):
+    texts = [PROSE * 4 + f" chunk {i} " + "mentor resume interview " * (i % 5) for i in range(200)]
+    monkeypatch.setattr(settings, "local_index_text_compress", False)
+    plain = lazy_of(texts)
+    monkeypatch.setattr(settings, "local_index_text_compress", True)
+    packed = lazy_of(texts)
+    assert list(packed) == texts == list(plain)
+    assert packed.nbytes() < 0.6 * plain.nbytes()
+
+
+def test_a_restored_snapshot_reads_text_the_way_it_was_packed(snaps, monkeypatch):
+    container, store = snaps
+    for flag in (True, False):
+        monkeypatch.setattr(settings, "local_index_text_compress", flag)
+        original = build()
+        manifest = store.publish(original, "v1", {"themuse.com"})
+        assert manifest["text_compressed"] is flag
+        restored = store.load(manifest, li.LocalIndex, keep_text=True, text_skip={"themuse.com"}, rescore=True)
+        assert restored.texts.compressed is flag
+        same_index(original, restored)
+        assert snap.compatible(manifest, version="v1", keep_text=True, text_skip={"themuse.com"}, rescore=True) == (True, "")
+    other = {**manifest, "text_compressed": not flag}
+    assert "compressed" in snap.compatible(other, version="v1", keep_text=True, text_skip={"themuse.com"}, rescore=True)[1]
+    assert snap.compatible(other, version="v1", keep_text=False, text_skip=set(), rescore=True) == (True, "")   # no text wanted: it does not matter
 
 
 def test_a_restored_index_holds_lazy_text_and_meta_no_longer_has_it(snaps):
