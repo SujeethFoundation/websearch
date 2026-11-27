@@ -304,7 +304,21 @@ def test_the_scaling_clip_can_be_chosen_and_changes_only_four_bit_rows():
     rng = np.random.default_rng(6)
     stored = np.array([np.frombuffer(li.quantize_int8(r), dtype=np.int8) for r in rng.standard_normal((6, 64))])
     a, _ = li.pack_rescore(stored, 64, 4)
-    b, _ = li.pack_rescore(stored, 64, 4, clip=li.RESCORE_CLIP)
+    b, _ = li.pack_rescore(stored, 64, 4, clip=settings.local_rescore_clip)
     c, _ = li.pack_rescore(stored, 64, 4, clip=2.0)
     assert np.array_equal(a, b) and not np.array_equal(a, c)
     assert np.array_equal(li.pack_rescore(stored, 64, 8, clip=2.0)[0], stored)
+
+
+def test_the_clip_setting_decides_the_four_bit_scaling_and_is_kept_in_the_snapshot_shape(monkeypatch):
+    rng = np.random.default_rng(7)
+    stored = np.array([np.frombuffer(li.quantize_int8(r), dtype=np.int8) for r in rng.standard_normal((6, 64))])
+    monkeypatch.setattr(settings, "local_rescore_clip", 3.0)
+    three, _ = li.pack_rescore(stored, 64, 4)
+    monkeypatch.setattr(settings, "local_rescore_clip", 3.5)
+    assert not np.array_equal(three, li.pack_rescore(stored, 64, 4)[0])
+    assert li.rescore_clip(4) == 3.5 and li.rescore_clip(8) is None
+
+
+def test_the_clip_default_is_three():
+    assert settings.local_rescore_clip == 3.0

@@ -236,6 +236,10 @@ def compatible(manifest, *, version, keep_text, text_skip, rescore):
         if (int(scalars.get("rescore_dims") or 0), int(scalars.get("rescore_bits") or 0)) != want:
             return False, (f"the snapshot's rescoring vectors are {scalars.get('rescore_bits')} bits over "
                            f"{scalars.get('rescore_dims')} dimensions, the settings ask for {want[1]} bits over {want[0]}")
+        from services.local_index import rescore_clip
+        if rescore_clip(want[1]) != manifest.get("rescore_clip"):
+            return False, (f"the snapshot's 4-bit vectors were scaled with clip {manifest.get('rescore_clip')}, "
+                           f"the settings ask for {rescore_clip(want[1])}")
     return True, ""
 
 
@@ -434,8 +438,10 @@ class SnapshotStore:
         arrays, meta, scalars = pack(index)
         keep_text = index.texts is not None
         skip = sorted(str(d).lower() for d in text_skip or ())
+        from services.local_index import rescore_clip
+        clip = rescore_clip(index.rescore_bits) if "rvec" in arrays else None
         build = build_id(version, keep_text, skip, "rvec" in arrays,
-                         (index.rescore_bits, index.rescore_dims) if "rvec" in arrays else ())
+                         (index.rescore_bits, index.rescore_dims, clip) if "rvec" in arrays else ())
         if not force and not self.claim(build):
             return None
         base = f"{self.prefix}/{build}"
@@ -450,7 +456,7 @@ class SnapshotStore:
                 files[name] = {"dtype": array.dtype.str, "shape": list(array.shape), "bytes": int(array.nbytes)}
             manifest = {"format": FORMAT_VERSION, "version": version, "build": build,
                         "built_at": datetime.now(timezone.utc).isoformat(), "keep_text": keep_text,
-                        "text_skip": skip, "has_rvec": "rvec" in arrays, "scalars": scalars, "arrays": files}
+                        "text_skip": skip, "has_rvec": "rvec" in arrays, "rescore_clip": clip, "scalars": scalars, "arrays": files}
             self._put(self.manifest_name, json.dumps(manifest).encode("utf-8"))
         except Exception:
             try:
