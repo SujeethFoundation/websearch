@@ -298,3 +298,13 @@ def test_compare_tool_reports_the_agreement_and_the_memory_saved(conf, monkeypat
     small = compare_rescoring.compare(index, 4, 128, queries=40, pool=100)
     assert small["bits"] == 4 and small["dims"] == 128 and 0.0 <= small["recall"] <= 1.0
     assert small["megabytes"] < same["megabytes"] / 3
+
+
+def test_the_scaling_clip_can_be_chosen_and_changes_only_four_bit_rows():
+    rng = np.random.default_rng(6)
+    stored = np.array([np.frombuffer(li.quantize_int8(r), dtype=np.int8) for r in rng.standard_normal((6, 64))])
+    a, _ = li.pack_rescore(stored, 64, 4)
+    b, _ = li.pack_rescore(stored, 64, 4, clip=li.RESCORE_CLIP)
+    c, _ = li.pack_rescore(stored, 64, 4, clip=2.0)
+    assert np.array_equal(a, b) and not np.array_equal(a, c)
+    assert np.array_equal(li.pack_rescore(stored, 64, 8, clip=2.0)[0], stored)

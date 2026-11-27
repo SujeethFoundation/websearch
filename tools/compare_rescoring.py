@@ -12,6 +12,7 @@ embedding calls:
     python tools/compare_rescoring.py                           # 4 bits over 1,024 dimensions, 500 questions
     python tools/compare_rescoring.py --bits 8 --dims 1024      # try another shape
     python tools/compare_rescoring.py --bits 4 --dims 0         # 4 bits, every dimension
+    python tools/compare_rescoring.py --sweep                   # a table of shapes and 4-bit scalings on one index load
     python tools/compare_rescoring.py --settings other.json
 
 A chunk's own vector is a fair question for ranking the neighbours it has, but a real question is shorter and vaguer than a
@@ -26,7 +27,7 @@ import time
 import numpy as np
 
 
-def compare(index, bits, dims, queries=500, pool=300, seed=1, top=10):
+def compare(index, bits, dims, queries=500, pool=300, seed=1, top=10, clip=None):
     """{"top1": share of questions where both rank the same chunk first, "recall": mean share of the reference top
     `top` kept, ...} for an index built with 8-bit rescoring over every dimension."""
     from services import local_index as li
@@ -41,7 +42,7 @@ def compare(index, bits, dims, queries=500, pool=300, seed=1, top=10):
     norms = np.empty(n, dtype=np.float32)
     for start in range(0, n, li.RESCORE_BLOCK):
         packed[start:start + li.RESCORE_BLOCK], norms[start:start + li.RESCORE_BLOCK] = li.pack_rescore(
-            full[start:start + li.RESCORE_BLOCK], use_dims, use_bits)
+            full[start:start + li.RESCORE_BLOCK], use_dims, use_bits, clip)
     ref_norm = np.sqrt((full.astype(np.float32) ** 2).sum(axis=1))
     ref_norm[ref_norm == 0] = 1.0
 
@@ -65,7 +66,7 @@ def compare(index, bits, dims, queries=500, pool=300, seed=1, top=10):
         kept += len(set(ref_top.tolist()) & set(small_top.tolist())) / k
         kept_one += int(ref_top[0] in set(small_top.tolist()))
     count = len(picks)
-    return {"queries": count, "bits": use_bits, "dims": use_dims, "pool": pool,
+    return {"queries": count, "bits": use_bits, "dims": use_dims, "pool": pool, "clip": clip,
             "top1": same_top / count, "best_in_top10": kept_one / count, "recall": kept / count,
             "megabytes": round((packed.nbytes + norms.nbytes) / 1e6, 1),
             "reference_megabytes": round((full.nbytes + ref_norm.nbytes) / 1e6, 1)}
@@ -92,6 +93,8 @@ def main():
     parser.add_argument("--dims", type=int, default=1024, help="dimensions in the smaller copy; 0 for every dimension (default 1024)")
     parser.add_argument("--queries", type=int, default=500, help="how many chunks to use as questions (default 500)")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--clip", type=float, default=None, help="4-bit scaling: root-mean-squares of a row that reach the largest step (default %s)" % "3.5")
+    parser.add_argument("--sweep", action="store_true", help="try 4 and 8 bits over 1,024 and every dimension, then four 4-bit clips, and print a table")
     args = parser.parse_args()
     loaded = load_settings(args.settings)
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -109,13 +112,22 @@ def main():
     if index is None or index.rvec is None:
         sys.exit("The index has no stored vectors to compare (run the backfill with mode all).")
     print(f"{index.n:,} chunks, {index.vec_dims} dimensions, loaded in {time.perf_counter() - began:.0f} s")
-    r = compare(index, args.bits, args.dims, args.queries, settings.local_rescore_pool, args.seed)
+    pool = settings.local_rescore_pool
+    if args.sweep:
+        runs = [(8, 1024, None), (4, 0, None), (4, 1024, None)] + [(4, 1024, c) for c in (2.5, 3.0, 4.0, 5.0)]
+        print(f"\n{'bits':>4} {'dims':>5} {'clip':>5} {'MB':>7}  {'same best':>9} {'best in top10':>13} {'top10 kept':>10}   ({pool} shortlist, {args.queries} questions)")
+        for bits, dims, clip in runs:
+            r = compare(index, bits, dims, args.queries, pool, args.seed, clip=clip)
+            print(f"{r['bits']:>4} {r['dims']:>5} {('-' if r['bits'] == 8 else (clip or 3.5)):>5} {r['megabytes']:>7}  {r['top1']:>9.1%} {r['best_in_top10']:>13.1%} {r['recall']:>10.1%}")
+        print("\nPick the smallest row whose numbers you are happy with. LOCAL_RESCORE_BITS and LOCAL_RESCORE_DIMS set bits and dims; "
+              "a clip other than 3.5 needs a change to RESCORE_CLIP in services/local_index.py.")
+        return
+    r = compare(index, args.bits, args.dims, args.queries, pool, args.seed, clip=args.clip)
     print(f"\n{r['bits']} bits over {r['dims']} dimensions, shortlist of {r['pool']}, {r['queries']} questions:")
     print(f"  same best chunk as the reference     {r['top1']:.1%}")
     print(f"  reference's best chunk in the top 10 {r['best_in_top10']:.1%}")
     print(f"  share of the reference top 10 kept   {r['recall']:.1%}")
     print(f"  vectors in memory                    {r['megabytes']} MB (reference {r['reference_megabytes']} MB)")
-
 
 if __name__ == "__main__":
     main()
