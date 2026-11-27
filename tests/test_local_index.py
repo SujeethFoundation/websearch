@@ -226,7 +226,8 @@ def reference_distance(ents, qcode):
     return np.array([bin(int.from_bytes(e["vec"], "big") ^ q).count("1") for e in ents])
 
 
-def test_keyword_scores_match_a_plain_bm25():
+def test_keyword_scores_match_a_plain_bm25(monkeypatch):
+    monkeypatch.setattr(settings, "local_posting_weight_dtype", "float32")  # float16 is covered in test_memory_512
     ents = entities(corpus())
     index = li.LocalIndex(li.row_from_entity(e) for e in ents)
     terms = li.query_terms("w3 w17 w250 w999 w44")
@@ -426,6 +427,12 @@ def conf(monkeypatch):
     monkeypatch.setattr(settings, "local_index_poll_seconds", 5)
     monkeypatch.setattr(settings, "local_index_min_reload_seconds", 0)
     monkeypatch.setattr(settings, "search_cache_seconds", 0)
+    # the tests below were written for the plain build and reload; tests/test_memory_512.py and test_lean_index.py turn the new ones on
+    monkeypatch.setattr(settings, "local_index_lean_build", False)
+    monkeypatch.setattr(settings, "local_index_drop_before_reload", False)
+    monkeypatch.setattr(settings, "local_index_reload_jitter_seconds", 0)
+    monkeypatch.setattr(settings, "local_index_fail_fast", False)
+    monkeypatch.setattr(settings, "local_index_snapshot_only", False)
 
 
 def wait_for(predicate, seconds=5.0):
