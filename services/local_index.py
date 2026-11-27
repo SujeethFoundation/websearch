@@ -327,6 +327,142 @@ def chunk_number(chunk_id):
         return 0
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Chunk ids without a string per chunk
+# ---------------------------------------------------------------------------------------------------------------
+
+class ChunkIds:
+    """The chunk ids of an index, read like the list of strings they replace (ids[row], len, iteration, index, ==).
+
+    A chunk id is '<page id>-<chunk number>', and an index holds about five chunks a page, so the ids are kept as a table
+    of page ids, the page's place in it for each row, and the chunk numbers the index holds anyway: about 2 MB for 95,000
+    chunks where the strings took 11 MB. An id is built when something asks for it."""
+
+    def __init__(self, page_ids, id_page, numbers):
+        self.page_ids = page_ids
+        self.id_page = id_page
+        self.numbers = numbers
+        self._codes = None
+
+    @classmethod
+    def compact(cls, ids):
+        """ChunkIds for a list of id strings, or None when some id would not read back exactly (a number with a leading
+        zero, no number at all): the caller then keeps the list."""
+        ids = list(ids)
+        pages, codes = {}, np.empty(len(ids), dtype=np.int32)
+        numbers = np.empty(len(ids), dtype=np.int32)
+        for row, cid in enumerate(ids):
+            page, _, number = str(cid).rpartition("-")
+            if not page or not number.isdigit() or (number != "0" and number[0] == "0") or len(number) > 9:
+                return None
+            codes[row] = pages.setdefault(page, len(pages))
+            numbers[row] = int(number)
+        return cls(list(pages), codes, numbers)
+
+    def __len__(self):
+        return len(self.id_page)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(len(self)))]
+        i = int(i)
+        if i < 0:
+            i += len(self)
+        if not 0 <= i < len(self):
+            raise IndexError(i)
+        return f"{self.page_ids[self.id_page[i]]}-{int(self.numbers[i])}"
+
+    def __iter__(self):
+        page_ids, numbers = self.page_ids, self.numbers.tolist()
+        for code, number in zip(self.id_page.tolist(), numbers):
+            yield f"{page_ids[code]}-{number}"
+
+    def __contains__(self, value):
+        try:
+            self.index(value)
+            return True
+        except ValueError:
+            return False
+
+    def index(self, value):
+        """The first row with this id (ValueError when there is none), like list.index."""
+        if self._codes is None:
+            self._codes = {p: c for c, p in enumerate(self.page_ids)}
+        page, _, number = str(value).rpartition("-")
+        code = self._codes.get(page)
+        if code is None or not number.isdigit():
+            raise ValueError(value)
+        rows = np.flatnonzero((self.id_page == code) & (self.numbers == int(number)))
+        if not len(rows) or f"{page}-{int(number)}" != value:
+            raise ValueError(value)
+        return int(rows[0])
+
+    def __eq__(self, other):
+        try:
+            return len(other) == len(self) and all(a == b for a, b in zip(self, other))
+        except TypeError:
+            return NotImplemented
+
+    __hash__ = None
+
+    def total_chars(self):
+        """Characters in all the ids together, worked out without making them."""
+        lengths = np.fromiter((len(p) for p in self.page_ids), dtype=np.int64, count=len(self.page_ids))
+        digits = np.where(self.numbers > 0, np.floor(np.log10(np.maximum(self.numbers, 1))) + 1, 1).astype(np.int64)
+        return int(lengths[self.id_page].sum() + digits.sum() + len(self))
+
+    def memory_bytes(self):
+        return int(self.id_page.nbytes) + sum(sys.getsizeof(p) for p in self.page_ids) + sys.getsizeof(self.page_ids)
+
+
+class IdIndex:
+    """index.by_id for ChunkIds: the row of a chunk id, found through its page's rows (no dictionary of every id)."""
+
+    def __init__(self, pages, chunk_numbers):
+        self._pages = pages
+        self._numbers = chunk_numbers
+
+    def _row(self, cid):
+        try:
+            page, number = split_chunk_id(cid)
+        except ValueError:
+            return None
+        for row in self._pages.get(page) or ():
+            if self._numbers[row] == number:
+                return row
+        return None
+
+    def __contains__(self, cid):
+        return self._row(cid) is not None
+
+    def __getitem__(self, cid):
+        row = self._row(cid)
+        if row is None:
+            raise KeyError(cid)
+        return row
+
+    def get(self, cid, default=None):
+        row = self._row(cid)
+        return default if row is None else row
+
+    def __len__(self):
+        return sum(len(rows) for rows in self._pages.values())
+
+    def items(self):
+        for page, rows in self._pages.items():
+            for row in rows:
+                yield f"{page}-{int(self._numbers[row])}", row
+
+    def __eq__(self, other):
+        if isinstance(other, IdIndex):
+            return self._pages == other._pages and np.array_equal(self._numbers, other._numbers)
+        if isinstance(other, dict):
+            return dict(self.items()) == other
+        return NotImplemented
+
+    __hash__ = None
+
+
 def build_entity(doc_id, title, url, domain, concepts, content, vector, title_weight=None):
     """The table row for one chunk."""
     page_id, number = split_chunk_id(doc_id)
@@ -448,7 +584,7 @@ class LocalIndex:
         self.skipped = skipped
         n = len(usable)
         self.n = n
-        self.ids = [r["id"] for r in usable]
+        self.ids = ChunkIds.compact(r["id"] for r in usable) or [r["id"] for r in usable]
         self.titles = share_strings(r["title"] for r in usable)
         self.urls = share_strings(r["url"] for r in usable)
         self.concepts = share_lists(list(r["concepts"]) for r in usable)
@@ -468,7 +604,10 @@ class LocalIndex:
         # answer can hold a page a limited number of times and never the same chunk of it twice.
         keys = {}
         self.page_codes = np.fromiter((keys.setdefault(page_key(u), len(keys)) for u in self.urls), dtype=np.int32, count=n)
-        self.chunk_numbers = np.fromiter((chunk_number(i) for i in self.ids), dtype=np.int32, count=n)
+        if isinstance(self.ids, ChunkIds):
+            self.chunk_numbers = self.ids.numbers          # the ids read their numbers from it: one array, not two
+        else:
+            self.chunk_numbers = np.fromiter((chunk_number(i) for i in self.ids), dtype=np.int32, count=n)
         self.distinct_pages = len(keys)
         self.concept_names = sorted({c.lower() for r in usable for c in r["concepts"]})
         concept_bit = {c: i for i, c in enumerate(self.concept_names)}
@@ -555,12 +694,23 @@ class LocalIndex:
     def _finish_lookups(self):
         """The lookups for reading pages and single chunks, derived from the ids and urls."""
         self._rows_cache = {}
-        self.by_id = {cid: i for i, cid in enumerate(self.ids)}
-        pages = {}
-        for i, cid in enumerate(self.ids):
-            page_id, number = split_chunk_id(cid)
-            pages.setdefault(page_id, []).append((number, i))
-        self.pages = {p: [i for _, i in sorted(items)] for p, items in pages.items()}
+        if isinstance(self.ids, ChunkIds):
+            # from the page codes and numbers directly: no string is made for any chunk
+            ids = self.ids
+            order = np.lexsort((np.arange(len(ids)), ids.numbers, ids.id_page))
+            sorted_pages = ids.id_page[order]
+            starts = np.concatenate(([0], np.flatnonzero(np.diff(sorted_pages)) + 1)) if len(order) else np.zeros(0, dtype=np.int64)
+            ends = np.concatenate((starts[1:], [len(order)])) if len(order) else starts
+            by_code = {int(sorted_pages[a]): order[a:z].tolist() for a, z in zip(starts, ends)}
+            self.pages = {page: by_code[code] for code, page in enumerate(ids.page_ids) if code in by_code}
+            self.by_id = IdIndex(self.pages, self.chunk_numbers)
+        else:
+            self.by_id = {cid: i for i, cid in enumerate(self.ids)}
+            pages = {}
+            for i, cid in enumerate(self.ids):
+                page_id, number = split_chunk_id(cid)
+                pages.setdefault(page_id, []).append((number, i))
+            self.pages = {p: [i for _, i in sorted(items)] for p, items in pages.items()}
         by_url = {}
         for page_rows in self.pages.values():
             for i in page_rows:
@@ -579,7 +729,8 @@ class LocalIndex:
             text_bytes = texts.nbytes()   # a restored snapshot holds its text as bytes: nothing is decoded to count it
         else:
             text_bytes = sum(len(s) * 2 for s in texts if s)
-        total += text_bytes + sum(len(s) for s in self.ids) + sum(len(s) for s in self.urls)
+        ids_chars = self.ids.total_chars() if isinstance(self.ids, ChunkIds) else sum(len(s) for s in self.ids)
+        total += text_bytes + ids_chars + sum(len(s) for s in self.urls)
         total += sum(len(s) for s in self.titles)
         return total
 
@@ -606,9 +757,14 @@ class LocalIndex:
         def lists_total(values):
             return sum(sys.getsizeof(v) for v in values)
 
+        def unique_lists_total(values):
+            """Each distinct list object once: chunks share their concept lists, so counting one per chunk overstates it."""
+            return sum(sys.getsizeof(v) for v in {id(v): v for v in values}.values())
+
+        ids_mb = mb(self.ids.memory_bytes()) if isinstance(self.ids, ChunkIds) else mb(strings(self.ids))
         objects = {
-            "ids": mb(strings(self.ids)), "urls": mb(strings(self.urls)), "titles": mb(strings(self.titles)),
-            "concepts": mb(sys.getsizeof(self.concepts) + lists_total(self.concepts) + sum(sys.getsizeof(t) for t in {id(t): t for c in self.concepts for t in c}.values())),
+            "ids": ids_mb, "urls": mb(strings(self.urls)), "titles": mb(strings(self.titles)),
+            "concepts": mb(sys.getsizeof(self.concepts) + unique_lists_total(self.concepts) + sum(sys.getsizeof(t) for t in {id(t): t for c in {id(c): c for c in self.concepts}.values() for t in c}.values())),
             "by_id": mb(sys.getsizeof(self.by_id)),
             "pages": mb(sys.getsizeof(self.pages) + lists_total(self.pages.values())),
             "by_url": mb(sys.getsizeof(self.by_url) + lists_total(self.by_url.values())),

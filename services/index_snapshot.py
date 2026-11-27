@@ -6,7 +6,7 @@ instance, every time. One instance does it once, saves the finished arrays here,
 
 Layout, in the blob container the chunks already use, under a prefix nothing else lists:
   index-snapshot/latest.json                 the manifest: which build is current and what it holds (written last)
-  index-snapshot/<build>/meta.json.gz        ids, titles, urls, concepts and the domain and concept names, as JSON (gzip)
+  index-snapshot/<build>/meta.json.gz        page ids (chunk ids are page id + chunk number), titles, urls, concepts and the domain and concept names, as JSON (gzip)
   index-snapshot/<build>/<array>.bin         one raw numpy array each (codes, rvec, postings, text ...), shapes in the manifest
 
 The chunk text is three of those arrays, not JSON: text_blob (every chunk's UTF-8 text end to end; zlib per chunk when the manifest says text_compressed), text_off (where each
@@ -37,7 +37,7 @@ from services.config import settings
 
 log = logging.getLogger("sujeeth-web-search.index-snapshot")
 
-FORMAT_VERSION = 3               # 3: postings hold chunk numbers at 3 bytes and the text may be compressed (manifest text_compressed); 2: the chunk text is in raw arrays (text_blob, text_off, text_none), not in meta.json.gz
+FORMAT_VERSION = 3               # 3: postings hold chunk numbers at 3 bytes, the text may be compressed (manifest text_compressed), chunk ids are page_ids in meta plus the id_page array; 2: the chunk text is in raw arrays (text_blob, text_off, text_none), not in meta.json.gz
 CLAIM_STALE_SECONDS = 20 * 60     # a claim this old belongs to a builder that died: take it over
 DOWNLOAD_WORKERS = 12             # most blobs fetched at once on a large instance; INDEX_SNAPSHOT_DOWNLOAD_WORKERS sets it (2 by default)
 
@@ -223,10 +223,15 @@ def build_id(version, keep_text, text_skip, has_rvec, rescore_shape=(), text_com
 def pack(index):
     """(arrays, meta, scalars) for a built LocalIndex. Nothing is copied: the arrays are the index's own."""
     arrays = {name: getattr(index, name) for name in _ARRAYS}
+    from services.local_index import ChunkIds
     if index.rvec is not None:
         arrays["rvec"], arrays["rnorm"] = index.rvec, index.rnorm
-    meta = {"ids": index.ids, "titles": index.titles, "urls": index.urls, "concepts": index.concepts,
+    meta = {"titles": index.titles, "urls": index.urls, "concepts": index.concepts,
             "domain_names": index.domain_names, "concept_names": index.concept_names}
+    if isinstance(index.ids, ChunkIds):
+        meta["page_ids"], arrays["id_page"] = index.ids.page_ids, index.ids.id_page     # the numbers are chunk_numbers
+    else:
+        meta["ids"] = index.ids
     if index.texts is not None:
         # None rows (domains whose text stays in the table) are flagged in text_none
         arrays["text_blob"], arrays["text_off"], arrays["text_none"] = pack_texts(index.texts)
@@ -277,9 +282,11 @@ def restore(index_cls, manifest, arrays, meta, *, keep_text, text_skip, rescore)
 
     s = manifest["scalars"]
     n = int(s["n"])
-    for name in ("ids", "titles", "urls", "concepts"):
+    for name in ("titles", "urls", "concepts") + (() if "page_ids" in meta else ("ids",)):
         if len(meta[name]) != n:
             raise SnapshotError(f"{name} holds {len(meta[name])} entries, expected {n}")
+    if "page_ids" in meta and ("id_page" not in arrays or arrays["id_page"].shape[0] != n):
+        raise SnapshotError("the snapshot's chunk ids are incomplete")
     for name in ("domain_codes", "page_codes", "chunk_numbers", "codes", "concept_bits"):
         if arrays[name].shape[0] != n:
             raise SnapshotError(f"{name} holds {arrays[name].shape[0]} rows, expected {n}")
@@ -291,8 +298,8 @@ def restore(index_cls, manifest, arrays, meta, *, keep_text, text_skip, rescore)
     index = index_cls.__new__(index_cls)
     index.n = n
     index.skipped = int(s["skipped"])
-    from services.local_index import share_lists, share_strings
-    index.ids = meta["ids"]
+    from services.local_index import ChunkIds, share_lists, share_strings
+    index.ids = ChunkIds(meta["page_ids"], arrays["id_page"], arrays["chunk_numbers"]) if "page_ids" in meta else meta["ids"]
     index.titles, index.urls = share_strings(meta["titles"]), share_strings(meta["urls"])
     index.concepts = share_lists(meta["concepts"])
     index.domain_names, index.concept_names = meta["domain_names"], meta["concept_names"]

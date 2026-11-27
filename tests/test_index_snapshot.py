@@ -451,3 +451,32 @@ def test_a_snapshot_scaled_with_another_clip_is_not_used(snaps, monkeypatch):
     eight = store.publish(build(), "v1", {"themuse.com"})
     assert eight["rescore_clip"] is None
     assert snap.compatible(eight, **ok) == (True, "")                    # at 8 bits the clip plays no part
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Chunk ids in a snapshot
+# ---------------------------------------------------------------------------------------------------------------
+
+def test_a_snapshot_holds_page_ids_and_a_page_array_not_every_chunk_id(snaps):
+    import gzip
+    import json
+    container, store = snaps
+    original = build()
+    manifest = store.publish(original, "v1", {"themuse.com"})
+    meta = json.loads(gzip.decompress(container.blobs[f"index-snapshot/{manifest['build']}/meta.json.gz"][0]))
+    assert "ids" not in meta and len(meta["page_ids"]) == len(set(i.rsplit("-", 1)[0] for i in original.ids))
+    assert "id_page" in manifest["arrays"]
+    restored = store.load(manifest, li.LocalIndex, keep_text=True, text_skip={"themuse.com"}, rescore=True)
+    assert isinstance(restored.ids, li.ChunkIds) and restored.chunk_numbers is restored.ids.numbers
+    assert list(restored.ids) == list(original.ids) and restored.by_id["page3-1"] == original.by_id["page3-1"]
+
+
+def test_a_snapshot_of_plain_ids_still_restores(snaps):
+    container, store = snaps
+    original = build()
+    original.ids = list(original.ids)
+    manifest = store.publish(original, "v1", {"themuse.com"})
+    assert "id_page" not in manifest["arrays"]
+    restored = store.load(manifest, li.LocalIndex, keep_text=True, text_skip={"themuse.com"}, rescore=True)
+    assert isinstance(restored.ids, list) and restored.ids == original.ids
+    assert restored.by_id == original.by_id and restored.pages == original.pages

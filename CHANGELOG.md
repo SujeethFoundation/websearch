@@ -1,5 +1,11 @@
 # Web search changelog
 
+- Three memory cuts to the index (snapshot format 3: the first deploy rebuilds the snapshot once):
+  - Keyword postings hold each chunk number in 3 bytes instead of 4 (`post_docs` is an (m, 3) uint8 array, decoded per word when a search reads its list): 45 MB instead of 60 MB at 15.1M postings, with room for 16.7 million chunks.
+  - Chunk text is kept compressed in memory (`LOCAL_INDEX_TEXT_COMPRESS`, default on): per-chunk zlib took technical prose to 52 to 64% of its size, and a chunk unpacks in about 10 microseconds.
+  - Chunk ids are no longer 95,000 strings and a dictionary: the index keeps a table of page ids plus the chunk numbers it already holds (`ChunkIds`, `IdIndex`), about 2 MB instead of about 15. Ids that would not read back exactly (a leading zero, no number) keep the plain list. The snapshot stores `page_ids` and an `id_page` array instead of every id.
+  - The memory breakdown (`Show-LocalIndex -Memory`) counted each shared concept list once per chunk, which made `concepts` look like 14 MB; it now counts each list once.
+
 - `LOCAL_RESCORE_CLIP` (default 3.0, was a fixed 3.5): the 4-bit scaling of the rescoring vectors, now an app setting. On the live index 3.0 agreed with the exact best chunk more often than 3.5. The snapshot records the clip, so changing it makes instances rebuild rather than load vectors scaled the old way. `tools/compare_rescoring.py --sweep` tries 2.5, 3.0, 3.5 and 4.0.
 
 - Rescoring vectors are held at 4 bits over the first 1,024 dimensions (`LOCAL_RESCORE_BITS=4`, `LOCAL_RESCORE_DIMS=1024`), down from 8 bits over all 1,536: 49 MB instead of 146 MB at 95,000 chunks, and a smaller snapshot. They are derived from the stored 8-bit vectors when the index loads, so no row changes and nothing is re-embedded; the question's vector is cut to the same dimensions. Each 4-bit row is scaled to 3.5 root-mean-squares and clipped, which ranks close neighbours better than scaling to the largest value. Set `LOCAL_RESCORE_BITS=8` and `LOCAL_RESCORE_DIMS=0` for the old index. A snapshot is only used by a reader with the same two settings; the first deploy rebuilds it. `tools/compare_rescoring.py` measures how often the smaller copies agree with the exact ranking on the real index. Renamed in the code: `vec8`/`norm8` are `rvec`/`rnorm`; the snapshot manifest says `has_rvec`.

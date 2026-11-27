@@ -140,6 +140,18 @@ def _build_postings(blocks, doc_len, n):
 # Pass 2: everything else, streamed into arrays of the final size
 # ---------------------------------------------------------------------------------------------------------------
 
+def _compact_ids(keys, chunk_numbers):
+    """The ids as ChunkIds sharing the index's chunk_numbers array (or the plain list when an id would not read back)."""
+    from services.local_index import ChunkIds
+    compact = ChunkIds.compact(keys)
+    if compact is None:
+        return list(keys)
+    if not np.array_equal(compact.numbers, chunk_numbers):
+        return list(keys)
+    compact.numbers = chunk_numbers
+    return compact
+
+
 def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
     from services.local_index import RescoreBuilder, chunk_number, page_key, share_lists
     from services.index_snapshot import LazyTexts, compress_text
@@ -227,7 +239,7 @@ def _read_rows(store, keep_text, skip, split, keys, domains, concepts, width):
         texts = LazyTexts(np.frombuffer(text_blob, dtype=np.uint8), np.frombuffer(text_off, dtype=np.int64),
                           np.frombuffer(text_none, dtype=np.uint8), compressed=compress)
     return {
-        "ids": ids, "titles": titles, "urls": urls, "concepts": share_lists(concept_lists), "texts": texts,
+        "ids": _compact_ids(ids, chunk_numbers), "titles": titles, "urls": urls, "concepts": share_lists(concept_lists), "texts": texts,
         "domain_names": domain_names, "domain_codes": domain_codes, "page_codes": page_codes,
         "chunk_numbers": chunk_numbers, "distinct_pages": len(pages), "concept_names": concept_names,
         "concept_words": concept_words, "concept_bits": bits, "code_bytes": width,
