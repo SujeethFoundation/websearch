@@ -37,6 +37,14 @@ import numpy as np
 
 from services.config import settings
 from services.ontology_client import OntologyClient
+from services.diagnostics import add_stage as _add_stage
+
+
+def _lap(name, began):
+    """Add the time since `began` to this request's `name` stage; returns the new starting point."""
+    now = time.perf_counter()
+    _add_stage(name, now - began)
+    return now
 
 log = logging.getLogger("sujeeth-web-search.local-index")
 
@@ -963,23 +971,27 @@ class LocalIndex:
         if not len(rows):
             return rows, [], parts
         fused = {}
+        clock = time.perf_counter()
         scores = (work.keyword_scores() if work is not None else self.keyword_scores(terms))[rows]
         hit = np.flatnonzero(scores > 0)
         for rank, pos in enumerate(self._top(scores[hit], text_candidates or candidates, True)):
             row = int(rows[hit[pos]])
             parts["keyword"][row] = rank
             fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
+        clock = _lap("keyword", clock)
         if qcode is not None and self.code_bytes:
             ranked = self.vector_ranking(rows, qcode, qvec, candidates, distance=work.distance_for if work is not None else None)
             for rank, row in enumerate(ranked):
                 parts["vector"][row] = rank
                 fused[row] = fused.get(row, 0.0) + 1.0 / (RRF_K + rank + 1)
+            clock = _lap("vector", clock)
         if concept_weights and concept_boost > 0 and fused:
             cand = np.fromiter(fused.keys(), dtype=np.int64, count=len(fused))
             for row, share in zip(cand.tolist(), self.concept_coverage(cand, concept_weights).tolist()):
                 if share:
                     parts["share"][row] = share
                     fused[row] += concept_boost * share / (RRF_K + 1)
+            clock = _lap("concept", clock)
         if question and phrase_boost > 0 and fused and self.texts is not None:
             phrases = work.phrases() if work is not None else self.question_phrases(question)
             parts["phrases"] = phrases
@@ -990,7 +1002,10 @@ class LocalIndex:
                     if share:
                         parts["phrase"][row] = share
                         fused[row] += phrase_boost * share / (RRF_K + 1)
-        return rows, sorted(fused.items(), key=lambda kv: (-kv[1], kv[0])), parts
+            clock = _lap("phrase", clock)
+        ordered = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))
+        _lap("sort", clock)
+        return rows, ordered, parts
 
     def _pick(self, ordered, limit, max_per_page, unique=False):
         """The answer from the ranked candidates: the best `limit`, preferring at most max_per_page chunks of a page.

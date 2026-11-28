@@ -27,15 +27,17 @@ class AdmissionGate:
         self._running = self._waiting = self._peak_waiting = self._admitted = self._refused = 0
         self._wait_total = self._wait_max = 0.0
 
-    def acquire(self):
-        """Take a slot, waiting up to the queue timeout. Raises SearchBusy when none is free in time. Pair with release()."""
+    def acquire(self, wait_seconds=None):
+        """Take a slot, waiting up to the queue timeout (or wait_seconds, when shorter). Raises SearchBusy when none is free in
+        time. Pair with release()."""
         if self._semaphore is None:
             return
+        limit = self.wait_seconds if wait_seconds is None else max(0.0, min(self.wait_seconds, float(wait_seconds)))
         began = time.monotonic()
         with self._lock:
             self._waiting += 1
             self._peak_waiting = max(self._peak_waiting, self._waiting)
-        got = self._semaphore.acquire(timeout=self.wait_seconds) if self.wait_seconds > 0 else self._semaphore.acquire(False)
+        got = self._semaphore.acquire(timeout=limit) if limit > 0 else self._semaphore.acquire(False)
         waited = time.monotonic() - began
         with self._lock:
             self._waiting -= 1
@@ -47,7 +49,7 @@ class AdmissionGate:
             else:
                 self._refused += 1
         if not got:
-            raise SearchBusy(waited, self.wait_seconds)
+            raise SearchBusy(waited, limit)
 
     def release(self):
         if self._semaphore is None:
