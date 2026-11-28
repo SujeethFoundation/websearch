@@ -184,6 +184,7 @@ def gated(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kw):
         arrived = time.monotonic()
+        timer = diagnostics.stages_start()
         budget = caller_budget(args[0] if args else None)
         limit = settings.search_deadline_seconds
         if budget is not None:
@@ -193,12 +194,19 @@ def gated(fn):
             gate.acquire(limit if limit > 0 else None)
         except SearchBusy as exc:
             deadline.clear(token)
+            diagnostics.stages_end(timer)
             diagnostics.counters.bump("queue_refused")
             return busy_response(exc)
         began = time.monotonic()
+        diagnostics.add_stage("queue", began - arrived)
         try:
             deadline.check("starting")
-            return fn(*args, **kw)
+            answer = fn(*args, **kw)
+            try:   # where the time went, for the caller's logs: {"queue": ms, "embed": ms, "keyword": ms, ...}
+                answer.headers["X-Stage-Ms"] = json.dumps(diagnostics.stage_times(), separators=(",", ":"))
+            except Exception:
+                pass   # timings never change an answer
+            return answer
         except SearchDeadline as exc:
             return deadline_response(exc)
         finally:
@@ -211,7 +219,9 @@ def gated(fn):
                 facts = process_info()
                 diagnostics.emit("slow_search", route=fn.__name__, took_s=round(took, 1), pid=facts["pid"],
                                  instance=facts["instance"], rss_mb=facts["rss_mb"], mem_limit_mb=facts.get("mem_limit_mb"),
+                                 stage_ms=json.dumps(diagnostics.stage_times(), separators=(",", ":")),
                                  **diagnostics_state())
+            diagnostics.stages_end(timer)
     return wrapper
 
 

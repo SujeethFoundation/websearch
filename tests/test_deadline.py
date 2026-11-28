@@ -79,3 +79,20 @@ def test_the_callers_budget_also_caps_the_wait_for_a_slot(monkeypatch):
         assert out.status_code == 503 and time.monotonic() - began < 1.5
     finally:
         gate.release()
+
+
+def test_a_search_reports_where_its_time_went(monkeypatch):
+    import json as _json
+    import function_app
+    from services import diagnostics
+
+    @function_app.gated
+    def work(req):
+        with diagnostics.stage("rank"):
+            time.sleep(0.02)
+        return function_app.response({"ok": True}, 200)
+
+    out = work(Req())
+    stages = _json.loads(out.headers["X-Stage-Ms"])
+    assert stages["rank"] >= 15 and "queue" in stages
+    assert diagnostics.stage_times() == {}            # nothing carries over to the next request

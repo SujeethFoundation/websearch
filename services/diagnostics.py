@@ -8,6 +8,8 @@ process_exit    when the worker exits normally. A worker killed for memory write
                 that stops, followed by a new process_start with a different pid.
 """
 import atexit
+import contextlib
+import contextvars
 import json
 import logging
 import threading
@@ -96,3 +98,41 @@ def beat(info, snapshot, idle_due=False):
          rss_mb=facts.get("rss_mb"), mem_limit_mb=facts.get("mem_limit_mb"), cpu_s=facts.get("cpu_seconds"),
          throttled_s=facts.get("cpu_throttled_seconds"), **state, **since)
     return True
+
+
+# -- time spent per stage of one request ---------------------------------------------------------------------------
+# A request turns this on (stages_start); each stage then adds its time with `with stage("name"):`. The variants of one
+# search run in threads that copy the context, so they add to the same totals: a stage's time is summed over them.
+_stages = contextvars.ContextVar("search_stages", default=None)
+_stages_lock = threading.Lock()
+
+
+def stages_start():
+    return _stages.set({})
+
+
+def stages_end(token):
+    _stages.reset(token)
+
+
+def stage_times():
+    """{stage: milliseconds} for the request in progress, or {} when none is being timed."""
+    times = _stages.get()
+    with _stages_lock:
+        return {name: round(ms) for name, ms in (times or {}).items()}
+
+
+def add_stage(name, seconds):
+    times = _stages.get()
+    if times is not None:
+        with _stages_lock:
+            times[name] = times.get(name, 0.0) + seconds * 1000
+
+
+@contextlib.contextmanager
+def stage(name):
+    began = time.perf_counter()
+    try:
+        yield
+    finally:
+        add_stage(name, time.perf_counter() - began)
