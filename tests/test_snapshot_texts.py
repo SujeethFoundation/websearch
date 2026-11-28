@@ -131,14 +131,16 @@ def test_text_blobs_are_not_downloaded_when_text_is_off(snaps):
     assert not [d for d in container.downloads if "text_" in d]
 
 
-def test_the_biggest_blobs_are_requested_first(snaps):
+def test_the_biggest_blobs_are_requested_first(snaps, monkeypatch):
+    # One worker makes the download log the submit order; with two, the threads race to log first.
+    monkeypatch.setattr(settings, "index_snapshot_download_workers", 1)
     container, store = snaps
     manifest = store.publish(build(), "v1", {"themuse.com"})
     container.downloads.clear()
     store.load(manifest, li.LocalIndex, keep_text=True, text_skip={"themuse.com"}, rescore=True)
     base = f"index-snapshot/{manifest['build']}/"
     sizes = [manifest["arrays"][d[len(base):-4]]["bytes"] for d in container.downloads if d.endswith(".bin")]
-    # pool.map submits in order; with a fake that answers instantly the log order is the submit order
+    # pool.map submits in order, and a single worker runs them in that order
     assert sizes == sorted(sizes, reverse=True)
 
 
