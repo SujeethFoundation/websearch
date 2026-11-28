@@ -275,7 +275,8 @@ def question_concept_weights(resolution):
     return weights
 
 
-def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ranking=None, ontology_version=None):
+def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ranking=None, ontology_version=None,
+               best_bet_domains=None):
     # MCP owns ontology resolution and sends the approved filter. Websearch applies that filter to indexed results.
     matched_concepts = list(dict.fromkeys(str(x) for x in (concepts or []) if str(x).strip()))
     selected_domains = list(dict.fromkeys(str(x).lower() for x in (domains or []) if str(x).strip()))
@@ -307,7 +308,7 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ra
 
     # The main search and the two side searches (best bets, spotlights) ask the same question of the same index, so
     # they run together in one pass: the embedding, the keyword scores and the code distances are worked out once.
-    bet_domains, bet_failed = plan_best_bets(selected_domains)
+    bet_domains, bet_failed = plan_best_bets(selected_domains, best_bet_domains)
     spotlight_domains = plan_spotlights(resolution, selected_domains)
     jobs = [{
         "concepts": matched_concepts,
@@ -347,7 +348,7 @@ def run_search(query, concepts=None, domains=None, purpose="search", limit=5, ra
 
 
 def run_search_batch(query, queries, concepts=None, domains=None, purpose="search", limit=5, ranking=None,
-                     ontology_version=None):
+                     ontology_version=None, best_bet_domains=None):
     """Run a bounded set of query variants with one shared MCP-approved filter."""
     candidates, seen_queries = [], set()
     for text in [query] + (queries if isinstance(queries, list) else []):
@@ -364,12 +365,12 @@ def run_search_batch(query, queries, concepts=None, domains=None, purpose="searc
         return {"query": query, "status": "completed", "queries": [], "count": 0, "results": []}
     if len(candidates) == 1:
         return run_search(query=candidates[0], concepts=concepts, domains=domains, purpose=purpose, limit=limit,
-                          ranking=ranking, ontology_version=ontology_version)
+                          ranking=ranking, ontology_version=ontology_version, best_bet_domains=best_bet_domains)
 
     with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
         answers = list(pool.map(lambda text: contextvars.copy_context().run(
             run_search, query=text, concepts=concepts, domains=domains, purpose=purpose, limit=limit, ranking=ranking,
-            ontology_version=ontology_version), candidates))
+            ontology_version=ontology_version, best_bet_domains=best_bet_domains), candidates))
     results = []
     for text, answer in zip(candidates, answers):
         for item in answer.get("results", []) or []:
@@ -438,9 +439,13 @@ def add_spotlights(result, found, domains):
 BEST_BETS_MAX = settings.best_bets_max
 
 
-def plan_best_bets(selected_domains):
+def plan_best_bets(selected_domains, sent=None):
     """(domains, failed): the selected domains that hold manually added pages, and whether the ontology manifest that
-    says which ones could not be read. Never raises."""
+    says which ones could not be read. Never raises. `sent` is the caller's list of best-bet domains (MCP sends it): when
+    given, it is used as is (limited to the selected domains) and the ontology app is not asked."""
+    if sent is not None:
+        selected = {str(d).lower() for d in selected_domains or []}
+        return (sorted({str(d).lower() for d in sent if str(d).lower() in selected}) if BEST_BETS_MAX else []), False
     try:
         return (best_bet_domains(ontology.search_manifest(), selected_domains) if BEST_BETS_MAX else []), False
     except Exception:
@@ -551,6 +556,8 @@ def search_post(req):
             "limit": limit,
             "ranking": body.get("ranking"),
             "ontology_version": body.get("ontology_version"),
+            # MCP sends which of the domains hold hand-added pages, so a search never has to ask the ontology app.
+            "best_bet_domains": body.get("best_bet_domains") if isinstance(body.get("best_bet_domains"), list) else None,
         }
         queries = body.get("queries") or []
         if isinstance(queries, list) and any(isinstance(q, str) and q.strip() and q.strip().casefold() != query.casefold()

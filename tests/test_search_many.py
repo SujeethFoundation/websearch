@@ -293,7 +293,7 @@ RESOLUTION = {"matched_concepts": MAIN_CONCEPTS, "domains": MAIN_DOMAINS, "ontol
 
 def wire(monkeypatch, svc, bet_domains=("manual.sujeeth.org",), resolution=None):
     monkeypatch.setattr(fa, "searcher", svc)
-    monkeypatch.setattr(fa, "plan_best_bets", lambda domains: (list(bet_domains), False))
+    monkeypatch.setattr(fa, "plan_best_bets", lambda domains, sent=None: (list(bet_domains), False))
     monkeypatch.setattr(fa.concept_resolver, "resolve_query", lambda **kw: (_ for _ in ()).throw(AssertionError("Websearch must not resolve ontology")))
 
 

@@ -80,3 +80,15 @@ def test_the_check_reports_how_many_manual_pages_it_left_out():
 
 def test_no_manual_page_ranks_when_the_main_search_found_nothing():
     assert merge_best_bets([], [hit("https://m/1")], within_rank=5) == []
+
+
+def test_best_bet_domains_sent_by_the_caller_skip_the_ontology(monkeypatch):
+    import function_app as fa
+
+    def no_ontology():
+        raise AssertionError("the ontology app was asked")
+
+    monkeypatch.setattr(fa.ontology, "search_manifest", no_ontology)
+    monkeypatch.setattr(fa, "BEST_BETS_MAX", 3)
+    assert fa.plan_best_bets(["app.candid.org", "sujeeth.org"], ["APP.candid.org", "elsewhere.org"]) == (["app.candid.org"], False)
+    assert fa.plan_best_bets(["sujeeth.org"], []) == ([], False)
