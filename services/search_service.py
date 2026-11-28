@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from services.config import settings
 from services.embedding_service import EmbeddingService
+from services.result_store import ResultStore
 from services.local_index import (
     LocalIndexManager, LocalIndexUnavailable, RELATED_PREFIX, VECTOR_FIELD, binary_code, entity_from_search_doc, query_terms,
     split_chunk_id,
@@ -114,6 +115,18 @@ class SearchService:
         self.embedder = EmbeddingService()
         self.local = LocalIndexManager()
         self.local.on_swap = _query_cache_clear  # a rebuilt in-memory index makes kept answers out of date
+
+    @property
+    def results(self):
+        """Finished answers shared by every instance (off unless SEARCH_SHARED_CACHE_SECONDS is above 0)."""
+        store = self.__dict__.get("_results")
+        if store is None:
+            store = self.__dict__["_results"] = ResultStore()
+        return store
+
+    @results.setter
+    def results(self, store):
+        self.__dict__["_results"] = store
 
     @staticmethod
     def _search_doc(doc, vector=None):
@@ -578,7 +591,8 @@ class SearchService:
         answers = [p if isinstance(p, Exception) else None for p in plans]
         todo = [i for i, p in enumerate(plans) if not isinstance(p, Exception)]
         generation = 0
-        if settings.search_cache_seconds > 0 and todo:
+        shared_on = self.results.enabled
+        if (settings.search_cache_seconds > 0 or shared_on) and todo:
             try:
                 self.local.current()   # let a first load swap the index in (and clear kept answers) before the generation is read
             except LocalIndexUnavailable:
@@ -602,6 +616,12 @@ class SearchService:
                     cached["query"] = query
                     answers[i] = cached
                     todo.remove(i)
+                elif shared_on:
+                    stored = self.results.get(self.local._version, plan["key"])   # another instance may have answered it
+                    if stored is not None:
+                        stored["query"] = query
+                        answers[i] = stored
+                        todo.remove(i)
         if todo:
             try:
                 fresh = self._search_local_many(query, [plans[i] for i in todo])
@@ -614,12 +634,15 @@ class SearchService:
                         and answer.get("search_mode") != "keyword"):
                     snapshot = copy.deepcopy(answer)
                     with _query_lock:
-                        if generation == _query_generation[0]:
+                        if settings.search_cache_seconds > 0 and generation == _query_generation[0]:
                             _query_cache[key] = (time.monotonic() + settings.search_cache_seconds, snapshot)
                             limit_entries = settings.search_cache_max_entries
                             if len(_query_cache) > limit_entries:
                                 for old_key in list(_query_cache)[: max(1, limit_entries // 10)]:
                                     _query_cache.pop(old_key, None)
+                        fresh_index = generation == _query_generation[0]
+                    if shared_on and fresh_index:
+                        self.results.put(self.local._version, key, snapshot)
         return answers
 
     def _search_local_many(self, query, plans):
