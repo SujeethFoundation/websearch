@@ -87,3 +87,44 @@ def test_a_second_instance_answers_from_the_table_without_embedding_or_searching
     again = second.search_many(question, service_jobs())
     assert again == answered
     assert second_embedder.calls == [] and second.local.describe()["searches"] == 0
+
+
+class SweepTable(FakeTable):
+    def query_entities(self, query_filter, select=None):
+        cutoff = int(query_filter.split()[-1])
+        return [{"PartitionKey": p, "RowKey": r} for (p, r), v in list(self.rows.items()) if int(v.get("ts") or 0) < cutoff]
+
+    def delete_entity(self, partition, row):
+        del self.rows[(partition, row)]
+
+
+def test_a_sweep_removes_only_rows_past_their_lifetime_and_grace():
+    from services.result_store import sweep_expired
+    table, now = SweepTable(), int(time.time())
+    table.rows[("a", "fresh")] = {"ts": now}
+    table.rows[("a", "old")] = {"ts": now - 600 - 3600 - 10}
+    table.rows[("a", "barely")] = {"ts": now - 600 - 60}
+    assert sweep_expired(table, 600) == 1 and set(r for _, r in table.rows) == {"fresh", "barely"}
+
+
+def test_a_sweep_stops_at_the_row_limit():
+    from services.result_store import sweep_expired
+    table = SweepTable()
+    for n in range(5):
+        table.rows[("p", str(n))] = {"ts": 1}
+    assert sweep_expired(table, 600, max_rows=3) == 3 and len(table.rows) == 2
+
+
+def test_a_background_write_starts_one_sweep_when_due():
+    table = SweepTable()
+    table.rows[("p", "stale")] = {"ts": 1}
+    store = ResultStore("x", "t", 600, table=table)
+    store.put("v1", KEY, {"results": []})
+    for _ in range(100):
+        if store.stats.get("swept"):
+            break
+        time.sleep(0.02)
+    assert store.stats.get("swept") == 1 and ("p", "stale") not in table.rows
+    store.put("v1", ("another",), {"results": []})
+    time.sleep(0.1)
+    assert store.stats.get("swept") == 1

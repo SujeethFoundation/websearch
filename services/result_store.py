@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import logging
+import random
 import threading
 import time
 import zlib
@@ -24,6 +25,25 @@ log = logging.getLogger("sujeeth-web-search.result-store")
 
 MAX_PACKED_CHARS = 60000
 MAX_PENDING_WRITES = 100
+SWEEP_INTERVAL_SECONDS = 6 * 3600
+SWEEP_MAX_ROWS = 500
+SWEEP_GRACE_SECONDS = 3600
+
+
+def sweep_expired(table, ttl_seconds, max_rows=SWEEP_MAX_ROWS, grace_seconds=SWEEP_GRACE_SECONDS):
+    """Delete up to max_rows rows older than the lifetime plus a grace; returns how many went."""
+    cutoff = int(time.time() - ttl_seconds - grace_seconds)
+    deleted = 0
+    for entity in table.query_entities(f"ts lt {cutoff}", select=["PartitionKey", "RowKey"]):
+        if deleted >= max_rows:
+            break
+        try:
+            table.delete_entity(entity["PartitionKey"], entity["RowKey"])
+            deleted += 1
+        except Exception as exc:
+            if exc.__class__.__name__ != "ResourceNotFoundError":
+                raise
+    return deleted
 
 
 def row_key_for(version, key):
@@ -39,6 +59,7 @@ class ResultStore:
         self._table = table
         self._lock = threading.Lock()
         self._down_until, self._pending, self._writer = 0.0, 0, None
+        self._next_sweep = 0.0
         self.stats = {"reads": 0, "hits": 0, "misses": 0, "errors": 0, "skipped": 0, "writes": 0, "write_errors": 0,
                       "writes_dropped": 0, "too_big": 0}
 
@@ -100,6 +121,22 @@ class ResultStore:
             self.stats["hits"] += 1
         return answer
 
+    def _maybe_sweep(self):
+        now = time.monotonic()
+        if now < self._next_sweep:
+            return
+        self._next_sweep = now + SWEEP_INTERVAL_SECONDS * random.uniform(0.8, 1.2)
+        self._writer.submit(self._sweep_now)
+
+    def _sweep_now(self):
+        try:
+            n = sweep_expired(self._client(), self._ttl)
+            with self._lock:
+                self.stats["swept"] = self.stats.get("swept", 0) + n
+        except Exception:
+            with self._lock:
+                self.stats["sweep_errors"] = self.stats.get("sweep_errors", 0) + 1   # never blocks reads or writes
+
     def _write(self, version, key, packed):
         partition, row = row_key_for(version, key)
         try:
@@ -135,3 +172,4 @@ class ResultStore:
             self._write(version, key, packed)
         else:
             self._writer.submit(self._write, version, key, packed)
+            self._maybe_sweep()
