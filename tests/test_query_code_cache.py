@@ -285,6 +285,7 @@ def test_seeding_counts_failures_and_carries_on(conf):
 
 def test_the_search_path_uses_the_code_and_falls_back_to_keywords_when_embedding_fails(conf, monkeypatch):
     from test_local_index import make_service
+    monkeypatch.setattr(settings, "search_cache_seconds", 0)   # this test is about the embedding cache, not the answer cache
     svc = make_service()
     calls = []
     embedder = es.EmbeddingService()
