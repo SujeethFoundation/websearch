@@ -178,6 +178,11 @@ class Settings:
     # 0 turns it off. The index only changes when pages are crawled, so a few minutes of reuse is safe; another
     # instance can serve an older answer for up to this long after a crawl. Each entry is roughly 10 KB.
     search_cache_seconds = _int("SEARCH_CACHE_SECONDS", 0, 0, 86400)
+    # SEARCH_SHARED_CACHE_SECONDS above 0 also keeps finished answers in a table every instance reads, so a question one
+    # instance answered is not searched again by the others. Keyed by the index version, so a crawl invalidates it.
+    search_shared_cache_seconds = _int("SEARCH_SHARED_CACHE_SECONDS", 0, 0, 86400)
+    search_shared_cache_table = ("".join(ch for ch in os.getenv("SEARCH_SHARED_CACHE_TABLE", "").strip() if ch.isalnum())
+                                 or (local_index_table + "results"))
     search_cache_max_entries = _int("SEARCH_CACHE_MAX_ENTRIES", 500, 10, 100000)
     # Chunks per backfill task. A "missing" backfill asks the table about each page of the task's chunks, so a larger
     # batch means fewer round trips.

@@ -478,6 +478,7 @@ def health(req):
         "embed_cache": _embed_cache_stats(),
         "process": process_info(),
         "query_cache": query_cache_stats(),
+        "shared_result_cache": {"enabled": searcher.results.enabled, **searcher.results.stats},
         "admission": gate.stats(),
     })
 
