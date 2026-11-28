@@ -167,15 +167,30 @@ def deadline_response(exc):
                     headers={"Retry-After": str(wait)})
 
 
+def caller_budget(req):
+    """Seconds the caller will still wait for this answer, from its X-Request-Budget-Ms header, or None when it sent none."""
+    try:
+        raw = req.headers.get("X-Request-Budget-Ms") if req is not None else None
+        return max(0.0, float(raw) / 1000) if raw not in (None, "") else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def gated(fn):
-    """Run a search or document read only once it holds one of this instance's SEARCH_MAX_CONCURRENT slots. It waits at most
-    SEARCH_QUEUE_TIMEOUT_SECONDS for one, and is then refused with a 503 (see busy_response)."""
+    """Run a search or document read only once it holds one of this instance's SEARCH_MAX_CONCURRENT slots, within one time
+    limit: SEARCH_DEADLINE_SECONDS, or the caller's X-Request-Budget-Ms when that is shorter. Waiting for a slot counts against
+    it and is itself capped at SEARCH_QUEUE_TIMEOUT_SECONDS. Past the queue wait the answer is a busy 503 (busy_response); past
+    the limit, between stages, a deadline 503 (deadline_response). Either way the caller hears back before it gives up."""
     @functools.wraps(fn)
     def wrapper(*args, **kw):
         arrived = time.monotonic()
-        token = deadline.start(settings.search_deadline_seconds, arrived)
+        budget = caller_budget(args[0] if args else None)
+        limit = settings.search_deadline_seconds
+        if budget is not None:
+            limit = max(0.001, min(limit, budget) if limit > 0 else budget)   # a spent budget still gets a prompt 503
+        token = deadline.start(limit, arrived)
         try:
-            gate.acquire()
+            gate.acquire(limit if limit > 0 else None)
         except SearchBusy as exc:
             deadline.clear(token)
             diagnostics.counters.bump("queue_refused")
@@ -496,7 +511,6 @@ def health(req):
         "embed_cache": _embed_cache_stats(),
         "process": process_info(),
         "query_cache": query_cache_stats(),
-        "shared_result_cache": {"enabled": searcher.results.enabled, **searcher.results.stats},
         "admission": gate.stats(),
     })
 

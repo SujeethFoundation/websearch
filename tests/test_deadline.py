@@ -46,3 +46,36 @@ def test_a_search_past_its_deadline_is_refused_with_a_503(monkeypatch):
     out = slow(None)
     assert out.status_code == 503
     assert b"search_deadline" in out.get_body() and out.headers.get("Retry-After")
+
+
+class Req:
+    def __init__(self, budget_ms=None):
+        self.headers = {} if budget_ms is None else {"X-Request-Budget-Ms": str(budget_ms)}
+
+
+def test_the_callers_budget_shortens_the_deadline(monkeypatch):
+    import function_app
+    monkeypatch.setattr(function_app.settings, "search_deadline_seconds", 20.0, raising=False)
+    seen = []
+
+    @function_app.gated
+    def look(req):
+        seen.append(deadline._until.get())
+
+    look(Req(3000))
+    look(Req())
+    assert round(seen[0][2], 1) == 3.0 and round(seen[1][2], 1) == 20.0
+
+
+def test_the_callers_budget_also_caps_the_wait_for_a_slot(monkeypatch):
+    import function_app
+    from services.admission import AdmissionGate
+    gate = AdmissionGate(1, 5)
+    monkeypatch.setattr(function_app, "gate", gate)
+    gate.acquire()                                   # the only slot is taken
+    try:
+        began = time.monotonic()
+        out = function_app.gated(lambda req: None)(Req(300))
+        assert out.status_code == 503 and time.monotonic() - began < 1.5
+    finally:
+        gate.release()
